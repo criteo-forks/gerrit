@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package walgerrit.v1;
+
+option java_package = "dev.walgerrit.proto";
+option java_outer_classname = "StorageProto";
+
+// The mutable repository index. Its atomic replacement is the only point at
+// which a transaction becomes visible.
+message Manifest {
+  uint32 format_version = 1;
+  string repo = 2;
+  string object_format = 3;
+  uint64 head_seq = 4;
+  repeated PackRef packs = 5;
+  repeated LogRef log_segments = 6;
+  uint64 revision = 7;
+  int64 updated_at_epoch_millis = 8;
+  string writer = 9;
+  // Changes only when the live reftable stack changes. Object-pack appends
+  // deliberately do not invalidate a ref transaction based on this value.
+  uint64 ref_revision = 10;
+}
+
+message PackRef {
+  // JGit's stable DFS pack name. Pack and index data beneath wal/ are
+  // immutable once this record is published.
+  string name = 1;
+  string source = 2;
+  uint64 seq = 3;
+  int64 last_modified_epoch_millis = 4;
+  uint64 object_count = 5;
+  uint64 delta_count = 6;
+  uint64 min_update_index = 7;
+  uint64 max_update_index = 8;
+  repeated PackFile files = 9;
+  string pack_checksum = 10;
+}
+
+message PackFile {
+  string extension = 1;
+  uint64 size = 2;
+  uint32 block_size = 3;
+}
+
+message LogRef {
+  string key = 1;
+  uint64 first_seq = 2;
+  uint64 last_seq = 3;
+  uint64 size = 4;
+  bool sealed = 5;
+}
+
+message LogEntry {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    PACK = 1;
+    REF_UPDATE = 2;
+    COMPACT = 3;
+  }
+
+  uint64 seq = 1;
+  Kind kind = 2;
+  repeated PackRef additions = 3;
+  repeated string supersedes = 4;
+  int64 created_at_epoch_millis = 5;
+  string writer = 6;
+  uint64 base_revision = 7;
+}
