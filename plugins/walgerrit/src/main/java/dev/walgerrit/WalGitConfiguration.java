@@ -14,15 +14,27 @@
 
 package dev.walgerrit;
 
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.Optional;
 import org.eclipse.jgit.lib.Config;
 
 /** Immutable WalGerrit configuration read from {@code gerrit.config}. */
-record WalGitConfiguration(BackendType backend, Path storagePath) {
+record WalGitConfiguration(
+    BackendType backend,
+    Path storagePath,
+    String s3Bucket,
+    String s3Region,
+    URI s3Endpoint,
+    String s3Prefix,
+    boolean s3PathStyle) {
   private static final String SECTION = "walgerrit";
   private static final String BACKEND_KEY = "backend";
   private static final String STORAGE_PATH_KEY = "storagePath";
+
+  WalGitConfiguration(BackendType backend, Path storagePath) {
+    this(backend, storagePath, null, "us-east-1", null, "", false);
+  }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
     String configuredBackend =
@@ -32,7 +44,28 @@ record WalGitConfiguration(BackendType backend, Path storagePath) {
         configuredStoragePath == null
             ? sitePath.resolve("data/walgerrit")
             : sitePath.resolve(configuredStoragePath).normalize();
-    return new WalGitConfiguration(
-        BackendType.parse(configuredBackend), storagePath.toAbsolutePath().normalize());
+    BackendType backend = BackendType.parse(configuredBackend);
+    String endpoint = config.getString(SECTION, null, "s3Endpoint");
+    WalGitConfiguration configuration =
+        new WalGitConfiguration(
+            backend,
+            storagePath.toAbsolutePath().normalize(),
+            config.getString(SECTION, null, "s3Bucket"),
+            Optional.ofNullable(config.getString(SECTION, null, "s3Region"))
+                .orElse("us-east-1"),
+            endpoint == null || endpoint.isBlank() ? null : URI.create(endpoint),
+            Optional.ofNullable(config.getString(SECTION, null, "s3Prefix")).orElse(""),
+            config.getBoolean(SECTION, null, "s3PathStyle", false));
+    configuration.validate();
+    return configuration;
+  }
+
+  private void validate() {
+    if (backend == BackendType.S3 && (s3Bucket == null || s3Bucket.isBlank())) {
+      throw new IllegalArgumentException("walgerrit.s3Bucket is required for the s3 backend");
+    }
+    if (s3Prefix.startsWith("/") || s3Prefix.contains("..") || s3Prefix.indexOf('\\') >= 0) {
+      throw new IllegalArgumentException("Invalid walgerrit.s3Prefix: " + s3Prefix);
+    }
   }
 }

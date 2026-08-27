@@ -49,6 +49,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   private final ThreadLocal<Long> refTransactionRevision = new ThreadLocal<>();
   private final ThreadLocal<Boolean> refTransactionCommitted = new ThreadLocal<>();
   private volatile Set<ObjectId> shallowCommits = Collections.emptySet();
+  private volatile long observedManifestRevision = -1;
 
   LocalWalGitObjectDatabase(DfsRepository repository, ManifestStore manifestStore) {
     super(repository, new DfsReaderOptions());
@@ -149,6 +150,12 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   }
 
   @Override
+  public PackList getPackList() throws IOException {
+    revalidateManifest();
+    return super.getPackList();
+  }
+
+  @Override
   protected ReadableChannel openFile(DfsPackDescription description, PackExt extension)
       throws IOException {
     Path path = manifestStore.immutableFile(description.getFileName(extension));
@@ -190,6 +197,26 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     // JGit's DFS pack list is intentionally cached. A new transaction must
     // revalidate the manifest, just like a conditional GET in remote WalGit.
     clearCache();
+  }
+
+  boolean revalidateManifest() throws IOException {
+    long revision = manifestStore.read().getRevision();
+    if (revision == observedManifestRevision) {
+      return false;
+    }
+    synchronized (this) {
+      if (revision == observedManifestRevision) {
+        return false;
+      }
+      clearCache();
+      observedManifestRevision = revision;
+      return true;
+    }
+  }
+
+  void invalidateCaches() {
+    clearCache();
+    observedManifestRevision = -1;
   }
 
   void endRefTransaction() {

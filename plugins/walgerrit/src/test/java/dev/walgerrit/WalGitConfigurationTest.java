@@ -50,7 +50,27 @@ class WalGitConfigurationTest {
   }
 
   @Test
-  void rejectsUnknownBackend() {
+  void configuresS3Backend() {
+    Config config = new Config();
+    config.setString("walgerrit", null, "backend", "s3");
+    config.setString("walgerrit", null, "s3Bucket", "walgerrit-test");
+    config.setString("walgerrit", null, "s3Region", "eu-west-3");
+    config.setString("walgerrit", null, "s3Endpoint", "http://127.0.0.1:9000");
+    config.setString("walgerrit", null, "s3Prefix", "test-prefix");
+    config.setBoolean("walgerrit", null, "s3PathStyle", true);
+
+    WalGitConfiguration configuration = WalGitConfiguration.from(config, sitePath);
+
+    assertEquals(BackendType.S3, configuration.backend());
+    assertEquals("walgerrit-test", configuration.s3Bucket());
+    assertEquals("eu-west-3", configuration.s3Region());
+    assertEquals("http://127.0.0.1:9000", configuration.s3Endpoint().toString());
+    assertEquals("test-prefix", configuration.s3Prefix());
+    assertTrue(configuration.s3PathStyle());
+  }
+
+  @Test
+  void s3BackendRequiresBucket() {
     Config config = new Config();
     config.setString("walgerrit", null, "backend", "s3");
 
@@ -59,6 +79,19 @@ class WalGitConfigurationTest {
             IllegalArgumentException.class,
             () -> WalGitConfiguration.from(config, sitePath));
 
-    assertTrue(exception.getMessage().contains("Unsupported walgerrit.backend 's3'"));
+    assertTrue(exception.getMessage().contains("walgerrit.s3Bucket is required"));
+  }
+
+  @Test
+  void rejectsUnknownBackend() {
+    Config config = new Config();
+    config.setString("walgerrit", null, "backend", "unknown");
+
+    IllegalArgumentException exception =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> WalGitConfiguration.from(config, sitePath));
+
+    assertTrue(exception.getMessage().contains("Unsupported walgerrit.backend 'unknown'"));
   }
 }

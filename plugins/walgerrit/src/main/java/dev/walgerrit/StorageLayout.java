@@ -15,68 +15,70 @@
 package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
-import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.NavigableSet;
 import java.util.TreeSet;
-import java.util.stream.Stream;
 
-/** Maps Gerrit project names onto the durable WalGerrit object-store layout. */
+/** Maps Gerrit project names onto object-store keys and node-local cache paths. */
 final class StorageLayout {
   private static final String REPOSITORIES_DIRECTORY = "repos";
   private static final String REPOSITORY_SUFFIX = ".git";
 
-  private final Path repositoriesPath;
+  private final ObjectStore objectStore;
+  private final Path cacheRepositoriesPath;
+  private final String repositoriesPrefix;
 
   StorageLayout(Path root) {
-    repositoriesPath = root.resolve(REPOSITORIES_DIRECTORY).toAbsolutePath().normalize();
+    this(new FileObjectStore(root), root, "");
+  }
+
+  StorageLayout(ObjectStore objectStore, Path cacheRoot, String prefix) {
+    this.objectStore = objectStore;
+    cacheRepositoriesPath =
+        cacheRoot.resolve(REPOSITORIES_DIRECTORY).toAbsolutePath().normalize();
+    String normalizedPrefix = prefix == null ? "" : prefix.replaceAll("/+$", "");
+    repositoriesPrefix =
+        normalizedPrefix.isEmpty()
+            ? REPOSITORIES_DIRECTORY
+            : normalizedPrefix + "/" + REPOSITORIES_DIRECTORY;
   }
 
   ManifestStore manifestStore(Project.NameKey name) throws IOException {
-    return new ManifestStore(repositoryPath(name), name.get());
+    String relative = repositoryRelativePath(name);
+    return new ManifestStore(
+        new PrefixedObjectStore(objectStore, repositoriesPrefix + "/" + relative),
+        cacheRepositoriesPath.resolve(relative),
+        name.get(),
+        Clock.systemUTC(),
+        ignored -> {});
   }
 
   NavigableSet<Project.NameKey> listProjects() throws IOException {
     NavigableSet<Project.NameKey> projects = new TreeSet<>();
-    if (!Files.isDirectory(repositoriesPath)) {
-      return projects;
-    }
-
-    try (Stream<Path> paths = Files.walk(repositoriesPath)) {
-      paths
-          .filter(path -> path.getFileName().toString().equals(ManifestStore.MANIFEST_FILE))
-          .map(Path::getParent)
-          .map(repositoriesPath::relativize)
-          .map(Path::toString)
-          .filter(path -> path.endsWith(REPOSITORY_SUFFIX))
-          .map(path -> path.substring(0, path.length() - REPOSITORY_SUFFIX.length()))
-          .map(path -> path.replace(File.separatorChar, '/'))
-          .map(Project::nameKey)
-          .forEach(projects::add);
-    }
+    String prefix = repositoriesPrefix + "/";
+    String manifestSuffix = "/" + ManifestStore.MANIFEST_FILE;
+    objectStore.list(prefix).stream()
+        .filter(key -> key.startsWith(prefix) && key.endsWith(manifestSuffix))
+        .map(key -> key.substring(prefix.length(), key.length() - manifestSuffix.length()))
+        .filter(path -> path.endsWith(REPOSITORY_SUFFIX))
+        .map(path -> path.substring(0, path.length() - REPOSITORY_SUFFIX.length()))
+        .map(Project::nameKey)
+        .forEach(projects::add);
     return projects;
   }
 
-  private Path repositoryPath(Project.NameKey name) throws IOException {
+  private String repositoryRelativePath(Project.NameKey name) throws IOException {
     String projectName = name.get();
     if (projectName.isBlank() || projectName.indexOf('\\') >= 0) {
       throw new IOException("Invalid project name: " + projectName);
     }
-
-    Path relative = Path.of(projectName + REPOSITORY_SUFFIX);
-    for (Path component : relative) {
-      String value = component.toString();
-      if (value.equals(".") || value.equals("..")) {
+    for (String component : projectName.split("/")) {
+      if (component.isBlank() || component.equals(".") || component.equals("..")) {
         throw new IOException("Invalid project name: " + projectName);
       }
     }
-
-    Path resolved = repositoriesPath.resolve(relative).normalize();
-    if (!resolved.startsWith(repositoriesPath)) {
-      throw new IOException("Project escapes storage root: " + projectName);
-    }
-    return resolved;
+    return projectName + REPOSITORY_SUFFIX;
   }
 }

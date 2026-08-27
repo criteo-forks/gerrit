@@ -115,6 +115,25 @@ class LocalWalGitTransactionTest {
   }
 
   @Test
+  void longLivedRepositoryRevalidatesRefsAndObjectsBeforeReads() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    Project.NameKey project = Project.nameKey("platform/read-freshness");
+    manager.createRepository(project).close();
+
+    try (Repository writer = manager.openRepository(project);
+        Repository reader = manager.openRepository(project)) {
+      assertNull(reader.exactRef(Constants.R_HEADS + "fresh"));
+      ObjectId commit = WalGitRepositoryManagerTest.insertCommit(writer, "fresh object");
+      RefUpdate update = writer.updateRef(Constants.R_HEADS + "fresh");
+      update.setNewObjectId(commit);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+
+      assertEquals(commit, reader.exactRef(Constants.R_HEADS + "fresh").getObjectId());
+      assertEquals(Constants.OBJ_COMMIT, reader.open(commit).getType());
+    }
+  }
+
+  @Test
   void staleExpectedOldValueFailsWithoutChangingTheWinningRef() throws Exception {
     WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/expected-old");
@@ -215,8 +234,7 @@ class LocalWalGitTransactionTest {
       child.setNewObjectId(commit);
 
       assertEquals(RefUpdate.Result.NEW, parent.update());
-      IOException error = assertThrows(IOException.class, child::update);
-      assertEquals("transaction aborted", error.getMessage());
+      assertEquals(RefUpdate.Result.LOCK_FAILURE, child.update());
     }
 
     try (Repository reopened = manager.openRepository(project)) {

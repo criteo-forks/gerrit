@@ -62,6 +62,7 @@ js-to-ts.sh
 !/plugins/reviewnotes
 !/plugins/singleusergroup
 !/plugins/webhooks
+!/plugins/walgerrit
 /test_site
 /tools/format
 /tools/maven/gerrit-*_pom.xml.asc

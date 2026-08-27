@@ -14,19 +14,11 @@
 
 package dev.walgerrit;
 
-import java.util.Locale;
+import java.io.IOException;
 
-/** Storage implementations understood by this version of WalGerrit. */
-enum BackendType {
-  LOCAL,
-  S3;
-
-  static BackendType parse(String value) {
-    try {
-      return valueOf(value.trim().toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException exception) {
-      throw new IllegalArgumentException(
-          "Unsupported walgerrit.backend '" + value + "'; expected one of: local, s3", exception);
-    }
+/** A conditional write raced with another writer. */
+final class ObjectStoreConflictException extends IOException {
+  ObjectStoreConflictException(String key) {
+    super("Conditional write conflict: " + key);
   }
 }

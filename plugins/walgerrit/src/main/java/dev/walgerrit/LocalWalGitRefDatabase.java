@@ -16,6 +16,8 @@ package dev.walgerrit;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableBatchRefUpdate;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableDatabase;
@@ -23,6 +25,8 @@ import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
 import org.eclipse.jgit.lib.BatchRefUpdate;
 import org.eclipse.jgit.lib.ProgressMonitor;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.ReflogReader;
+import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.ReceiveCommand;
 import org.slf4j.Logger;
@@ -41,6 +45,55 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   @Override
   public BatchRefUpdate newBatchUpdate() {
     return new WalGitBatchRefUpdate(this, objectDatabase);
+  }
+
+  @Override
+  public Ref exactRef(String name) throws IOException {
+    revalidate();
+    return super.exactRef(name);
+  }
+
+  @Override
+  public Map<String, Ref> getRefs(String prefix) throws IOException {
+    revalidate();
+    return super.getRefs(prefix);
+  }
+
+  @Override
+  public List<Ref> getRefsByPrefix(String prefix) throws IOException {
+    revalidate();
+    return super.getRefsByPrefix(prefix);
+  }
+
+  @Override
+  public List<Ref> getRefsByPrefixWithExclusions(String include, Set<String> excludes)
+      throws IOException {
+    revalidate();
+    return super.getRefsByPrefixWithExclusions(include, excludes);
+  }
+
+  @Override
+  public boolean isNameConflicting(String refName) throws IOException {
+    revalidate();
+    return super.isNameConflicting(refName);
+  }
+
+  @Override
+  public ReflogReader getReflogReader(Ref ref) throws IOException {
+    revalidate();
+    return super.getReflogReader(ref);
+  }
+
+  @Override
+  public Set<Ref> getTipsWithSha1(ObjectId id) throws IOException {
+    revalidate();
+    return super.getTipsWithSha1(id);
+  }
+
+  private void revalidate() throws IOException {
+    if (objectDatabase.revalidateManifest()) {
+      super.refresh();
+    }
   }
 
   private static final class WalGitBatchRefUpdate extends DfsReftableBatchRefUpdate {
@@ -90,7 +143,15 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
           logger.warn(
               "WalGerrit ref transaction committed, but local cache update failed; refreshing",
               exception);
-          refDatabase.refresh();
+          try {
+            refDatabase.refresh();
+          } catch (RuntimeException repairFailure) {
+            objectDatabase.invalidateCaches();
+            logger.warn(
+                "WalGerrit cache refresh failed after a committed ref transaction; "
+                    + "the next read will rematerialize it",
+                repairFailure);
+          }
           return;
         }
         logger.error("WalGerrit ref publication failed", exception);

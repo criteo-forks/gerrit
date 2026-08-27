@@ -39,10 +39,19 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
   }
 
   WalGitRepositoryManager(WalGitConfiguration configuration) {
-    if (configuration.backend() != BackendType.LOCAL) {
-      throw new IllegalArgumentException("No implementation for " + configuration.backend());
-    }
-    storage = new StorageLayout(configuration.storagePath());
+    storage =
+        switch (configuration.backend()) {
+          case LOCAL -> new StorageLayout(configuration.storagePath());
+          case S3 ->
+              new StorageLayout(
+                  new S3ObjectStore(
+                      configuration.s3Bucket(),
+                      configuration.s3Region(),
+                      configuration.s3Endpoint(),
+                      configuration.s3PathStyle()),
+                  configuration.storagePath(),
+                  configuration.s3Prefix());
+        };
   }
 
   @Override

@@ -19,44 +19,36 @@ import dev.walgerrit.proto.StorageProto.LogRef;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.channels.FileLock;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Clock;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
 
 /** Durable protobuf manifest and immutable transaction-log storage for one repository. */
 final class ManifestStore {
   static final String MANIFEST_FILE = "manifest.pb";
 
   private static final int FORMAT_VERSION = 1;
+  private static final int MAX_CAS_ATTEMPTS = 64;
   private static final String OBJECT_FORMAT = "sha1";
   private static final String LOG_DIRECTORY = "log";
   private static final String STAGING_DIRECTORY = "staging";
   private static final String WAL_DIRECTORY = "wal";
-  private static final String LOCK_FILE = "manifest.lock";
-  private static final Map<Path, ReentrantLock> JVM_LOCKS = new ConcurrentHashMap<>();
 
+  private final ObjectStore objectStore;
   private final Path repositoryPath;
-  private final Path manifestPath;
-  private final Path logPath;
   private final Path stagingPath;
   private final Path walPath;
-  private final Path lockPath;
   private final String repositoryName;
   private final Clock clock;
-  private final IoConsumer<Path> afterAtomicMove;
+  private final IoConsumer<String> afterManifestCas;
 
   ManifestStore(Path repositoryPath, String repositoryName) {
     this(repositoryPath, repositoryName, Clock.systemUTC(), ignored -> {});
@@ -70,53 +62,55 @@ final class ManifestStore {
       Path repositoryPath,
       String repositoryName,
       Clock clock,
-      IoConsumer<Path> afterAtomicMove) {
-    this.repositoryPath = repositoryPath;
+      IoConsumer<Path> afterManifestCas) {
+    this(
+        new FileObjectStore(repositoryPath),
+        repositoryPath,
+        repositoryName,
+        clock,
+        ignored -> afterManifestCas.accept(repositoryPath.resolve(MANIFEST_FILE)));
+  }
+
+  ManifestStore(
+      ObjectStore objectStore,
+      Path repositoryPath,
+      String repositoryName,
+      Clock clock,
+      IoConsumer<String> afterManifestCas) {
+    this.objectStore = objectStore;
+    this.repositoryPath = repositoryPath.toAbsolutePath().normalize();
     this.repositoryName = repositoryName;
     this.clock = clock;
-    this.afterAtomicMove = afterAtomicMove;
-    manifestPath = repositoryPath.resolve(MANIFEST_FILE);
-    logPath = repositoryPath.resolve(LOG_DIRECTORY);
-    stagingPath = repositoryPath.resolve(STAGING_DIRECTORY);
-    walPath = repositoryPath.resolve(WAL_DIRECTORY);
-    lockPath = repositoryPath.resolve(LOCK_FILE);
+    this.afterManifestCas = afterManifestCas;
+    stagingPath = this.repositoryPath.resolve(STAGING_DIRECTORY);
+    walPath = this.repositoryPath.resolve(WAL_DIRECTORY);
   }
 
   boolean exists() throws IOException {
-    if (!Files.exists(manifestPath)) {
-      return false;
-    }
-    if (!Files.isRegularFile(manifestPath)) {
-      throw new IOException("Manifest is not a regular file: " + manifestPath);
-    }
-    return true;
+    return objectStore.get(MANIFEST_FILE).isPresent();
   }
 
   boolean create() throws IOException {
-    createDirectories();
-    return withManifestLock(
-        () -> {
-          if (Files.exists(manifestPath)) {
-            return false;
-          }
-          long now = clock.millis();
-          Manifest manifest =
-              Manifest.newBuilder()
-                  .setFormatVersion(FORMAT_VERSION)
-                  .setRepo(repositoryName)
-                  .setObjectFormat(OBJECT_FORMAT)
-                  .setUpdatedAtEpochMillis(now)
-                  .setWriter(writerIdentity())
-                  .build();
-          writeManifestAtomic(manifest.toByteArray());
-          return true;
-        });
+    createCacheDirectories();
+    long now = clock.millis();
+    Manifest manifest =
+        Manifest.newBuilder()
+            .setFormatVersion(FORMAT_VERSION)
+            .setRepo(repositoryName)
+            .setObjectFormat(OBJECT_FORMAT)
+            .setUpdatedAtEpochMillis(now)
+            .setWriter(writerIdentity())
+            .build();
+    try {
+      objectStore.putIfAbsent(MANIFEST_FILE, manifest.toByteArray());
+      return true;
+    } catch (ObjectAlreadyExistsException exception) {
+      return false;
+    }
   }
 
   Manifest read() throws IOException {
-    Manifest manifest = Manifest.parseFrom(Files.readAllBytes(manifestPath));
-    validate(manifest);
-    return manifest;
+    return readVersioned().manifest();
   }
 
   Manifest publish(
@@ -125,92 +119,117 @@ final class ManifestStore {
       Collection<String> supersedes,
       boolean requireExactRefRevision)
       throws IOException {
-    createDirectories();
-    return withManifestLock(
-        () -> {
-          Manifest current = read();
-          if (requireExactRefRevision
-              && current.getRefRevision() != expectedRefRevision) {
-            throw new ManifestConflictException(
-                expectedRefRevision, current.getRefRevision());
+    createCacheDirectories();
+    for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+      VersionedManifest versioned = readVersioned();
+      Manifest current = versioned.manifest();
+      if (requireExactRefRevision && current.getRefRevision() != expectedRefRevision) {
+        throw new ManifestConflictException(expectedRefRevision, current.getRefRevision());
+      }
+
+      long sequence = current.getHeadSeq() + 1;
+      long now = clock.millis();
+      String writer = writerIdentity();
+      Map<String, PackRef> livePacks = new LinkedHashMap<>();
+      for (PackRef pack : current.getPacksList()) {
+        livePacks.put(pack.getName(), pack);
+      }
+      for (String superseded : supersedes) {
+        if (livePacks.remove(superseded) == null) {
+          throw new IOException("Cannot supersede a pack that is no longer live: " + superseded);
+        }
+      }
+
+      boolean changesRefs = changesRefs(additions, supersedes, current);
+      LogEntry.Builder entry =
+          LogEntry.newBuilder()
+              .setSeq(sequence)
+              .setKind(entryKind(supersedes, requireExactRefRevision))
+              .addAllSupersedes(supersedes)
+              .setCreatedAtEpochMillis(now)
+              .setWriter(writer)
+              .setBaseRevision(current.getRevision());
+      for (PackRef addition : additions) {
+        PackRef published = addition.toBuilder().setSeq(sequence).build();
+        if (livePacks.putIfAbsent(published.getName(), published) != null) {
+          throw new IOException("Pack already exists in manifest: " + published.getName());
+        }
+        entry.addAdditions(published);
+      }
+
+      byte[] logBytes = entry.build().toByteArray();
+      String logKey =
+          String.format("%s/%016x-%s.pb", LOG_DIRECTORY, sequence, UUID.randomUUID());
+      objectStore.putIfAbsent(logKey, logBytes);
+
+      LogRef logRef =
+          LogRef.newBuilder()
+              .setKey(logKey)
+              .setFirstSeq(sequence)
+              .setLastSeq(sequence)
+              .setSize(logBytes.length)
+              .setSealed(true)
+              .build();
+      Manifest updated =
+          current.toBuilder()
+              .setHeadSeq(sequence)
+              .clearPacks()
+              .addAllPacks(livePacks.values())
+              .addLogSegments(logRef)
+              .setRevision(current.getRevision() + 1)
+              .setRefRevision(current.getRefRevision() + (changesRefs ? 1 : 0))
+              .setUpdatedAtEpochMillis(now)
+              .setWriter(writer)
+              .build();
+
+      try {
+        objectStore.compareAndSwap(MANIFEST_FILE, versioned.version(), updated.toByteArray());
+        afterManifestCas.accept(logKey);
+        return updated;
+      } catch (ObjectStoreConflictException conflict) {
+        // An object-only publication may merge a concurrent ref/object append.
+        // A ref publication retries only while ref_revision remains unchanged.
+      } catch (IOException ambiguous) {
+        try {
+          Manifest fresh = read();
+          if (containsLog(fresh, logKey)) {
+            return fresh;
           }
-
-          long sequence = current.getHeadSeq() + 1;
-          long now = clock.millis();
-          String writer = writerIdentity();
-          Map<String, PackRef> livePacks = new LinkedHashMap<>();
-          for (PackRef pack : current.getPacksList()) {
-            livePacks.put(pack.getName(), pack);
-          }
-          for (String superseded : supersedes) {
-            if (livePacks.remove(superseded) == null) {
-              throw new IOException(
-                  "Cannot supersede a pack that is no longer live: " + superseded);
-            }
-          }
-
-          boolean changesRefs = changesRefs(additions, supersedes, current);
-
-          LogEntry.Builder entry =
-              LogEntry.newBuilder()
-                  .setSeq(sequence)
-                  .setKind(entryKind(supersedes, requireExactRefRevision))
-                  .addAllSupersedes(supersedes)
-                  .setCreatedAtEpochMillis(now)
-                  .setWriter(writer)
-                  .setBaseRevision(current.getRevision());
-          for (PackRef addition : additions) {
-            PackRef published = addition.toBuilder().setSeq(sequence).build();
-            if (livePacks.putIfAbsent(published.getName(), published) != null) {
-              throw new IOException("Pack already exists in manifest: " + published.getName());
-            }
-            entry.addAdditions(published);
-          }
-
-          byte[] logBytes = entry.build().toByteArray();
-          String logKey =
-              String.format("%s/%016x-%s.pb", LOG_DIRECTORY, sequence, UUID.randomUUID());
-          writeImmutable(repositoryPath.resolve(logKey), logBytes);
-
-          LogRef logRef =
-              LogRef.newBuilder()
-                  .setKey(logKey)
-                  .setFirstSeq(sequence)
-                  .setLastSeq(sequence)
-                  .setSize(logBytes.length)
-                  .setSealed(true)
-                  .build();
-          Manifest updated =
-              current.toBuilder()
-                  .setHeadSeq(sequence)
-                  .clearPacks()
-                  .addAllPacks(livePacks.values())
-                  .addLogSegments(logRef)
-                  .setRevision(current.getRevision() + 1)
-                  .setRefRevision(
-                      current.getRefRevision() + (changesRefs ? 1 : 0))
-                  .setUpdatedAtEpochMillis(now)
-                  .setWriter(writer)
-                  .build();
-          writeManifestAtomic(updated.toByteArray());
-          return updated;
-        });
+        } catch (IOException verificationFailure) {
+          ambiguous.addSuppressed(verificationFailure);
+        }
+        throw ambiguous;
+      }
+    }
+    throw new IOException("Manifest CAS did not converge after " + MAX_CAS_ATTEMPTS + " attempts");
   }
 
   Path stagingFile(String fileName) throws IOException {
-    createDirectories();
+    createCacheDirectories();
     return stagingPath.resolve(fileName);
   }
 
-  Path immutableFile(String fileName) {
-    return walPath.resolve(fileName);
+  Path immutableFile(String fileName) throws IOException {
+    createCacheDirectories();
+    Path target = walPath.resolve(fileName);
+    if (!Files.isRegularFile(target)) {
+      objectStore.download(WAL_DIRECTORY + "/" + fileName, target);
+    }
+    return target;
   }
 
   void publishImmutableFile(String fileName) throws IOException {
+    createCacheDirectories();
     Path source = stagingPath.resolve(fileName);
+    String key = WAL_DIRECTORY + "/" + fileName;
+    objectStore.uploadIfAbsent(key, source);
+
     Path target = walPath.resolve(fileName);
-    forceFile(source);
-    moveAtomic(source, target, false);
+    if (Files.isRegularFile(target)) {
+      Files.deleteIfExists(source);
+      return;
+    }
+    moveAtomic(source, target);
     forceDirectory(walPath);
   }
 
@@ -226,9 +245,18 @@ final class ManifestStore {
     return repositoryPath;
   }
 
-  private void createDirectories() throws IOException {
+  private VersionedManifest readVersioned() throws IOException {
+    ObjectStore.StoredObject stored =
+        objectStore
+            .get(MANIFEST_FILE)
+            .orElseThrow(() -> new IOException("Manifest not found: " + repositoryName));
+    Manifest manifest = Manifest.parseFrom(stored.bytes());
+    validate(manifest);
+    return new VersionedManifest(manifest, stored.version());
+  }
+
+  private void createCacheDirectories() throws IOException {
     Files.createDirectories(repositoryPath);
-    Files.createDirectories(logPath);
     Files.createDirectories(stagingPath);
     Files.createDirectories(walPath);
   }
@@ -249,101 +277,9 @@ final class ManifestStore {
     }
   }
 
-  private <T> T withManifestLock(IoSupplier<T> operation) throws IOException {
-    Path normalizedLockPath = lockPath.toAbsolutePath().normalize();
-    ReentrantLock jvmLock = JVM_LOCKS.computeIfAbsent(normalizedLockPath, ignored -> new ReentrantLock());
-    jvmLock.lock();
-    try (FileChannel channel =
-            FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-        FileLock ignored = channel.lock()) {
-      return operation.get();
-    } finally {
-      jvmLock.unlock();
-    }
-  }
-
-  private void writeImmutable(Path target, byte[] bytes) throws IOException {
-    Files.createDirectories(target.getParent());
-    Path temporary = target.resolveSibling(target.getFileName() + ".tmp-" + UUID.randomUUID());
-    try {
-      writeAndForce(temporary, bytes);
-      moveAtomic(temporary, target, false);
-      forceDirectory(target.getParent());
-    } finally {
-      Files.deleteIfExists(temporary);
-    }
-  }
-
-  private void writeManifestAtomic(byte[] bytes) throws IOException {
-    try {
-      writeAtomic(manifestPath, bytes);
-    } catch (IOException publicationFailure) {
-      // A conditional object-store write may land and lose its response. A
-      // local atomic rename has the same ambiguity if the following directory
-      // fsync reports an error. The committed manifest is the source of truth:
-      // never report failure for a transaction that is already visible.
-      try {
-        if (Arrays.equals(Files.readAllBytes(manifestPath), bytes)) {
-          return;
-        }
-      } catch (IOException verificationFailure) {
-        publicationFailure.addSuppressed(verificationFailure);
-      }
-      throw publicationFailure;
-    }
-  }
-
-  private void writeAtomic(Path target, byte[] bytes) throws IOException {
-    Path temporary = target.resolveSibling(target.getFileName() + ".tmp-" + UUID.randomUUID());
-    try {
-      writeAndForce(temporary, bytes);
-      moveAtomic(temporary, target, true);
-      afterAtomicMove.accept(target);
-      forceDirectory(target.getParent());
-    } finally {
-      Files.deleteIfExists(temporary);
-    }
-  }
-
-  private static void writeAndForce(Path path, byte[] bytes) throws IOException {
-    try (FileChannel channel =
-        FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-      ByteBuffer buffer = ByteBuffer.wrap(bytes);
-      while (buffer.hasRemaining()) {
-        channel.write(buffer);
-      }
-      channel.force(true);
-    }
-  }
-
-  private static void forceFile(Path path) throws IOException {
-    try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
-      channel.force(true);
-    }
-  }
-
-  private static void forceDirectory(Path path) throws IOException {
-    try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-      channel.force(true);
-    } catch (UnsupportedOperationException ignored) {
-      // Some filesystems do not expose directory fsync through FileChannel.
-    }
-  }
-
-  private static void moveAtomic(Path source, Path target, boolean replace) throws IOException {
-    try {
-      if (replace) {
-        Files.move(
-            source,
-            target,
-            StandardCopyOption.ATOMIC_MOVE,
-            StandardCopyOption.REPLACE_EXISTING);
-      } else {
-        Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
-      }
-    } catch (AtomicMoveNotSupportedException exception) {
-      throw new IOException("Storage filesystem does not support atomic publication: " + target, exception);
-    }
+  private static boolean containsLog(Manifest manifest, String logKey) {
+    return manifest.getLogSegmentsList().stream()
+        .anyMatch(segment -> segment.getKey().equals(logKey));
   }
 
   private static LogEntry.Kind entryKind(
@@ -355,9 +291,7 @@ final class ManifestStore {
   }
 
   private static boolean changesRefs(
-      Collection<PackRef> additions,
-      Collection<String> supersedes,
-      Manifest current) {
+      Collection<PackRef> additions, Collection<String> supersedes, Manifest current) {
     if (additions.stream().anyMatch(ManifestStore::hasReftable)) {
       return true;
     }
@@ -373,15 +307,29 @@ final class ManifestStore {
         .anyMatch(file -> file.getExtension().equals("ref"));
   }
 
+  private static void moveAtomic(Path source, Path target) throws IOException {
+    try {
+      Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+    } catch (AtomicMoveNotSupportedException exception) {
+      throw new IOException(
+          "Cache filesystem does not support atomic materialization: " + target, exception);
+    }
+  }
+
+  private static void forceDirectory(Path path) throws IOException {
+    try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+      channel.force(true);
+    } catch (UnsupportedOperationException ignored) {
+      // Some filesystems do not expose directory fsync through FileChannel.
+    }
+  }
+
   private static String writerIdentity() {
     String host = System.getenv().getOrDefault("HOSTNAME", "localhost");
     return host + ":" + ProcessHandle.current().pid();
   }
 
-  @FunctionalInterface
-  private interface IoSupplier<T> {
-    T get() throws IOException;
-  }
+  private record VersionedManifest(Manifest manifest, String version) {}
 
   @FunctionalInterface
   interface IoConsumer<T> {

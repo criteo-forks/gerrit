@@ -27,6 +27,7 @@ import org.eclipse.jgit.lib.RefDatabase;
 final class LocalWalGitRepository extends DfsRepository {
   private final LocalWalGitObjectDatabase objectDatabase;
   private final DfsRefDatabase refDatabase;
+  private volatile String gitwebDescription;
 
   LocalWalGitRepository(Project.NameKey name, ManifestStore manifestStore) throws IOException {
     super(
@@ -45,6 +46,20 @@ final class LocalWalGitRepository extends DfsRepository {
   @Override
   public RefDatabase getRefDatabase() {
     return refDatabase;
+  }
+
+  @Override
+  public String getGitwebDescription() {
+    return gitwebDescription;
+  }
+
+  @Override
+  public void setGitwebDescription(String description) {
+    // Gerrit's authoritative project description lives in refs/meta/config. A DFS repository has
+    // no description file, but Gerrit still invokes this optional JGit compatibility API while
+    // creating and updating a project. Match Gerrit's InMemoryRepository behavior so that the
+    // compatibility write cannot prevent the Git-backed project update.
+    gitwebDescription = description;
   }
 
   ManifestStore manifestStore() {
