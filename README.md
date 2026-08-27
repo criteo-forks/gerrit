@@ -1,3 +1,13 @@
+# WalGerrit
+
+This repository is a fork of Gerrit Code Review `v3.12.2` that adds the narrow initialization seam
+required by the WalGerrit immutable-pack and manifest-CAS storage backend. The backend lives in
+[`plugins/walgerrit`](plugins/walgerrit); its
+[`JGit/CAS audit`](plugins/walgerrit/docs/jgit-cas-deep-dive.md) defines the correctness contract.
+The fork does not modify or fork JGit.
+
+The remainder of this README is the upstream Gerrit introduction and build documentation.
+
 # Gerrit Code Review
 
 [Gerrit](https://www.gerritcodereview.com) is a code review and project

@@ -50,8 +50,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   private final ThreadLocal<Boolean> refTransactionCommitted = new ThreadLocal<>();
   private volatile Set<ObjectId> shallowCommits = Collections.emptySet();
 
-  LocalWalGitObjectDatabase(
-      DfsRepository repository, ManifestStore manifestStore) {
+  LocalWalGitObjectDatabase(DfsRepository repository, ManifestStore manifestStore) {
     super(repository, new DfsReaderOptions());
     this.manifestStore = manifestStore;
   }
@@ -68,9 +67,22 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   @Override
   protected void commitPackImpl(
-      Collection<DfsPackDescription> descriptions,
-      Collection<DfsPackDescription> replacements)
+      Collection<DfsPackDescription> descriptions, Collection<DfsPackDescription> replacements)
       throws IOException {
+    for (DfsPackDescription description : descriptions) {
+      switch (description.getPackSource()) {
+        case GC:
+        case GC_REST:
+        case UNREACHABLE_GARBAGE:
+          throw new IOException(
+              "DfsGarbageCollector publication is disabled; use the leased DfsPackCompactor path");
+        case COMPACT:
+        case INSERT:
+        case RECEIVE:
+          break;
+      }
+    }
+
     for (DfsPackDescription description : descriptions) {
       for (PackExt extension : PackExt.values()) {
         if (description.hasFileExt(extension)) {
@@ -91,8 +103,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     }
 
     boolean writesReftable =
-        descriptions.stream()
-            .anyMatch(description -> description.hasFileExt(PackExt.REFTABLE));
+        descriptions.stream().anyMatch(description -> description.hasFileExt(PackExt.REFTABLE));
     boolean logicalRefUpdate =
         descriptions.stream()
             .anyMatch(
@@ -150,8 +161,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   @Override
   protected DfsOutputStream writeFile(DfsPackDescription description, PackExt extension)
       throws IOException {
-    return new FileDfsOutputStream(
-        manifestStore.stagingFile(description.getFileName(extension)));
+    return new FileDfsOutputStream(manifestStore.stagingFile(description.getFileName(extension)));
   }
 
   @Override
@@ -167,9 +177,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   @Override
   public long getApproximateObjectCount() {
     try {
-      return manifestStore.read().getPacksList().stream()
-          .mapToLong(PackRef::getObjectCount)
-          .sum();
+      return manifestStore.read().getPacksList().stream().mapToLong(PackRef::getObjectCount).sum();
     } catch (IOException exception) {
       return -1;
     }

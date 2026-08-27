@@ -13,9 +13,9 @@ Two boundaries remain:
 1. WalGerrit must supply stronger distributed publication and freshness behavior than JGit's
    process-local caches and locks provide. This belongs in the DFS backend and its
    `DfsReftableBatchRefUpdate` subclass.
-2. Gerrit 3.12.2 initialization contains direct `FileRepository` access that bypasses
-   `GitRepositoryManager`. This needs a small Gerrit fork/upstream patch. It is not a reason to fork
-   JGit.
+2. Gerrit 3.12.2 initialization contained direct `FileRepository` access that bypassed
+   `GitRepositoryManager`. This repository carries the small Gerrit fork patch that switches init
+   helpers to the configured manager. It is not a reason to fork JGit.
 
 The audit baseline is Gerrit `v3.12.2` and its pinned JGit revision
 [`010858e24f1860fc70ecce534a274def79826abb`](https://eclipse.googlesource.com/jgit/jgit/+/010858e24f1860fc70ecce534a274def79826abb/).
@@ -86,7 +86,7 @@ Writer affinity and batching reduce contention, but correctness never depends on
 | Reftable ordering | `ReftableDatabase.nextUpdateIndex` returns current max + 1; `DfsPackDescription.reftableComparator` orders the stack by source and update index | Persist min/max update indices and prevent two publications based on the same ref generation | Fits if the manifest CAS is enforced |
 | Reftable compaction during a ref update | `DfsReftableBatchRefUpdate` may fold the top table and pass it as `replaces` | Addition and superseded table are one manifest transaction | Fits cleanly |
 | Leased pack compaction | `DfsPackCompactor` supplies new descriptions and the source descriptions it replaces | WalGerrit owns the lease, stale-input check, manifest CAS, propagation, and retention | Correct production maintenance model |
-| Full DFS garbage collection | `DfsGarbageCollector` snapshots refs and packs, then commits several outputs and removals together | It is not the production maintenance path | Keep disabled |
+| Full DFS garbage collection | `DfsGarbageCollector` snapshots refs and packs, then commits several outputs and removals together | It is not the production maintenance path | Gerrit GC is disabled and the backend rejects its `GC`, `GC_REST`, and `UNREACHABLE_GARBAGE` publications |
 | MIDX | Optional `DfsMidxWriter`; covered-pack relationships live in `DfsPackDescription` | Persist the MIDX base and covered-pack graph before enabling it | Keep disabled until the manifest schema supports it |
 | Ref rename | `DfsRefRename` creates the destination and deletes the source as two updates; JGit contains a TODO to batch them | Provide an atomic WalGerrit override before exposing rename to plugins | Gerrit core does not currently call it, but it is not acceptable as a general API |
 | Cache refresh | `DfsRepository.scanForRepoChanges` clears ref and object caches | A newly opened repository starts from a fresh manifest; mutations force refresh before expected-ref validation | Fits with backend policy; long-lived readers need an explicit request-boundary revalidation contract |
@@ -159,7 +159,8 @@ behavior.
 
 ## Normative compaction model
 
-Ordinary Gerrit nodes never run JGit GC independently. `canPerformGC()` remains `false`.
+Ordinary Gerrit nodes never run JGit GC independently. `canPerformGC()` remains `false`, and the
+publication hook rejects all `DfsGarbageCollector` pack sources as defense in depth.
 
 A separate compactor does the following:
 
@@ -198,23 +199,28 @@ effects must likewise happen after publication and be replayable from the WAL.
 Gerrit's atomicity is per repository. Operations spanning multiple projects are not made globally
 atomic by a per-repository manifest; this is existing Gerrit behavior, not a JGit storage regression.
 
-## Required Gerrit fork
+## Gerrit fork seam
 
-The stock 3.12.2 server loads `installDbModule` and successfully creates the complete `All-Projects`
-and `All-Users` NoteDb schema through WalGerrit. Initialization then fails because init-only code
-opens `$site/git/All-Users` directly.
+The stock 3.12.2 server loads `installDbModule` and creates the complete `All-Projects` and
+`All-Users` NoteDb schema through WalGerrit. Unmodified init then fails because later init-only code
+opens repositories below `$site/git` directly.
 
 Direct filesystem assumptions exist in:
 
 - `AccountsOnInitNoteDbImpl`;
 - `GroupsOnInit`;
 - `ExternalIdsOnInit`;
-- `VersionedMetaDataOnInit`, used by initial authorized keys and auth tokens;
+- `VersionedMetaDataOnInit`, used by project config and initial authorized keys;
 - `GitRepositoryManagerOnInit`.
 
-The clean fork patch is to make init-time repository access delegate to the configured
-`GitRepositoryManager` after the system injector is available. It must not create a shadow local
-`All-Users` repository: that would split NoteDb state between two authorities.
+The fork now makes `GitRepositoryManagerOnInit` a switching manager. It preserves the filesystem
+fallback while init gathers configuration, then `SitePathInitializer.postRun` installs the system
+injector's configured `GitRepositoryManager` before any post-init step. All affected helpers use
+that switching manager. A missing pre-schema fallback repository remains an ordinary
+`RepositoryNotFoundException`, preserving upstream's empty-state behavior.
+
+The fresh-site smoke test completes init and reindex with no repository under `gerrit.basePath` and
+with both system projects present in the WalGerrit manifest store.
 
 This is a narrow Gerrit integration seam. Runtime NoteDb, fetch, push, and schema creation already
 operate through the repository manager and JGit APIs.
@@ -236,5 +242,8 @@ operate through the repository manager and JGit APIs.
 12. Full Gerrit init, reindex, daemon start, project creation, push, review mutation, submit, and
     restart against the backend.
 
-The local milestone currently covers gates 1, 2, 7, basic batch atomicity, reopen/recovery, and the
-schema-creation portion of gate 12. The remaining gates are release blockers, not optional polish.
+The local milestone covers gates 1-3, the object-ID part of gate 4, gate 5, gate 7, the core
+add-and-supersede/retention behavior in gate 10, basic batch atomicity, and reopen/recovery. Gate 12
+currently covers fresh init and reindex. Symbolic expected-old races, crash injection beyond lost
+post-rename acknowledgement, lease orchestration, two-node visibility, daemon/push/review/submit,
+and restart remain release blockers rather than optional polish.

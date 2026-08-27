@@ -17,13 +17,10 @@ package com.google.gerrit.pgm.init.api;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.GerritPersonIdentProvider;
-import com.google.gerrit.server.config.SitePaths;
 import com.google.gerrit.server.git.meta.VersionedMetaData;
-import java.io.File;
 import java.io.IOException;
-import java.nio.file.Path;
 import org.eclipse.jgit.errors.ConfigInvalidException;
-import org.eclipse.jgit.internal.storage.file.FileRepository;
+import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.lib.CommitBuilder;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectInserter;
@@ -31,21 +28,20 @@ import org.eclipse.jgit.lib.ObjectReader;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.Repository;
-import org.eclipse.jgit.lib.RepositoryCache.FileKey;
 import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
-import org.eclipse.jgit.util.FS;
 
 public abstract class VersionedMetaDataOnInit extends VersionedMetaData {
 
   protected final String project;
   private final InitFlags flags;
-  private final SitePaths site;
+  private final GitRepositoryManagerOnInit repositoryManager;
   private final String ref;
 
-  protected VersionedMetaDataOnInit(InitFlags flags, SitePaths site, String project, String ref) {
+  protected VersionedMetaDataOnInit(
+      InitFlags flags, GitRepositoryManagerOnInit repositoryManager, String project, String ref) {
     this.flags = flags;
-    this.site = site;
+    this.repositoryManager = repositoryManager;
     this.project = project;
     this.ref = ref;
   }
@@ -57,11 +53,10 @@ public abstract class VersionedMetaDataOnInit extends VersionedMetaData {
 
   @CanIgnoreReturnValue
   public VersionedMetaDataOnInit load() throws IOException, ConfigInvalidException {
-    File path = getPath();
-    if (path != null) {
-      try (Repository repo = new FileRepository(path)) {
-        load(Project.nameKey(project), repo);
-      }
+    try (Repository repo = repositoryManager.openRepository(Project.nameKey(project))) {
+      load(Project.nameKey(project), repo);
+    } catch (RepositoryNotFoundException e) {
+      // Preserve init's behavior when the project has not been created yet.
     }
     return this;
   }
@@ -71,7 +66,7 @@ public abstract class VersionedMetaDataOnInit extends VersionedMetaData {
   }
 
   protected void save(PersonIdent ident, String msg) throws IOException, ConfigInvalidException {
-    try (Repository repo = openGitRepository();
+    try (Repository repo = repositoryManager.openRepository(Project.nameKey(project));
         ObjectInserter i = repo.newObjectInserter();
         ObjectReader r = repo.newObjectReader();
         RevWalk rw = new RevWalk(r)) {
@@ -134,22 +129,5 @@ public abstract class VersionedMetaDataOnInit extends VersionedMetaData {
         throw new IOException(
             "Failed to update " + getRefName() + " of " + project + ": " + r.name());
     }
-  }
-
-  private File getPath() {
-    Path basePath = site.resolve(flags.cfg.getString("gerrit", null, "basePath"));
-    if (basePath == null) {
-      throw new IllegalStateException("gerrit.basePath must be configured");
-    }
-    return FileKey.resolve(basePath.resolve(project).toFile(), FS.DETECTED);
-  }
-
-  public Repository openGitRepository() throws IOException {
-    File path = getPath();
-    if (path == null) {
-      throw new IOException(project + " does not exist.");
-    }
-
-    return new FileRepository(path);
   }
 }

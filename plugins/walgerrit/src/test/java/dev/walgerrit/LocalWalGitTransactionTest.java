@@ -15,8 +15,10 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
 import dev.walgerrit.proto.StorageProto.LogEntry;
@@ -24,7 +26,15 @@ import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+import org.eclipse.jgit.internal.storage.dfs.DfsPackCompactor;
+import org.eclipse.jgit.internal.storage.dfs.DfsPackDescription;
+import org.eclipse.jgit.internal.storage.dfs.DfsPackFile;
+import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
+import org.eclipse.jgit.internal.storage.pack.PackExt;
 import org.eclipse.jgit.lib.BatchRefUpdate;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.NullProgressMonitor;
@@ -68,8 +78,7 @@ class LocalWalGitTransactionTest {
     assertEquals(sequenceBefore + 1, manifest.getHeadSeq());
     var lastLog = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
     LogEntry entry =
-        LogEntry.parseFrom(
-            Files.readAllBytes(repositoryPath(project).resolve(lastLog.getKey())));
+        LogEntry.parseFrom(Files.readAllBytes(repositoryPath(project).resolve(lastLog.getKey())));
     assertEquals(LogEntry.Kind.REF_UPDATE, entry.getKind());
     assertEquals(1, entry.getAdditionsCount());
 
@@ -106,8 +115,7 @@ class LocalWalGitTransactionTest {
   }
 
   @Test
-  void staleExpectedOldValueFailsWithoutChangingTheWinningRef()
-      throws Exception {
+  void staleExpectedOldValueFailsWithoutChangingTheWinningRef() throws Exception {
     WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/expected-old");
     ObjectId original;
@@ -144,8 +152,7 @@ class LocalWalGitTransactionTest {
   }
 
   @Test
-  void atomicBatchPublishesNothingWhenOneExpectedValueIsStale()
-      throws Exception {
+  void atomicBatchPublishesNothingWhenOneExpectedValueIsStale() throws Exception {
     WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/atomic-conflict");
     ObjectId original;
@@ -170,11 +177,9 @@ class LocalWalGitTransactionTest {
       winning.setForceUpdate(true);
       assertEquals(RefUpdate.Result.FORCED, winning.update());
 
-      ReceiveCommand staleMain =
-          new ReceiveCommand(original, other, Constants.R_HEADS + "main");
+      ReceiveCommand staleMain = new ReceiveCommand(original, other, Constants.R_HEADS + "main");
       ReceiveCommand mustNotAppear =
-          new ReceiveCommand(
-              ObjectId.zeroId(), other, Constants.R_HEADS + "must-not-appear");
+          new ReceiveCommand(ObjectId.zeroId(), other, Constants.R_HEADS + "must-not-appear");
       BatchRefUpdate update = stale.getRefDatabase().newBatchUpdate();
       update.setAtomic(true);
       update.setAllowNonFastForwards(true);
@@ -220,6 +225,89 @@ class LocalWalGitTransactionTest {
     }
   }
 
+  @Test
+  void jgitCompactorPublishesOneExactAddAndSupersedeTransaction() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    Project.NameKey project = Project.nameKey("platform/compaction");
+    ObjectId first;
+    ObjectId second;
+    Set<String> compactedInputs;
+
+    try (Repository repository = manager.createRepository(project)) {
+      first = WalGitRepositoryManagerTest.insertCommit(repository, "first pack");
+      second = WalGitRepositoryManagerTest.insertCommit(repository, "second pack");
+
+      DfsRepository dfsRepository = (DfsRepository) repository;
+      DfsPackFile[] inputs = dfsRepository.getObjectDatabase().getPacks();
+      assertEquals(2, inputs.length);
+      compactedInputs =
+          Arrays.stream(inputs)
+              .map(pack -> packName(pack.getPackDescription().getFileName(PackExt.PACK)))
+              .collect(Collectors.toUnmodifiableSet());
+
+      DfsPackCompactor compactor = new DfsPackCompactor(dfsRepository);
+      Arrays.stream(inputs).forEach(compactor::add);
+      compactor.compact(NullProgressMonitor.INSTANCE);
+
+      assertEquals(Constants.OBJ_COMMIT, repository.open(first, Constants.OBJ_COMMIT).getType());
+      assertEquals(Constants.OBJ_COMMIT, repository.open(second, Constants.OBJ_COMMIT).getType());
+    }
+
+    Path repositoryPath = repositoryPath(project);
+    Manifest manifest = manifest(project);
+    assertEquals(2, manifest.getPacksCount());
+    assertFalse(
+        manifest.getPacksList().stream()
+            .anyMatch(pack -> compactedInputs.contains(pack.getName())));
+    var compactedPacks =
+        manifest.getPacksList().stream()
+            .filter(pack -> pack.getSource().equals("COMPACT"))
+            .toList();
+    assertEquals(1, compactedPacks.size());
+    var compacted = compactedPacks.get(0);
+    assertTrue(
+        Files.isRegularFile(repositoryPath.resolve("wal").resolve(compacted.getName() + ".pack")));
+
+    var lastLog = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
+    LogEntry entry =
+        LogEntry.parseFrom(Files.readAllBytes(repositoryPath.resolve(lastLog.getKey())));
+    assertEquals(LogEntry.Kind.COMPACT, entry.getKind());
+    assertEquals(compactedInputs, Set.copyOf(entry.getSupersedesList()));
+    assertEquals(compacted.getName(), entry.getAdditions(0).getName());
+
+    for (String input : compactedInputs) {
+      assertTrue(Files.isRegularFile(repositoryPath.resolve("wal").resolve(input + ".pack")));
+      assertTrue(Files.isRegularFile(repositoryPath.resolve("wal").resolve(input + ".idx")));
+    }
+  }
+
+  @Test
+  void ordinaryDfsGarbageCollectorPublicationIsRejected() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    Project.NameKey project = Project.nameKey("platform/no-node-gc");
+
+    try (Repository repository = manager.createRepository(project)) {
+      LocalWalGitObjectDatabase objectDatabase =
+          (LocalWalGitObjectDatabase) repository.getObjectDatabase();
+      DfsPackDescription forbidden =
+          new DfsPackDescription(
+              ((DfsRepository) repository).getDescription(),
+              "forbidden-gc",
+              org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase.PackSource.GC);
+      long revisionBefore = manifest(project).getRevision();
+
+      IOException error =
+          assertThrows(
+              IOException.class,
+              () -> objectDatabase.commitPackImpl(List.of(forbidden), List.of()));
+
+      assertEquals(
+          "DfsGarbageCollector publication is disabled; use the leased DfsPackCompactor path",
+          error.getMessage());
+      assertEquals(revisionBefore, manifest(project).getRevision());
+    }
+  }
+
   private WalGitRepositoryManager manager() {
     return new WalGitRepositoryManager(new WalGitConfiguration(BackendType.LOCAL, storagePath));
   }
@@ -231,5 +319,9 @@ class LocalWalGitTransactionTest {
 
   private Path repositoryPath(Project.NameKey project) {
     return storagePath.resolve("repos").resolve(project.get() + ".git");
+  }
+
+  private static String packName(String fileName) {
+    return fileName.substring(0, fileName.length() - ".pack".length());
   }
 }

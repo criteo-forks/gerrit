@@ -29,6 +29,7 @@ import com.google.gerrit.entities.SubmitRequirementExpression;
 import com.google.gerrit.pgm.init.api.AllProjectsConfig;
 import com.google.gerrit.pgm.init.api.AllProjectsNameOnInitProvider;
 import com.google.gerrit.pgm.init.api.ConsoleUI;
+import com.google.gerrit.pgm.init.api.GitRepositoryManagerOnInit;
 import com.google.gerrit.pgm.init.api.InitStep;
 import com.google.gerrit.server.GerritPersonIdent;
 import com.google.gerrit.server.extensions.events.GitReferenceUpdated;
@@ -40,6 +41,7 @@ import com.google.inject.Singleton;
 import java.io.IOException;
 import java.util.Optional;
 import org.eclipse.jgit.errors.ConfigInvalidException;
+import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Repository;
@@ -51,6 +53,7 @@ public class InitLabels implements InitStep {
   private final ConsoleUI ui;
   private final AllProjectsConfig allProjectsConfig;
   private final AllProjectsNameOnInitProvider allProjectsName;
+  private final GitRepositoryManagerOnInit repositoryManager;
   private PersonIdent serverUser;
   private ProjectConfig.Factory projectConfigFactory;
   private SystemGroupBackend systemGroupBackend;
@@ -61,10 +64,12 @@ public class InitLabels implements InitStep {
   InitLabels(
       ConsoleUI ui,
       AllProjectsConfig allProjectsConfig,
-      AllProjectsNameOnInitProvider allProjectsName) {
+      AllProjectsNameOnInitProvider allProjectsName,
+      GitRepositoryManagerOnInit repositoryManager) {
     this.ui = ui;
     this.allProjectsConfig = allProjectsConfig;
     this.allProjectsName = allProjectsName;
+    this.repositoryManager = repositoryManager;
   }
 
   @Inject(optional = true)
@@ -84,8 +89,7 @@ public class InitLabels implements InitStep {
 
   @Override
   public void run() throws Exception {
-    Config cfg = allProjectsConfig.load().getConfig();
-    if (cfg == null || !cfg.getSubsections(KEY_LABEL).contains(VERIFIED)) {
+    if (shouldInstallVerified()) {
       ui.header("Review Labels");
       installVerified = ui.yesno(false, "Install Verified label");
     }
@@ -93,13 +97,23 @@ public class InitLabels implements InitStep {
 
   @Override
   public void postRun() throws Exception {
-    if (installVerified) {
+    // A non-local repository manager is only available after run(). Recheck
+    // the authoritative All-Projects state so an existing remote-backed site
+    // cannot overwrite a label that the filesystem fallback could not see.
+    if (installVerified && shouldInstallVerified()) {
       installVerified();
     }
   }
 
-  private void installVerified() throws IOException, ConfigInvalidException {
-    try (Repository git = allProjectsConfig.openGitRepository();
+  private boolean shouldInstallVerified() throws IOException, ConfigInvalidException {
+    Config cfg = allProjectsConfig.load().getConfig();
+    return cfg == null || !cfg.getSubsections(KEY_LABEL).contains(VERIFIED);
+  }
+
+  private void installVerified()
+      throws RepositoryNotFoundException, IOException, ConfigInvalidException {
+    try (Repository git =
+            repositoryManager.openRepository(Project.nameKey(allProjectsName.get()));
         MetaDataUpdate md =
             new MetaDataUpdate(
                 GitReferenceUpdated.DISABLED, Project.nameKey(allProjectsName.get()), git)) {

@@ -36,7 +36,10 @@ Compaction verifies that every superseded input is still live while preserving c
 2. **Implemented:** atomic JGit reftables published through the manifest CAS.
 3. **Implemented:** repository create, open, list, interrupted-create recovery, and stale-writer
    rejection.
-4. **Next:** replace local durable files with an object-store interface and bounded local cache.
-5. **Later:** a separately leased compactor using JGit/Git as the repacking engine, plus import,
-   integrity checking, checkpoints, deletion, retention, and snapshots. Ordinary Gerrit nodes never
-   run independent GC.
+4. **Implemented:** JGit `DfsPackCompactor` output is published as one exact add-and-supersede
+   manifest transaction; superseded files remain physically retained. Ordinary Gerrit GC is
+   disabled at the manager and rejected at the DFS publication hook.
+5. **Next:** replace local durable files with an object-store interface and bounded local cache, and
+   add the separate per-repository compaction lease.
+6. **Later:** reader-generation-aware reclamation, import, integrity checking, checkpoints,
+   deletion, and snapshots. Ordinary Gerrit nodes never run independent GC.

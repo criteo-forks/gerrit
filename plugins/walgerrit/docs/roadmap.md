@@ -6,7 +6,8 @@
 - [x] Route daemon and batch repository access through `WalGitRepositoryManager`.
 - [x] Delegate to local repositories as a behavioral control.
 - [x] Run unit tests and prove stock Gerrit schema creation uses the module.
-- [ ] Patch Gerrit's init-only direct `FileRepository` helpers to use `GitRepositoryManager`.
+- [x] Patch Gerrit's init-only direct `FileRepository` helpers to switch to the configured
+  `GitRepositoryManager` after the system injector is available.
 
 ## Milestone 1: local WalGit format
 
@@ -23,7 +24,7 @@
 
 ## Milestone 3: Gerrit workflows
 
-- Initialize `All-Projects` and `All-Users`.
+- [x] Initialize and reindex `All-Projects` and `All-Users` through WalGerrit.
 - Push `refs/for/*`, comment, vote, edit and submit.
 - Run two Gerrit instances against one backend with local Lucene indexes.
 - Consume existing Kafka index/cache events.
@@ -32,6 +33,8 @@
 
 - Import all repositories with full object-closure verification.
 - Add snapshots, integrity checks, and orphan cleanup.
-- Add a separate leased compactor: JGit/Git repacks once; WalGerrit publishes one exact
-  add-and-supersede manifest CAS and retains old files for older readers.
+- [x] Publish `DfsPackCompactor` output as one exact add-and-supersede manifest transaction while
+  retaining old files.
+- Add the per-repository compaction lease, scheduling, and reader-generation-aware physical
+  reclamation.
 - Document cutover and rollback.

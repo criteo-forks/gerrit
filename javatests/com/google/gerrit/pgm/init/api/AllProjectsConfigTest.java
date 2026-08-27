@@ -82,7 +82,10 @@ public class AllProjectsConfigTest {
 
     allProjectsConfig =
         new AllProjectsConfig(
-            new AllProjectsNameOnInitProvider(sections), configProvider, sitePaths, flags);
+            new AllProjectsNameOnInitProvider(sections),
+            configProvider,
+            flags,
+            new GitRepositoryManagerOnInit(flags, sitePaths));
   }
 
   @Test

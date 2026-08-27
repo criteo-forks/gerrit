@@ -20,7 +20,8 @@ The Java runtime is pinned in `.tool-versions`.
 ## Build
 
 ```bash
-mvn verify
+cd plugins/walgerrit
+./mvnw verify
 ```
 
 The deployable library is written to `target/walgerrit-0.1.0-SNAPSHOT.jar`.
@@ -50,17 +51,16 @@ is now stored below `data/walgerrit/repos/`; `gerrit.basePath` is not used by th
 This milestone is intended for a new Gerrit site. Importing existing repositories is deliberately
 not implicit and remains a later milestone.
 
-Run the integration probe against a stock Gerrit WAR:
+Build the fork WAR from the repository root, then run the fresh-site integration test:
 
 ```bash
-GERRIT_WAR=/path/to/gerrit-3.12.2.war scripts/smoke-test.sh
+npx @bazel/bazelisk build --config=java21 release
+GERRIT_WAR="$PWD/bazel-bin/release.war" plugins/walgerrit/scripts/smoke-test.sh
 ```
 
-The current probe demonstrates that stock Gerrit creates the `All-Projects` and `All-Users` NoteDb
-schema through WalGerrit, then exposes Gerrit's init-only direct `FileRepository` access. Completing
-init requires the narrow Gerrit patch described in the
-[JGit/CAS audit](docs/jgit-cas-deep-dive.md). The same module is loaded by daemon and batch programs;
-configuring a separate batch module would bind `GitRepositoryManager` twice.
+The test builds the backend, initializes a fresh Gerrit site, verifies the `All-Projects` and
+`All-Users` manifests, and reindexes entirely through WalGerrit. The same module is loaded by daemon
+and batch programs; configuring a separate batch module would bind `GitRepositoryManager` twice.
 
 ## Storage model
 
@@ -79,10 +79,11 @@ writer receives a JGit lock failure and must refresh before retrying. See the
 ## Fork boundary
 
 The storage engine does not require a JGit fork. Gerrit's runtime Git paths and schema creation use
-`GitRepositoryManager`, so the engine remains a separate module. Gerrit 3.12.2's init-only account,
-group, external-ID, authorized-key, and token helpers directly open repositories beneath
-`gerrit.basePath`; a thin Gerrit fork/upstream patch must route those helpers through the configured
-repository manager. A shadow local `All-Users` repository is not an acceptable workaround.
+`GitRepositoryManager`, so the engine remains a separate module inside this Gerrit fork. The fork
+changes Gerrit 3.12.2's init-only account, group, external-ID, authorized-key, and project-config
+helpers to use a switching init repository manager. Before the system injector exists it preserves
+Gerrit's local fallback; afterwards it delegates to the configured WalGerrit manager. No shadow
+local `All-Users` repository is created.
 
 The design follows Cursor's
 [Git at any scale](https://cursor.com/blog/git-at-any-scale) and uses
@@ -94,5 +95,7 @@ See [the architecture](docs/architecture.md), [CAS audit](docs/jgit-cas-deep-div
 ## Status
 
 Experimental. The local filesystem publication and concurrency contract is implemented and tested.
-S3-compatible storage, cache materialization, the Gerrit init patch, checkpoints, leased
-compaction, import, deletion, and production fault-injection are not implemented yet.
+The Gerrit init fork, fresh-site init/reindex, and JGit compactor-to-manifest publication path are
+also implemented and tested. S3-compatible storage, cache materialization, compactor lease
+orchestration, checkpoints, import, deletion, and production fault-injection are not implemented
+yet.

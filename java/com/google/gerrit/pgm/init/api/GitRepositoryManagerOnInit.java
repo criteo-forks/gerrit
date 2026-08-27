@@ -24,6 +24,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.NavigableSet;
+import java.util.Objects;
 import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.internal.storage.file.FileRepository;
 import org.eclipse.jgit.lib.Repository;
@@ -34,6 +35,7 @@ import org.eclipse.jgit.util.FS;
 public class GitRepositoryManagerOnInit implements GitRepositoryManager {
   private final InitFlags flags;
   private final SitePaths site;
+  private volatile GitRepositoryManager delegate;
 
   @Inject
   GitRepositoryManagerOnInit(InitFlags flags, SitePaths site) {
@@ -41,8 +43,27 @@ public class GitRepositoryManagerOnInit implements GitRepositoryManager {
     this.site = site;
   }
 
+  /**
+   * Switch init-time access to the repository manager selected by the system injector.
+   *
+   * <p>The filesystem fallback is needed while init is collecting configuration. Once the system
+   * injector exists, continuing to use it would create a second Git authority beside an installed
+   * repository-manager module.
+   */
+  public void setDelegate(GitRepositoryManager delegate) {
+    GitRepositoryManager newDelegate = Objects.requireNonNull(delegate);
+    if (newDelegate == this) {
+      throw new IllegalArgumentException("cannot delegate to self");
+    }
+    this.delegate = newDelegate;
+  }
+
   @Override
   public Status getRepositoryStatus(NameKey name) {
+    GitRepositoryManager current = delegate;
+    if (current != null) {
+      return current.getRepositoryStatus(name);
+    }
     try {
       @SuppressWarnings("unused")
       var unused = openRepository(name);
@@ -57,17 +78,48 @@ public class GitRepositoryManagerOnInit implements GitRepositoryManager {
   @Override
   public Repository openRepository(Project.NameKey name)
       throws RepositoryNotFoundException, IOException {
-    return new FileRepository(getPath(name));
+    GitRepositoryManager current = delegate;
+    if (current != null) {
+      return current.openRepository(name);
+    }
+    File path = getPath(name);
+    if (path == null) {
+      throw new RepositoryNotFoundException(name.get());
+    }
+    return new FileRepository(path);
   }
 
   @Override
-  public Repository createRepository(Project.NameKey name) {
+  public Repository createRepository(Project.NameKey name)
+      throws RepositoryNotFoundException, IOException {
+    GitRepositoryManager current = delegate;
+    if (current != null) {
+      return current.createRepository(name);
+    }
     throw new UnsupportedOperationException("not implemented");
   }
 
   @Override
   public NavigableSet<Project.NameKey> list() {
+    GitRepositoryManager current = delegate;
+    if (current != null) {
+      return current.list();
+    }
     throw new UnsupportedOperationException("not implemented");
+  }
+
+  @Override
+  public Boolean canPerformGC() {
+    GitRepositoryManager current = delegate;
+    return current != null ? current.canPerformGC() : false;
+  }
+
+  @Override
+  public void repositoryDeleted(Project.NameKey name) {
+    GitRepositoryManager current = delegate;
+    if (current != null) {
+      current.repositoryDeleted(name);
+    }
   }
 
   private File getPath(Project.NameKey name) {

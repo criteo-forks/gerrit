@@ -15,25 +15,23 @@
 package com.google.gerrit.pgm.init;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.util.Objects.requireNonNull;
 
 import com.google.gerrit.entities.Account;
+import com.google.gerrit.entities.Project;
 import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.pgm.init.api.AllUsersNameOnInitProvider;
+import com.google.gerrit.pgm.init.api.GitRepositoryManagerOnInit;
 import com.google.gerrit.pgm.init.api.InitFlags;
 import com.google.gerrit.server.GerritPersonIdentProvider;
 import com.google.gerrit.server.account.AccountDelta;
 import com.google.gerrit.server.account.AccountProperties;
 import com.google.gerrit.server.account.storage.notedb.AccountsNoteDbRepoReader;
-import com.google.gerrit.server.config.SitePaths;
 import com.google.inject.Inject;
-import java.io.File;
 import java.io.IOException;
-import java.nio.file.Path;
 import org.eclipse.jgit.dircache.DirCache;
 import org.eclipse.jgit.dircache.DirCacheEditor;
 import org.eclipse.jgit.dircache.DirCacheEntry;
-import org.eclipse.jgit.internal.storage.file.FileRepository;
+import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.lib.CommitBuilder;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
@@ -43,25 +41,25 @@ import org.eclipse.jgit.lib.ObjectInserter;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.Repository;
-import org.eclipse.jgit.lib.RepositoryCache;
-import org.eclipse.jgit.util.FS;
 
 public class AccountsOnInitNoteDbImpl implements AccountsOnInit {
   private final InitFlags flags;
-  private final SitePaths site;
   private final String allUsers;
+  private final GitRepositoryManagerOnInit repositoryManager;
 
   @Inject
-  AccountsOnInitNoteDbImpl(InitFlags flags, SitePaths site, AllUsersNameOnInitProvider allUsers) {
+  AccountsOnInitNoteDbImpl(
+      InitFlags flags,
+      AllUsersNameOnInitProvider allUsers,
+      GitRepositoryManagerOnInit repositoryManager) {
     this.flags = flags;
-    this.site = site;
     this.allUsers = allUsers.get();
+    this.repositoryManager = repositoryManager;
   }
 
   @Override
   public Account insert(Account.Builder account) throws IOException {
-    File path = getPath();
-    try (Repository repo = new FileRepository(path);
+    try (Repository repo = repositoryManager.openRepository(Project.nameKey(allUsers));
         ObjectInserter oi = repo.newObjectInserter()) {
       PersonIdent ident =
           new PersonIdent(new GerritPersonIdentProvider(flags.cfg).get(), account.registeredOn());
@@ -117,22 +115,10 @@ public class AccountsOnInitNoteDbImpl implements AccountsOnInit {
 
   @Override
   public boolean hasAnyAccount() throws IOException {
-    File path = getPath();
-    if (path == null) {
+    try (Repository repo = repositoryManager.openRepository(Project.nameKey(allUsers))) {
+      return AccountsNoteDbRepoReader.hasAnyAccount(repo);
+    } catch (RepositoryNotFoundException e) {
       return false;
     }
-
-    try (Repository repo = new FileRepository(path)) {
-      return AccountsNoteDbRepoReader.hasAnyAccount(repo);
-    }
-  }
-
-  private File getPath() {
-    Path basePath = site.resolve(flags.cfg.getString("gerrit", null, "basePath"));
-    requireNonNull(basePath, "gerrit.basePath must be configured");
-    File file = basePath.resolve(allUsers).toFile();
-    File resolvedFile = RepositoryCache.FileKey.resolve(file, FS.DETECTED);
-    requireNonNull(resolvedFile, () -> String.format("%s does not exist", file.getAbsolutePath()));
-    return resolvedFile;
   }
 }
