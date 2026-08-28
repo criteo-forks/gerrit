@@ -41,6 +41,12 @@ sub-indexes, groups, and projects. A missing payload, sequence gap, cursor/histo
 failure leaves the cursor unacknowledged and stops progress for that repository instead of silently
 skipping data.
 
+Before Gerrit's serving listeners start, a daemon must complete a clean sweep of every repository.
+Only then does it publish its node-local readiness marker and gauge. A failed background sweep
+revokes readiness while still attempting every repository, and a later clean sweep restores it.
+This is a consumer-health signal for the most recently completed sweep, not a cross-repository
+snapshot or a barrier against writes committed just afterward.
+
 Repository WAL streams have no global order. When an All-Users draft/star event depends on a change
 whose project stream has not yet been indexed, the event is retried rather than acknowledged.
 

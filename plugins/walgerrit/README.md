@@ -63,6 +63,13 @@ Add the following to `etc/gerrit.config`:
 is now stored below `data/walgerrit/repos/`; `gerrit.basePath` is not used by this backend.
 `indexCursorPath` must be node-local even when the WAL storage is shared.
 
+Daemon startup synchronously catches every node-local index cursor up to a freshly read manifest
+before Gerrit's SSH and HTTP listeners start. A successful full sweep publishes the gauge
+`walgerrit/index_events/ready` and creates `<indexCursorPath>/READY`; a later failed sweep or orderly
+shutdown revokes both. A Kubernetes readiness probe should require that marker and a successful
+request to the local Gerrit listener, so a marker left by a hard kill cannot make an early-starting
+container ready. See [WAL-driven index events](docs/index-events.md#startup-and-readiness).
+
 The zero `commitWithin` values are currently mandatory. WalGerrit advances a durable replay cursor
 only after synchronous Lucene writes; allowing Lucene to defer its disk commit could otherwise lose
 an acknowledged index event after a hard crash. The daemon refuses to start the tailer without
@@ -134,13 +141,13 @@ See [the architecture](docs/architecture.md), [CAS audit](docs/jgit-cas-deep-div
 ## Status
 
 Experimental. Local and S3-compatible manifest CAS, cache materialization, durable ref-event
-payloads, node-local replay cursors, and the Gerrit init/reindex path are implemented and tested. A
-two-node MinIO test passes project creation, `refs/for/*` push, cross-node review/vote, submit,
-search convergence, and restart without manual reindexing. The S3 object-store fault suite also
-passes.
+payloads, synchronous startup catch-up, node-local replay cursors and readiness, and the Gerrit
+init/reindex path are implemented and tested. A two-node MinIO test passes project creation,
+`refs/for/*` push, cross-node review/vote, submit, search convergence, and restart without manual
+reindexing. The S3 object-store fault suite also passes.
 
 It is not production-ready yet: compactor lease/fencing and generation-aware pack reclamation are
 still missing; index notification wakeups and scalable repository sweeping are not implemented;
 cursor-gap recovery and legacy-WAL cursor seeding need an operator command; the cache has no size
-bound; migration, deletion, metrics, integrity tooling, and broader Gerrit acceptance coverage
-remain open.
+bound; migration, deletion, replay-lag metrics, integrity tooling, and broader Gerrit acceptance
+coverage remain open.

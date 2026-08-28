@@ -15,6 +15,7 @@ The shared format mirrors the Continuity/WalGit layout while using JGit's native
   wal/                         # materialized immutable-file cache
 
 <indexCursorPath>/repos/<project>.git.cursor
+<indexCursorPath>/READY
 ```
 
 The local backend maps the shared object-store prefix and cache onto the same filesystem tree and
@@ -29,7 +30,8 @@ logical ref transaction (ref name, old/new object IDs, and new symbolic target).
 
 `indexCursorPath` is node-local and is not part of the shared object store. Its protobuf cursor
 identifies both the last applied sequence and the immutable log key at that sequence, which detects
-history replacement rather than trusting a sequence number alone.
+history replacement rather than trusting a sequence number alone. `READY` exists only while the
+daemon's most recently completed full index-event sweep was clean.
 
 ## Publication
 

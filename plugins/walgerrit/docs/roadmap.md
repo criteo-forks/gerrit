@@ -32,6 +32,7 @@
   indexes, including restart.
 - [x] Persist exact ref transactions in the WAL and replay them at least once into accounts,
   changes, groups, and projects indexes from node-local cursors.
+- [x] Block daemon startup on a full initial catch-up and publish node-local replay readiness.
 - [ ] Add object-store notification wakeups and a scalable sweep backstop.
 - [ ] Add legacy-WAL/full-reindex cursor seeding and sequence-gap recovery tooling.
 

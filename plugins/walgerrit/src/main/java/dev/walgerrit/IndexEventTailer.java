@@ -44,7 +44,9 @@ final class IndexEventTailer implements LifecycleListener {
   private final GerritRuntime runtime;
   private final String indexType;
   private final Config serverConfig;
+  private final IndexEventReadiness readiness;
   private ScheduledExecutorService executor;
+  private boolean participating;
 
   @Inject
   IndexEventTailer(
@@ -52,18 +54,27 @@ final class IndexEventTailer implements LifecycleListener {
       GerritIndexEventApplier applier,
       GerritRuntime runtime,
       IndexConfig indexConfig,
-      @GerritServerConfig Config serverConfig) {
+      @GerritServerConfig Config serverConfig,
+      IndexEventReadiness readiness) {
     this(
         asWalGit(repositories),
         (IndexEventApplier) applier,
         runtime,
         indexConfig.type(),
-        serverConfig);
+        serverConfig,
+        readiness);
   }
 
   IndexEventTailer(
       WalGitRepositoryManager repositories, IndexEventApplier applier, GerritRuntime runtime) {
-    this(repositories, applier, runtime, "lucene", new Config());
+    this(
+        repositories,
+        applier,
+        runtime,
+        "lucene",
+        new Config(),
+        new IndexEventReadiness(
+            repositories.configuration().indexCursorPath().resolve("READY")));
   }
 
   IndexEventTailer(
@@ -72,11 +83,29 @@ final class IndexEventTailer implements LifecycleListener {
       GerritRuntime runtime,
       String indexType,
       Config serverConfig) {
+    this(
+        repositories,
+        applier,
+        runtime,
+        indexType,
+        serverConfig,
+        new IndexEventReadiness(
+            repositories.configuration().indexCursorPath().resolve("READY")));
+  }
+
+  IndexEventTailer(
+      WalGitRepositoryManager repositories,
+      IndexEventApplier applier,
+      GerritRuntime runtime,
+      String indexType,
+      Config serverConfig,
+      IndexEventReadiness readiness) {
     this.repositories = repositories;
     this.applier = applier;
     this.runtime = runtime;
     this.indexType = indexType;
     this.serverConfig = serverConfig;
+    this.readiness = readiness;
   }
 
   @Override
@@ -85,48 +114,84 @@ final class IndexEventTailer implements LifecycleListener {
     if (runtime != GerritRuntime.DAEMON || !configuration.indexTailerEnabled()) {
       return;
     }
-    validateIndexDurability(indexType, serverConfig);
-    executor =
-        Executors.newSingleThreadScheduledExecutor(
-            runnable -> {
-              Thread thread = new Thread(runnable, "WalGerrit-Index-Events");
-              thread.setDaemon(true);
-              return thread;
-            });
-    executor.scheduleWithFixedDelay(
-        this::runSafely,
-        0,
-        Math.max(1, configuration.indexPollInterval().toMillis()),
-        TimeUnit.MILLISECONDS);
-    logger.info(
-        "WalGerrit index-event tailer started with {} poll interval",
-        configuration.indexPollInterval());
+    participating = true;
+    try {
+      readiness.beginStartup();
+      validateIndexDurability(indexType, serverConfig);
+      runOnce();
+
+      long pollMillis = Math.max(1, configuration.indexPollInterval().toMillis());
+      executor =
+          Executors.newSingleThreadScheduledExecutor(
+              runnable -> {
+                Thread thread = new Thread(runnable, "WalGerrit-Index-Events");
+                thread.setDaemon(true);
+                return thread;
+              });
+      executor.scheduleWithFixedDelay(
+          this::runBackgroundSweep, pollMillis, pollMillis, TimeUnit.MILLISECONDS);
+      readiness.markReady();
+      logger.info(
+          "WalGerrit index-event tailer is ready after synchronous catch-up; poll interval {}, "
+              + "marker {}",
+          configuration.indexPollInterval(),
+          readiness.markerPath());
+    } catch (IOException | RuntimeException exception) {
+      if (executor != null) {
+        executor.shutdownNow();
+        executor = null;
+      }
+      participating = false;
+      readiness.markNotReady();
+      throw new IllegalStateException(
+          "WalGerrit initial index-event catch-up failed; refusing to become ready", exception);
+    }
   }
 
   @Override
-  public synchronized void stop() {
-    if (executor == null) {
+  public void stop() {
+    ScheduledExecutorService runningExecutor;
+    synchronized (this) {
+      if (!participating) {
+        return;
+      }
+      participating = false;
+      readiness.markNotReady();
+      runningExecutor = executor;
+      executor = null;
+    }
+    if (runningExecutor == null) {
       return;
     }
-    executor.shutdownNow();
+    runningExecutor.shutdownNow();
     try {
-      if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+      if (!runningExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
         logger.warn("WalGerrit index-event tailer did not stop within 10 seconds");
       }
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
-    } finally {
-      executor = null;
     }
   }
 
-  void runOnce() {
+  void runOnce() throws IOException {
+    Exception firstFailure = null;
     for (Project.NameKey project : repositories.list()) {
       try {
         catchUp(project);
       } catch (IOException | RuntimeException exception) {
         logger.error("WalGerrit index-event replay failed for {}", project.get(), exception);
+        if (firstFailure == null) {
+          firstFailure = exception;
+        } else {
+          firstFailure.addSuppressed(exception);
+        }
       }
+    }
+    if (firstFailure instanceof IOException ioException) {
+      throw ioException;
+    }
+    if (firstFailure instanceof RuntimeException runtimeException) {
+      throw runtimeException;
     }
   }
 
@@ -167,11 +232,24 @@ final class IndexEventTailer implements LifecycleListener {
     return applied;
   }
 
-  private void runSafely() {
+  void runBackgroundSweep() {
     try {
       runOnce();
-    } catch (RuntimeException exception) {
-      logger.error("WalGerrit index-event sweep failed", exception);
+      synchronized (this) {
+        if (participating) {
+          readiness.markReady();
+        }
+      }
+    } catch (Throwable failure) {
+      synchronized (this) {
+        if (participating) {
+          readiness.markNotReady();
+        }
+      }
+      logger.error("WalGerrit index-event sweep failed", failure);
+      if (failure instanceof Error error) {
+        throw error;
+      }
     }
   }
 

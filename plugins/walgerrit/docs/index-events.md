@@ -13,10 +13,11 @@ notifications or gossip are only latency optimizations.
 2. JGit emits the immutable pack/index/reftable files.
 3. WalGerrit writes a WAL entry containing those files and every logical ref update.
 4. The manifest CAS publishes the files, refs, and index event together.
-5. Each Gerrit daemon periodically reads a fresh manifest for every repository and replays unseen
-   entries in sequence order.
+5. Before Gerrit's SSH or HTTP listeners start, each daemon reads a fresh manifest for every
+   repository and synchronously replays unseen entries in sequence order.
 6. After all synchronous index work for an entry succeeds, the daemon atomically writes its
    node-local cursor with the sequence and immutable log key.
+7. Only after a complete clean sweep does the daemon publish readiness and start periodic sweeps.
 
 If index work or the cursor write fails, the entry is retried. A crash after indexing but before the
 cursor write also replays the entry, which is safe because the operations are idempotent. A
@@ -76,7 +77,32 @@ The tailer also fails closed for:
 - a cursor whose saved log key no longer matches manifest history; or
 - any synchronous Gerrit index failure.
 
-One repository's failure is logged and does not stop other repositories from converging.
+One repository's failure is logged and does not stop the same sweep from converging other
+repositories. It does, however, fail the initial startup catch-up or revoke readiness during a
+background sweep. A later complete clean sweep restores readiness.
+
+## Startup and readiness
+
+The index lifecycle listener belongs to Gerrit's system injector, which starts before the SSH and
+HTTP injectors. Its first sweep is deliberately synchronous. If repository listing, WAL replay,
+index application, cursor persistence, or readiness publication fails, Gerrit startup fails rather
+than briefly serving with a stale local index.
+
+A ready node exposes the Gerrit callback gauge `walgerrit/index_events/ready = true` and atomically
+creates `<indexCursorPath>/READY`. Both remain false/absent until a full sweep succeeds and are
+revoked on a failed later sweep or orderly shutdown. The file is node-local, just like the cursors.
+
+For a Kubernetes `exec` readiness probe, combine the marker with a request to the node itself so a
+marker left by a hard-killed prior process cannot make the new container ready before Java starts:
+
+```sh
+test -f /var/gerrit/data/walgerrit-index-events/READY &&
+  curl -fsS http://127.0.0.1:8080/ >/dev/null
+```
+
+Adjust the site path and listener URL for the image. The signal means that the last full sweep was
+clean; it is not a global linearizable barrier against a ref transaction committed immediately
+after that sweep.
 
 ## Configuration
 

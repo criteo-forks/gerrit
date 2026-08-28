@@ -15,6 +15,7 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -27,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.RefUpdate;
@@ -154,6 +156,135 @@ class IndexEventTailerTest {
         new IndexCursorStore(secondStore.indexCursorPath()).read().getSequence());
   }
 
+  @Test
+  void startupSynchronouslyCatchesUpBeforePublishingReadiness() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    Project.NameKey project = Project.nameKey("platform/startup-catch-up");
+    manager.createRepository(project).close();
+
+    ObjectId commit;
+    try (Repository repository = manager.openRepository(project)) {
+      commit = WalGitRepositoryManagerTest.insertCommit(repository, "before startup");
+      RefUpdate update = repository.updateRef(Constants.R_HEADS + "main");
+      update.setNewObjectId(commit);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+    }
+
+    RecordingApplier applier = new RecordingApplier();
+    IndexEventReadiness readiness = readiness("startup-node");
+    IndexEventTailer tailer = startingTailer(manager, applier, readiness);
+    tailer.start();
+    try {
+      assertTrue(
+          applier.transactions.stream()
+              .flatMap(transaction -> transaction.getUpdatesList().stream())
+              .anyMatch(
+                  update ->
+                      update.getName().equals(Constants.R_HEADS + "main")
+                          && update.getNewObjectId().equals(commit.name())));
+      assertTrue(readiness.isReady());
+      assertTrue(Files.isRegularFile(readiness.markerPath()));
+
+      ManifestStore store = manager.storage().manifestStore(project);
+      assertEquals(
+          store.read().getHeadSeq(),
+          new IndexCursorStore(store.indexCursorPath()).read().getSequence());
+    } finally {
+      tailer.stop();
+    }
+    assertFalse(readiness.isReady());
+    assertTrue(Files.notExists(readiness.markerPath()));
+  }
+
+  @Test
+  void startupFailureClearsStaleMarkerAndRefusesReadiness() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    Project.NameKey project = Project.nameKey("platform/startup-failure");
+    manager.createRepository(project).close();
+
+    IndexEventReadiness readiness = readiness("failed-node");
+    Files.createDirectories(readiness.markerPath().getParent());
+    Files.writeString(readiness.markerPath(), "stale\n");
+    IndexEventTailer tailer =
+        startingTailer(
+            manager,
+            (ignoredProject, ignoredTransaction) -> {
+              throw new IllegalStateException("injected startup failure");
+            },
+            readiness);
+
+    IllegalStateException failure = assertThrows(IllegalStateException.class, tailer::start);
+
+    assertTrue(failure.getMessage().contains("refusing to become ready"));
+    assertFalse(readiness.isReady());
+    assertTrue(Files.notExists(readiness.markerPath()));
+  }
+
+  @Test
+  void failedBackgroundSweepRevokesReadinessUntilAFullSweepSucceeds() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    Project.NameKey project = Project.nameKey("platform/readiness-recovery");
+    manager.createRepository(project).close();
+
+    AtomicBoolean fail = new AtomicBoolean();
+    RecordingApplier recorded = new RecordingApplier();
+    IndexEventApplier applier =
+        (eventProject, transaction) -> {
+          if (fail.get()) {
+            throw new IllegalStateException("injected background failure");
+          }
+          recorded.apply(eventProject, transaction);
+        };
+    IndexEventReadiness readiness = readiness("recovering-node");
+    IndexEventTailer tailer = startingTailer(manager, applier, readiness);
+    tailer.start();
+    try {
+      try (Repository repository = manager.openRepository(project)) {
+        ObjectId commit = WalGitRepositoryManagerTest.insertCommit(repository, "during failure");
+        RefUpdate update = repository.updateRef(Constants.R_HEADS + "recovery");
+        update.setNewObjectId(commit);
+        assertEquals(RefUpdate.Result.NEW, update.update());
+      }
+
+      fail.set(true);
+      tailer.runBackgroundSweep();
+      assertFalse(readiness.isReady());
+      assertTrue(Files.notExists(readiness.markerPath()));
+
+      fail.set(false);
+      tailer.runBackgroundSweep();
+      assertTrue(readiness.isReady());
+      assertTrue(Files.isRegularFile(readiness.markerPath()));
+      assertTrue(
+          recorded.transactions.stream()
+              .flatMap(transaction -> transaction.getUpdatesList().stream())
+              .anyMatch(update -> update.getName().equals(Constants.R_HEADS + "recovery")));
+    } finally {
+      tailer.stop();
+    }
+  }
+
+  @Test
+  void batchLifecycleDoesNotRemoveDaemonReadinessMarker() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    IndexEventReadiness readiness = readiness("daemon-owned-marker");
+    Files.createDirectories(readiness.markerPath().getParent());
+    Files.writeString(readiness.markerPath(), "ready\n");
+    IndexEventTailer batch =
+        new IndexEventTailer(
+            manager,
+            new RecordingApplier(),
+            GerritRuntime.BATCH,
+            "lucene",
+            durableLuceneConfig(),
+            readiness);
+
+    batch.start();
+    batch.stop();
+
+    assertTrue(Files.isRegularFile(readiness.markerPath()));
+  }
+
   private static org.eclipse.jgit.lib.Config durableLuceneConfig() {
     org.eclipse.jgit.lib.Config config = new org.eclipse.jgit.lib.Config();
     for (String name :
@@ -176,6 +307,23 @@ class IndexEventTailerTest {
   private static IndexEventTailer tailer(
       WalGitRepositoryManager manager, IndexEventApplier applier) {
     return new IndexEventTailer(manager, applier, GerritRuntime.DAEMON);
+  }
+
+  private IndexEventReadiness readiness(String node) {
+    return new IndexEventReadiness(storagePath.resolve(node).resolve("READY"));
+  }
+
+  private static IndexEventTailer startingTailer(
+      WalGitRepositoryManager manager,
+      IndexEventApplier applier,
+      IndexEventReadiness readiness) {
+    return new IndexEventTailer(
+        manager,
+        applier,
+        GerritRuntime.DAEMON,
+        "lucene",
+        durableLuceneConfig(),
+        readiness);
   }
 
   private static final class RecordingApplier implements IndexEventApplier {
