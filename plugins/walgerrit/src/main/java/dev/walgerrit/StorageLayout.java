@@ -28,16 +28,19 @@ final class StorageLayout {
 
   private final ObjectStore objectStore;
   private final Path cacheRepositoriesPath;
+  private final Path indexCursorRepositoriesPath;
   private final String repositoriesPrefix;
 
   StorageLayout(Path root) {
-    this(new FileObjectStore(root), root, "");
+    this(new FileObjectStore(root), root, root.resolve("index-events"), "");
   }
 
-  StorageLayout(ObjectStore objectStore, Path cacheRoot, String prefix) {
+  StorageLayout(ObjectStore objectStore, Path cacheRoot, Path indexCursorRoot, String prefix) {
     this.objectStore = objectStore;
     cacheRepositoriesPath =
         cacheRoot.resolve(REPOSITORIES_DIRECTORY).toAbsolutePath().normalize();
+    indexCursorRepositoriesPath =
+        indexCursorRoot.resolve(REPOSITORIES_DIRECTORY).toAbsolutePath().normalize();
     String normalizedPrefix = prefix == null ? "" : prefix.replaceAll("/+$", "");
     repositoriesPrefix =
         normalizedPrefix.isEmpty()
@@ -50,6 +53,7 @@ final class StorageLayout {
     return new ManifestStore(
         new PrefixedObjectStore(objectStore, repositoriesPrefix + "/" + relative),
         cacheRepositoriesPath.resolve(relative),
+        indexCursorRepositoriesPath.resolve(relative + ".cursor"),
         name.get(),
         Clock.systemUTC(),
         ignored -> {});

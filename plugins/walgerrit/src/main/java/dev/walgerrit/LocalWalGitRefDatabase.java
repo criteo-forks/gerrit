@@ -133,6 +133,7 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
     @Override
     protected void applyUpdates(List<Ref> newRefs, List<ReceiveCommand> pending)
         throws IOException {
+      objectDatabase.recordRefTransaction(pending);
       try {
         super.applyUpdates(newRefs, pending);
       } catch (IOException exception) {

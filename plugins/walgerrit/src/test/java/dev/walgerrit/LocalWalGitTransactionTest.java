@@ -81,6 +81,19 @@ class LocalWalGitTransactionTest {
         LogEntry.parseFrom(Files.readAllBytes(repositoryPath(project).resolve(lastLog.getKey())));
     assertEquals(LogEntry.Kind.REF_UPDATE, entry.getKind());
     assertEquals(1, entry.getAdditionsCount());
+    assertTrue(entry.hasRefTransaction());
+    assertEquals(2, entry.getRefTransaction().getUpdatesCount());
+    assertEquals(
+        Set.of(Constants.R_HEADS + "first", Constants.R_HEADS + "second"),
+        entry.getRefTransaction().getUpdatesList().stream()
+            .map(update -> update.getName())
+            .collect(Collectors.toSet()));
+    assertTrue(
+        entry.getRefTransaction().getUpdatesList().stream()
+            .allMatch(
+                update ->
+                    update.getOldObjectId().equals(ObjectId.zeroId().name())
+                        && update.getNewObjectId().equals(commit.name())));
 
     try (Repository reopened = manager.openRepository(project)) {
       assertEquals(commit, reopened.exactRef(Constants.R_HEADS + "first").getObjectId());

@@ -18,16 +18,22 @@
 
 ## Milestone 2: S3-compatible storage
 
-- Replace local object operations with conditional S3 requests.
-- Add a bounded local pack cache.
-- Exercise concurrent writers and injected crash points.
+- [x] Replace local object operations with conditional S3 requests.
+- [x] Materialize immutable packs into a node-local cache on demand.
+- [x] Exercise concurrent writers, CAS conflicts, and ambiguous-success fault points against MinIO.
+- [ ] Add a size bound and eviction policy to the local pack cache.
 
 ## Milestone 3: Gerrit workflows
 
 - [x] Initialize and reindex `All-Projects` and `All-Users` through WalGerrit.
-- Push `refs/for/*`, comment, vote, edit and submit.
-- Run two Gerrit instances against one backend with local Lucene indexes.
-- Consume existing Kafka index/cache events.
+- [x] Push `refs/for/*`, comment, vote, and submit.
+- [ ] Exercise change edits and the wider Gerrit acceptance matrix.
+- [x] Run two Gerrit instances against one S3-compatible backend with independent local Lucene
+  indexes, including restart.
+- [x] Persist exact ref transactions in the WAL and replay them at least once into accounts,
+  changes, groups, and projects indexes from node-local cursors.
+- [ ] Add object-store notification wakeups and a scalable sweep backstop.
+- [ ] Add legacy-WAL/full-reindex cursor seeding and sequence-gap recovery tooling.
 
 ## Milestone 4: migration and operations
 
@@ -37,4 +43,5 @@
   retaining old files.
 - Add the per-repository compaction lease, scheduling, and reader-generation-aware physical
   reclamation.
+- Add index replay lag/error metrics and operational alerts.
 - Document cutover and rollback.

@@ -16,7 +16,9 @@ package dev.walgerrit;
 
 import java.net.URI;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import org.eclipse.jgit.lib.Config;
 
 /** Immutable WalGerrit configuration read from {@code gerrit.config}. */
@@ -27,13 +29,26 @@ record WalGitConfiguration(
     String s3Region,
     URI s3Endpoint,
     String s3Prefix,
-    boolean s3PathStyle) {
+    boolean s3PathStyle,
+    Path indexCursorPath,
+    boolean indexTailerEnabled,
+    Duration indexPollInterval) {
   private static final String SECTION = "walgerrit";
   private static final String BACKEND_KEY = "backend";
   private static final String STORAGE_PATH_KEY = "storagePath";
 
   WalGitConfiguration(BackendType backend, Path storagePath) {
-    this(backend, storagePath, null, "us-east-1", null, "", false);
+    this(
+        backend,
+        storagePath,
+        null,
+        "us-east-1",
+        null,
+        "",
+        false,
+        storagePath.resolve("index-events"),
+        true,
+        Duration.ofSeconds(5));
   }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
@@ -44,6 +59,11 @@ record WalGitConfiguration(
         configuredStoragePath == null
             ? sitePath.resolve("data/walgerrit")
             : sitePath.resolve(configuredStoragePath).normalize();
+    String configuredIndexCursorPath = config.getString(SECTION, null, "indexCursorPath");
+    Path indexCursorPath =
+        configuredIndexCursorPath == null
+            ? sitePath.resolve("data/walgerrit-index-events")
+            : sitePath.resolve(configuredIndexCursorPath).normalize();
     BackendType backend = BackendType.parse(configuredBackend);
     String endpoint = config.getString(SECTION, null, "s3Endpoint");
     WalGitConfiguration configuration =
@@ -55,7 +75,16 @@ record WalGitConfiguration(
                 .orElse("us-east-1"),
             endpoint == null || endpoint.isBlank() ? null : URI.create(endpoint),
             Optional.ofNullable(config.getString(SECTION, null, "s3Prefix")).orElse(""),
-            config.getBoolean(SECTION, null, "s3PathStyle", false));
+            config.getBoolean(SECTION, null, "s3PathStyle", false),
+            indexCursorPath.toAbsolutePath().normalize(),
+            config.getBoolean(SECTION, null, "indexTailerEnabled", true),
+            Duration.ofMillis(
+                config.getTimeUnit(
+                    SECTION,
+                    null,
+                    "indexPollInterval",
+                    TimeUnit.SECONDS.toMillis(5),
+                    TimeUnit.MILLISECONDS)));
     configuration.validate();
     return configuration;
   }
@@ -66,6 +95,9 @@ record WalGitConfiguration(
     }
     if (s3Prefix.startsWith("/") || s3Prefix.contains("..") || s3Prefix.indexOf('\\') >= 0) {
       throw new IllegalArgumentException("Invalid walgerrit.s3Prefix: " + s3Prefix);
+    }
+    if (indexPollInterval.isZero() || indexPollInterval.isNegative()) {
+      throw new IllegalArgumentException("walgerrit.indexPollInterval must be positive");
     }
   }
 }

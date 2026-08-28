@@ -17,6 +17,8 @@ package dev.walgerrit;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackFile;
 import dev.walgerrit.proto.StorageProto.PackRef;
+import dev.walgerrit.proto.StorageProto.RefTransaction;
+import dev.walgerrit.proto.StorageProto.RefUpdate;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -40,6 +42,7 @@ import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
 import org.eclipse.jgit.internal.storage.dfs.ReadableChannel;
 import org.eclipse.jgit.internal.storage.pack.PackExt;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.transport.ReceiveCommand;
 
 /** JGit DFS object database backed by immutable local files and a CAS manifest. */
 final class LocalWalGitObjectDatabase extends DfsObjDatabase {
@@ -48,6 +51,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   private final ManifestStore manifestStore;
   private final ThreadLocal<Long> refTransactionRevision = new ThreadLocal<>();
   private final ThreadLocal<Boolean> refTransactionCommitted = new ThreadLocal<>();
+  private final ThreadLocal<RefTransaction> refTransaction = new ThreadLocal<>();
   private volatile Set<ObjectId> shallowCommits = Collections.emptySet();
   private volatile long observedManifestRevision = -1;
 
@@ -116,11 +120,16 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     if (logicalRefUpdate && expectedRefRevision == null) {
       throw new IOException("Reftable publication is outside a ref transaction");
     }
+    RefTransaction logicalTransaction = refTransaction.get();
+    if (logicalRefUpdate && logicalTransaction == null) {
+      throw new IOException("Reftable publication has no recorded ref transaction");
+    }
     manifestStore.publish(
         expectedRefRevision == null ? 0 : expectedRefRevision,
         additions,
         supersedes,
-        logicalRefUpdate);
+        logicalRefUpdate,
+        logicalTransaction);
     if (logicalRefUpdate) {
       refTransactionCommitted.set(true);
     } else if (writesReftable) {
@@ -199,6 +208,22 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     clearCache();
   }
 
+  void recordRefTransaction(Collection<ReceiveCommand> commands) {
+    RefTransaction.Builder transaction = RefTransaction.newBuilder();
+    for (ReceiveCommand command : commands) {
+      RefUpdate.Builder update =
+          RefUpdate.newBuilder()
+              .setName(command.getRefName())
+              .setOldObjectId(command.getOldId().name())
+              .setNewObjectId(command.getNewId().name());
+      if (command.getNewSymref() != null) {
+        update.setNewSymbolicTarget(command.getNewSymref());
+      }
+      transaction.addUpdates(update);
+    }
+    refTransaction.set(transaction.build());
+  }
+
   boolean revalidateManifest() throws IOException {
     long revision = manifestStore.read().getRevision();
     if (revision == observedManifestRevision) {
@@ -222,6 +247,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   void endRefTransaction() {
     refTransactionRevision.remove();
     refTransactionCommitted.remove();
+    refTransaction.remove();
   }
 
   boolean refTransactionCommitted() {

@@ -18,6 +18,7 @@ import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.LogRef;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
+import dev.walgerrit.proto.StorageProto.RefTransaction;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -26,8 +27,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -44,6 +48,7 @@ final class ManifestStore {
 
   private final ObjectStore objectStore;
   private final Path repositoryPath;
+  private final Path indexCursorPath;
   private final Path stagingPath;
   private final Path walPath;
   private final String repositoryName;
@@ -66,6 +71,7 @@ final class ManifestStore {
     this(
         new FileObjectStore(repositoryPath),
         repositoryPath,
+        repositoryPath.resolve("index-events.cursor"),
         repositoryName,
         clock,
         ignored -> afterManifestCas.accept(repositoryPath.resolve(MANIFEST_FILE)));
@@ -77,8 +83,25 @@ final class ManifestStore {
       String repositoryName,
       Clock clock,
       IoConsumer<String> afterManifestCas) {
+    this(
+        objectStore,
+        repositoryPath,
+        repositoryPath.resolve("index-events.cursor"),
+        repositoryName,
+        clock,
+        afterManifestCas);
+  }
+
+  ManifestStore(
+      ObjectStore objectStore,
+      Path repositoryPath,
+      Path indexCursorPath,
+      String repositoryName,
+      Clock clock,
+      IoConsumer<String> afterManifestCas) {
     this.objectStore = objectStore;
     this.repositoryPath = repositoryPath.toAbsolutePath().normalize();
+    this.indexCursorPath = indexCursorPath.toAbsolutePath().normalize();
     this.repositoryName = repositoryName;
     this.clock = clock;
     this.afterManifestCas = afterManifestCas;
@@ -113,11 +136,97 @@ final class ManifestStore {
     return readVersioned().manifest();
   }
 
+  List<LogEntry> readLogEntriesAfter(long sequence, Manifest manifest) throws IOException {
+    if (sequence < 0 || sequence > manifest.getHeadSeq()) {
+      throw new IOException(
+          "Invalid WAL cursor " + sequence + " for head " + manifest.getHeadSeq());
+    }
+    List<LogRef> segments = new ArrayList<>(manifest.getLogSegmentsList());
+    segments.sort(Comparator.comparingLong(LogRef::getFirstSeq));
+    List<LogEntry> entries = new ArrayList<>();
+    long expected = sequence + 1;
+    for (LogRef segment : segments) {
+      if (segment.getLastSeq() <= sequence) {
+        continue;
+      }
+      if (segment.getFirstSeq() != segment.getLastSeq()) {
+        throw new IOException("Batched WAL segments are not supported yet: " + segment.getKey());
+      }
+      ObjectStore.StoredObject stored =
+          objectStore
+              .get(segment.getKey())
+              .orElseThrow(() -> new IOException("WAL segment not found: " + segment.getKey()));
+      LogEntry entry = LogEntry.parseFrom(stored.bytes());
+      if (entry.getSeq() != segment.getFirstSeq()) {
+        throw new IOException(
+            "WAL segment sequence mismatch for "
+                + segment.getKey()
+                + ": expected "
+                + segment.getFirstSeq()
+                + " but found "
+                + entry.getSeq());
+      }
+      if (entry.getSeq() != expected) {
+        throw new IOException(
+            "WAL gap for "
+                + repositoryName
+                + ": expected sequence "
+                + expected
+                + " but found "
+                + entry.getSeq());
+      }
+      entries.add(entry);
+      expected++;
+    }
+    if (expected != manifest.getHeadSeq() + 1) {
+      throw new IOException(
+          "WAL gap for "
+              + repositoryName
+              + ": expected through "
+              + manifest.getHeadSeq()
+              + " but reached "
+              + (expected - 1));
+    }
+    return entries;
+  }
+
+  String logKeyForSequence(Manifest manifest, long sequence) throws IOException {
+    if (sequence == 0) {
+      return "";
+    }
+    return manifest.getLogSegmentsList().stream()
+        .filter(segment -> segment.getFirstSeq() <= sequence && segment.getLastSeq() >= sequence)
+        .map(LogRef::getKey)
+        .findFirst()
+        .orElseThrow(
+            () ->
+                new IOException(
+                    "Manifest has no WAL segment for sequence "
+                        + sequence
+                        + " in "
+                        + repositoryName));
+  }
+
   Manifest publish(
       long expectedRefRevision,
       Collection<PackRef> additions,
       Collection<String> supersedes,
       boolean requireExactRefRevision)
+      throws IOException {
+    return publish(
+        expectedRefRevision,
+        additions,
+        supersedes,
+        requireExactRefRevision,
+        null);
+  }
+
+  Manifest publish(
+      long expectedRefRevision,
+      Collection<PackRef> additions,
+      Collection<String> supersedes,
+      boolean requireExactRefRevision,
+      RefTransaction refTransaction)
       throws IOException {
     createCacheDirectories();
     for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
@@ -149,6 +258,9 @@ final class ManifestStore {
               .setCreatedAtEpochMillis(now)
               .setWriter(writer)
               .setBaseRevision(current.getRevision());
+      if (refTransaction != null) {
+        entry.setRefTransaction(refTransaction);
+      }
       for (PackRef addition : additions) {
         PackRef published = addition.toBuilder().setSeq(sequence).build();
         if (livePacks.putIfAbsent(published.getName(), published) != null) {
@@ -243,6 +355,10 @@ final class ManifestStore {
 
   Path repositoryPath() {
     return repositoryPath;
+  }
+
+  Path indexCursorPath() {
+    return indexCursorPath;
   }
 
   private VersionedManifest readVersioned() throws IOException {

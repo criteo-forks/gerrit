@@ -15,10 +15,12 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import org.eclipse.jgit.lib.Config;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -34,6 +36,11 @@ class WalGitConfigurationTest {
     assertEquals(
         sitePath.resolve("data/walgerrit").toAbsolutePath().normalize(),
         configuration.storagePath());
+    assertEquals(
+        sitePath.resolve("data/walgerrit-index-events").toAbsolutePath().normalize(),
+        configuration.indexCursorPath());
+    assertTrue(configuration.indexTailerEnabled());
+    assertEquals(Duration.ofSeconds(5), configuration.indexPollInterval());
   }
 
   @Test
@@ -58,6 +65,9 @@ class WalGitConfigurationTest {
     config.setString("walgerrit", null, "s3Endpoint", "http://127.0.0.1:9000");
     config.setString("walgerrit", null, "s3Prefix", "test-prefix");
     config.setBoolean("walgerrit", null, "s3PathStyle", true);
+    config.setBoolean("walgerrit", null, "indexTailerEnabled", false);
+    config.setString("walgerrit", null, "indexPollInterval", "250 ms");
+    config.setString("walgerrit", null, "indexCursorPath", "data/index-cursors");
 
     WalGitConfiguration configuration = WalGitConfiguration.from(config, sitePath);
 
@@ -67,6 +77,24 @@ class WalGitConfigurationTest {
     assertEquals("http://127.0.0.1:9000", configuration.s3Endpoint().toString());
     assertEquals("test-prefix", configuration.s3Prefix());
     assertTrue(configuration.s3PathStyle());
+    assertEquals(
+        sitePath.resolve("data/index-cursors").toAbsolutePath().normalize(),
+        configuration.indexCursorPath());
+    assertFalse(configuration.indexTailerEnabled());
+    assertEquals(Duration.ofMillis(250), configuration.indexPollInterval());
+  }
+
+  @Test
+  void indexPollIntervalMustBePositive() {
+    Config config = new Config();
+    config.setString("walgerrit", null, "indexPollInterval", "0 ms");
+
+    IllegalArgumentException exception =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> WalGitConfiguration.from(config, sitePath));
+
+    assertTrue(exception.getMessage().contains("indexPollInterval must be positive"));
   }
 
   @Test

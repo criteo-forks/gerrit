@@ -31,6 +31,7 @@ import org.eclipse.jgit.lib.Repository;
 /** Gerrit's repository-manager entry point for WalGit-backed storage. */
 @Singleton
 public final class WalGitRepositoryManager implements GitRepositoryManager {
+  private final WalGitConfiguration configuration;
   private final StorageLayout storage;
 
   @Inject
@@ -39,9 +40,15 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
   }
 
   WalGitRepositoryManager(WalGitConfiguration configuration) {
+    this.configuration = configuration;
     storage =
         switch (configuration.backend()) {
-          case LOCAL -> new StorageLayout(configuration.storagePath());
+          case LOCAL ->
+              new StorageLayout(
+                  new FileObjectStore(configuration.storagePath()),
+                  configuration.storagePath(),
+                  configuration.indexCursorPath(),
+                  "");
           case S3 ->
               new StorageLayout(
                   new S3ObjectStore(
@@ -50,6 +57,7 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
                       configuration.s3Endpoint(),
                       configuration.s3PathStyle()),
                   configuration.storagePath(),
+                  configuration.indexCursorPath(),
                   configuration.s3Prefix());
         };
   }
@@ -102,6 +110,14 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
   @Override
   public void repositoryDeleted(Project.NameKey name) {
     // Durable deletion requires a tombstone transaction and is intentionally not inferred from this hook.
+  }
+
+  WalGitConfiguration configuration() {
+    return configuration;
+  }
+
+  StorageLayout storage() {
+    return storage;
   }
 
   private static LocalWalGitRepository openInitialized(

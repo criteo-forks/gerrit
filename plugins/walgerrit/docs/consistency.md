@@ -1,10 +1,8 @@
 # Consistency contract
 
-The object-store backend is not complete until it provides all of the following properties.
-
-The Milestone 1 local backend implements this ordering with atomic filesystem moves and a locked
-manifest compare-and-swap. Milestone 2 must preserve the same contract through conditional object
-store operations.
+Both storage backends provide the same publication contract. The local backend uses atomic
+filesystem moves and a locked manifest compare-and-swap. The S3 backend uses immutable puts and a
+conditional manifest request.
 
 ## Publication order
 
@@ -32,5 +30,18 @@ reftable stack advances the ref revision.
 ## Derived state
 
 Lucene indexes and caches are not part of the Git transaction. They are updated after publication
-and remain rebuildable from Git/NoteDb. Event delivery may be at least once because Gerrit index
-updates are idempotent.
+and remain rebuildable from Git/NoteDb. The complete logical ref transaction is stored in the
+immutable WAL entry before the manifest CAS. A node processes entries in repository sequence order
+and atomically advances its node-local cursor only after the synchronous index applications return.
+Delivery is at least once because Gerrit index replacements and deletions are idempotent.
+
+The cursor is safe across hard crashes only when every affected Lucene index commits each write to
+stable storage. WalGerrit therefore requires `commitWithin = 0` for accounts, both change
+sub-indexes, groups, and projects. A missing payload, sequence gap, cursor/history mismatch, or index
+failure leaves the cursor unacknowledged and stops progress for that repository instead of silently
+skipping data.
+
+Repository WAL streams have no global order. When an All-Users draft/star event depends on a change
+whose project stream has not yet been indexed, the event is retried rather than acknowledged.
+
+See [WAL-driven index events](index-events.md) for mappings and operational limitations.

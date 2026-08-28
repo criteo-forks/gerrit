@@ -36,8 +36,14 @@ cp target/walgerrit-0.1.0-SNAPSHOT.jar "$site/lib/walgerrit.jar"
 
 git config --file "$site/etc/gerrit.config" \
   --add gerrit.installDbModule dev.walgerrit.WalGitModule
+git config --file "$site/etc/gerrit.config" \
+  --add gerrit.installModule dev.walgerrit.WalGitIndexModule
 git config --file "$site/etc/gerrit.config" walgerrit.backend local
 git config --file "$site/etc/gerrit.config" walgerrit.storagePath data/walgerrit
+git config --file "$site/etc/gerrit.config" walgerrit.indexCursorPath data/walgerrit-index-events
+for index_name in accounts changes_open changes_closed groups projects; do
+  git config --file "$site/etc/gerrit.config" "index.${index_name}.commitWithin" 0
+done
 
 run_gerrit init --batch --no-auto-start -d "$site"
 test -f "$site/data/walgerrit/repos/All-Projects.git/manifest.pb"

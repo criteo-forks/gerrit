@@ -66,4 +66,29 @@ message LogEntry {
   int64 created_at_epoch_millis = 5;
   string writer = 6;
   uint64 base_revision = 7;
+  // Present for REF_UPDATE. This is the logical transaction whose reftable
+  // publication became durable at this sequence. Secondary-index followers
+  // replay it from the WAL; it is deliberately recorded before the manifest
+  // CAS so an acknowledged ref update can never lose its index event.
+  RefTransaction ref_transaction = 8;
+}
+
+message RefUpdate {
+  string name = 1;
+  // Full hexadecimal object IDs. The all-zero ID means the ref did not exist.
+  string old_object_id = 2;
+  string new_object_id = 3;
+  // Set when the new value is symbolic (for example HEAD -> refs/heads/main).
+  string new_symbolic_target = 4;
+}
+
+message RefTransaction {
+  repeated RefUpdate updates = 1;
+}
+
+// Node-local acknowledgement of secondary-index replay. It is stored beside
+// that node's Lucene indexes, never in the shared object store.
+message IndexCursor {
+  uint64 sequence = 1;
+  string log_key = 2;
 }
