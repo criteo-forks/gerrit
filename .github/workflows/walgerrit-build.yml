@@ -24,7 +24,10 @@ jobs:
       - name: Check out Gerrit and pinned submodules
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          # The WalGerrit branch is only a handful of commits above v3.14.2. Keep enough history
+          # for Gerrit's version stamping without cloning the entire Gerrit project history.
+          fetch-depth: 50
+          fetch-tags: true
           submodules: recursive
 
       - name: Set up Java 21
