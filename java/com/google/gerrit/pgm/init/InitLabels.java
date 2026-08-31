@@ -112,8 +112,7 @@ public class InitLabels implements InitStep {
 
   private void installVerified()
       throws RepositoryNotFoundException, IOException, ConfigInvalidException {
-    try (Repository git =
-            repositoryManager.openRepository(Project.nameKey(allProjectsName.get()));
+    try (Repository git = repositoryManager.openRepository(Project.nameKey(allProjectsName.get()));
         MetaDataUpdate md =
             new MetaDataUpdate(
                 GitReferenceUpdated.DISABLED, Project.nameKey(allProjectsName.get()), git)) {

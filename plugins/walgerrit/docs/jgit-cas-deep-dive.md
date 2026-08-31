@@ -13,16 +13,23 @@ Two boundaries remain:
 1. WalGerrit must supply stronger distributed publication and freshness behavior than JGit's
    process-local caches and locks provide. This belongs in the DFS backend and its
    `DfsReftableBatchRefUpdate` subclass.
-2. Gerrit 3.12.2 initialization contained direct `FileRepository` access that bypassed
+2. Gerrit 3.14.2 initialization contained direct `FileRepository` access that bypassed
    `GitRepositoryManager`. This repository carries the small Gerrit fork patch that switches init
    helpers to the configured manager. It is not a reason to fork JGit.
 
-The audit baseline is Gerrit `v3.12.2` and its pinned JGit revision
-[`010858e24f1860fc70ecce534a274def79826abb`](https://eclipse.googlesource.com/jgit/jgit/+/010858e24f1860fc70ecce534a274def79826abb/).
+The audit baseline is Gerrit `v3.14.2` and its pinned JGit revision
+[`38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/).
 The storage rules come from Cursor's
 [`Git at scale`](https://cursor.com/blog/git-at-any-scale) and the executable design in
 [`tobi/walgit`](https://github.com/tobi/walgit), inspected at
 [`6d8fa54ba0f83072a1a50317bb6c8c1afa5a3cd1`](https://github.com/tobi/walgit/commit/6d8fa54ba0f83072a1a50317bb6c8c1afa5a3cd1).
+
+The 3.14.2 re-audit confirms that JGit 7.7 retains `commitPack(newPacks, replacements)`,
+`DfsPackCompactor.getNewPacks()`, and `getSourcePacks()`. Its new compactor pre-commit hook can add
+pack descriptions to the same call but does not weaken that transaction boundary. JGit 7.7 also
+adds optional multi-pack-index descriptions; WalGerrit explicitly disables them because the
+current manifest records independent pack families rather than MIDX coverage. Adding MIDX later
+requires an explicit storage-format extension and fault tests, not an implicit JGit config change.
 
 ## Reference invariants
 
@@ -92,10 +99,10 @@ Writer affinity and batching reduce contention, but correctness never depends on
 | Cache refresh | `DfsRepository.scanForRepoChanges` clears ref and object caches | A newly opened repository starts from a fresh manifest; mutations force refresh before expected-ref validation | Fits with backend policy; long-lived readers need an explicit request-boundary revalidation contract |
 
 The relevant JGit sources are
-[`DfsObjDatabase`](https://eclipse.googlesource.com/jgit/jgit/+/010858e24f1860fc70ecce534a274def79826abb/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsObjDatabase.java),
-[`DfsReftableDatabase`](https://eclipse.googlesource.com/jgit/jgit/+/010858e24f1860fc70ecce534a274def79826abb/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsReftableDatabase.java),
-[`DfsReftableBatchRefUpdate`](https://eclipse.googlesource.com/jgit/jgit/+/010858e24f1860fc70ecce534a274def79826abb/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsReftableBatchRefUpdate.java), and
-[`ReftableBatchRefUpdate`](https://eclipse.googlesource.com/jgit/jgit/+/010858e24f1860fc70ecce534a274def79826abb/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/reftable/ReftableBatchRefUpdate.java).
+[`DfsObjDatabase`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsObjDatabase.java),
+[`DfsReftableDatabase`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsReftableDatabase.java),
+[`DfsReftableBatchRefUpdate`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsReftableBatchRefUpdate.java), and
+[`ReftableBatchRefUpdate`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/reftable/ReftableBatchRefUpdate.java).
 
 ## Logical ref transaction
 
@@ -201,7 +208,7 @@ atomic by a per-repository manifest; this is existing Gerrit behavior, not a JGi
 
 ## Gerrit fork seam
 
-The stock 3.12.2 server loads `installDbModule` and creates the complete `All-Projects` and
+The stock 3.14.2 server loads `installDbModule` and creates the complete `All-Projects` and
 `All-Users` NoteDb schema through WalGerrit. Unmodified init then fails because later init-only code
 opens repositories below `$site/git` directly.
 

@@ -27,6 +27,7 @@ js-to-ts.sh
 /bazel-*
 /bin/
 /bower_components/
+/dist/
 /eclipse-out
 /extras
 /gerrit-package-plugins

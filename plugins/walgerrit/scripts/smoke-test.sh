@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ -z "${GERRIT_WAR:-}" ]]; then
-  echo "Set GERRIT_WAR to the WalGerrit fork's Gerrit 3.12.2 WAR." >&2
+  echo "Set GERRIT_WAR to the WalGerrit fork's Gerrit 3.14.2 WAR." >&2
   exit 2
 fi
 

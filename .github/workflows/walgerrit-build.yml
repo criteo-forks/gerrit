@@ -1,0 +1,65 @@
+name: WalGerrit build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - walgerrit-3.14
+  pull_request:
+    branches:
+      - walgerrit-3.14
+
+permissions:
+  contents: read
+
+concurrency:
+  group: walgerrit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out Gerrit and pinned submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: plugins/walgerrit/pom.xml
+
+      - name: Test and package WalGerrit
+        working-directory: plugins/walgerrit
+        run: ./mvnw --batch-mode --no-transfer-progress verify
+
+      - name: Build Gerrit 3.14.2 release WAR
+        run: npx --yes @bazel/bazelisk build --config=java21 //:release
+
+      - name: Exercise fresh-site init, reindex, daemon startup, and readiness
+        env:
+          GERRIT_WAR: ${{ github.workspace }}/bazel-bin/release.war
+        run: plugins/walgerrit/scripts/smoke-test.sh
+
+      - name: Assemble deployment bundle
+        run: |
+          mkdir -p dist
+          cp bazel-bin/release.war dist/gerrit.war
+          cp plugins/walgerrit/target/walgerrit-0.1.0-SNAPSHOT.jar dist/walgerrit.jar
+          cp plugins/walgerrit/docs/artifact-bundle.md dist/INSTALL.md
+          cd dist
+          sha256sum gerrit.war walgerrit.jar > SHA256SUMS
+
+      - name: Upload deployment bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: walgerrit-3.14.2-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

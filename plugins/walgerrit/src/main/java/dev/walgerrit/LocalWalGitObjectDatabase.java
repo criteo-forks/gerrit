@@ -58,6 +58,10 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   LocalWalGitObjectDatabase(DfsRepository repository, ManifestStore manifestStore) {
     super(repository, new DfsReaderOptions());
     this.manifestStore = manifestStore;
+    // JGit 7.7 can synthesize multi-pack-index descriptions. WalGerrit's manifest currently
+    // records independent immutable pack families, not MIDX coverage, so keep this representation
+    // disabled even if a future repository config attempts to enable it.
+    setUseMultipackIndex(false);
   }
 
   ManifestStore manifestStore() {

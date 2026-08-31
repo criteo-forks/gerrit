@@ -14,7 +14,7 @@ required for the implemented workflow.
 
 - Java 21
 - Maven 3.9 or newer
-- Gerrit 3.12.2
+- Gerrit 3.14.2
 
 The Java runtime is pinned in `.tool-versions`.
 
@@ -126,7 +126,7 @@ for the local-Lucene convergence and recovery contract.
 
 The storage engine does not require a JGit fork. Gerrit's runtime Git paths and schema creation use
 `GitRepositoryManager`, so the engine remains a separate module inside this Gerrit fork. The fork
-changes Gerrit 3.12.2's init-only account, group, external-ID, authorized-key, and project-config
+changes Gerrit 3.14.2's init-only account, group, external-ID, authorized-key, and project-config
 helpers to use a switching init repository manager. Before the system injector exists it preserves
 Gerrit's local fallback; afterwards it delegates to the configured WalGerrit manager. No shadow
 local `All-Users` repository is created.

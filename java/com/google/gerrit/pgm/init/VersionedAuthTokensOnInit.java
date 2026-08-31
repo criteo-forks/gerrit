@@ -22,12 +22,12 @@ import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.pgm.init.api.AllUsersNameOnInitProvider;
+import com.google.gerrit.pgm.init.api.GitRepositoryManagerOnInit;
 import com.google.gerrit.pgm.init.api.InitFlags;
 import com.google.gerrit.pgm.init.api.VersionedMetaDataOnInit;
 import com.google.gerrit.server.account.AuthToken;
 import com.google.gerrit.server.account.InvalidAuthTokenException;
 import com.google.gerrit.server.account.VersionedAuthTokens;
-import com.google.gerrit.server.config.SitePaths;
 import com.google.inject.Inject;
 import com.google.inject.assistedinject.Assisted;
 import java.io.IOException;
@@ -49,10 +49,10 @@ public class VersionedAuthTokensOnInit extends VersionedMetaDataOnInit {
   @Inject
   public VersionedAuthTokensOnInit(
       AllUsersNameOnInitProvider allUsers,
-      SitePaths site,
+      GitRepositoryManagerOnInit repositoryManager,
       InitFlags flags,
       @Assisted Account.Id accountId) {
-    super(flags, site, allUsers.get(), RefNames.refsUsers(accountId));
+    super(flags, repositoryManager, allUsers.get(), RefNames.refsUsers(accountId));
   }
 
   @Override

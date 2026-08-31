@@ -2,7 +2,7 @@
 
 ## Milestone 0: extension boundary
 
-- [x] Load a library module in stock Gerrit 3.12.2.
+- [x] Load a library module in stock Gerrit 3.14.2.
 - [x] Route daemon and batch repository access through `WalGitRepositoryManager`.
 - [x] Delegate to local repositories as a behavioral control.
 - [x] Run unit tests and prove stock Gerrit schema creation uses the module.
