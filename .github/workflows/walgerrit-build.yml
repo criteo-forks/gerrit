@@ -105,7 +105,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$RELEASE_TAG" \
+          gh release create --repo "$GITHUB_REPOSITORY" "$RELEASE_TAG" \
             dist/gerrit.war \
             dist/walgerrit.jar \
             dist/SHA256SUMS \
