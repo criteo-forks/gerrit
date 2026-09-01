@@ -13,6 +13,12 @@ if [[ ! -f "$GERRIT_WAR" ]]; then
 fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+walgerrit_jar="${WALGERRIT_JAR:-$repo_root/target/walgerrit-0.1.0-SNAPSHOT.jar}"
+if [[ ! -f "$walgerrit_jar" ]]; then
+  echo "WALGERRIT_JAR does not exist: $walgerrit_jar" >&2
+  exit 2
+fi
+
 site=$(mktemp -d "${TMPDIR:-/tmp}/walgerrit-smoke.XXXXXX")
 mkdir -p "$site/etc" "$site/home" "$site/lib"
 daemon_pid=""
@@ -37,7 +43,7 @@ run_gerrit() {
   java -Duser.home="$site/home" -jar "$GERRIT_WAR" "$@"
 }
 
-cp target/walgerrit-0.1.0-SNAPSHOT.jar "$site/lib/walgerrit.jar"
+cp "$walgerrit_jar" "$site/lib/walgerrit.jar"
 
 git config --file "$site/etc/gerrit.config" \
   --add gerrit.installDbModule dev.walgerrit.WalGitModule
