@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - walgerrit-3.14
+    tags:
+      - walgerrit-3.14.2-*
   pull_request:
     branches:
       - walgerrit-3.14
@@ -76,3 +78,42 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 30
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/walgerrit-3.14.2-')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested deployment bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: walgerrit-3.14.2-${{ github.sha }}
+          path: dist
+
+      - name: Verify release payload
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          test "$(cat dist/SOURCE_COMMIT)" = "$SOURCE_COMMIT"
+          cd dist
+          sha256sum --check SHA256SUMS
+
+      - name: Publish immutable GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            dist/gerrit.war \
+            dist/walgerrit.jar \
+            dist/SHA256SUMS \
+            dist/SOURCE_COMMIT \
+            dist/GERRIT_VERSION \
+            dist/INSTALL.md \
+            dist/walgerrit-gerritpoc-bundle.tar.gz \
+            --verify-tag \
+            --prerelease \
+            --title "WalGerrit 3.14.2 PoC ${RELEASE_TAG}" \
+            --notes "Tested Gerrit PoC payload built from ${GITHUB_SHA}. The WAR and WalGerrit library must be consumed together; verify them with SHA256SUMS."
