@@ -19,26 +19,42 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Stream;
 
 /** Filesystem implementation of the versioned object-store contract. */
 final class FileObjectStore implements ObjectStore {
-  private static final Map<Path, ReentrantLock> JVM_LOCKS = new ConcurrentHashMap<>();
+  /**
+   * Writers of the same key serialize on one of these stripes, and the matching lock file extends
+   * the exclusion across processes. Striping keeps both the lock objects and the lock files bounded
+   * no matter how many objects a store ever holds; a per-key map grew with every object written.
+   */
+  private static final int LOCK_STRIPES = 256;
+
+  private static final ReentrantLock[] JVM_LOCKS = new ReentrantLock[LOCK_STRIPES];
+
+  static {
+    for (int stripe = 0; stripe < LOCK_STRIPES; stripe++) {
+      JVM_LOCKS[stripe] = new ReentrantLock();
+    }
+  }
+
+  private static final String TEMPORARY_MARKER = ".tmp-";
 
   private final Path root;
   private final Path lockRoot;
@@ -147,18 +163,59 @@ final class FileObjectStore implements ObjectStore {
 
   @Override
   public List<String> list(String prefix) throws IOException {
-    if (!Files.isDirectory(root)) {
+    Path start = listingRoot(prefix);
+    if (!Files.isDirectory(start)) {
       return List.of();
     }
-    try (Stream<Path> paths = Files.walk(root)) {
-      return paths
-          .filter(Files::isRegularFile)
-          .map(root::relativize)
-          .map(path -> path.toString().replace(path.getFileSystem().getSeparator(), "/"))
-          .filter(key -> key.startsWith(prefix))
-          .sorted()
-          .toList();
+    List<String> keys = new ArrayList<>();
+    Files.walkFileTree(
+        start,
+        new SimpleFileVisitor<>() {
+          @Override
+          public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) {
+            return directory.equals(lockRoot)
+                ? FileVisitResult.SKIP_SUBTREE
+                : FileVisitResult.CONTINUE;
+          }
+
+          @Override
+          public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) {
+            if (attributes.isRegularFile()
+                && !file.getFileName().toString().contains(TEMPORARY_MARKER)) {
+              Path relative = root.relativize(file);
+              String key =
+                  relative.toString().replace(relative.getFileSystem().getSeparator(), "/");
+              if (key.startsWith(prefix)) {
+                keys.add(key);
+              }
+            }
+            return FileVisitResult.CONTINUE;
+          }
+
+          @Override
+          public FileVisitResult visitFileFailed(Path file, IOException failure) {
+            // A staging file that was renamed or removed while the walk was in progress.
+            return FileVisitResult.CONTINUE;
+          }
+        });
+    Collections.sort(keys);
+    return List.copyOf(keys);
+  }
+
+  /**
+   * The deepest directory every key with this prefix lives under, so a listing walks only that
+   * subtree rather than the whole store.
+   */
+  private Path listingRoot(String prefix) throws IOException {
+    int slash = prefix.lastIndexOf('/');
+    if (slash < 0) {
+      return root;
     }
+    Path start = root.resolve(prefix.substring(0, slash)).normalize();
+    if (!start.startsWith(root)) {
+      throw new IOException("Listing prefix escapes storage root: " + prefix);
+    }
+    return start;
   }
 
   @Override
@@ -186,9 +243,12 @@ final class FileObjectStore implements ObjectStore {
   }
 
   private <T> T withLock(String key, IoSupplier<T> operation) throws IOException {
+    // String.hashCode is specified by the language, so every process maps a key to the same stripe
+    // and therefore to the same lock file.
+    int stripe = Math.floorMod(key.hashCode(), LOCK_STRIPES);
     Files.createDirectories(lockRoot);
-    Path lockPath = lockRoot.resolve(version(key.getBytes(java.nio.charset.StandardCharsets.UTF_8)) + ".lock");
-    ReentrantLock jvmLock = JVM_LOCKS.computeIfAbsent(lockPath, ignored -> new ReentrantLock());
+    Path lockPath = lockRoot.resolve(stripe + ".lock");
+    ReentrantLock jvmLock = JVM_LOCKS[stripe];
     jvmLock.lock();
     try (FileChannel channel =
             FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
@@ -235,7 +295,7 @@ final class FileObjectStore implements ObjectStore {
   }
 
   private static Path temporarySibling(Path target) {
-    return target.resolveSibling(target.getFileName() + ".tmp-" + UUID.randomUUID());
+    return target.resolveSibling(target.getFileName() + TEMPORARY_MARKER + UUID.randomUUID());
   }
 
   private static void forceFile(Path path) throws IOException {
