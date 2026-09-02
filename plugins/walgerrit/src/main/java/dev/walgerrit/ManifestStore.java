@@ -39,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Durable protobuf manifest and immutable transaction-log storage for one repository.
@@ -70,6 +71,7 @@ final class ManifestStore {
   private final IoConsumer<String> afterManifestCas;
   private final ManifestCache cache;
   private final String cacheKey;
+  private final ReentrantLock writeLock;
 
   ManifestStore(Path repositoryPath, String repositoryName) {
     this(repositoryPath, repositoryName, Clock.systemUTC(), ignored -> {});
@@ -124,6 +126,7 @@ final class ManifestStore {
         clock,
         afterManifestCas,
         new ManifestCache(),
+        new RepositoryLocks(),
         repositoryName);
   }
 
@@ -141,6 +144,7 @@ final class ManifestStore {
       Clock clock,
       IoConsumer<String> afterManifestCas,
       ManifestCache cache,
+      RepositoryLocks locks,
       String cacheKey) {
     this.objectStore = objectStore;
     this.manifestObjects = manifestObjects;
@@ -151,8 +155,14 @@ final class ManifestStore {
     this.afterManifestCas = afterManifestCas;
     this.cache = cache;
     this.cacheKey = cacheKey;
+    this.writeLock = locks.forRepository(cacheKey);
     stagingPath = this.repositoryPath.resolve(STAGING_DIRECTORY);
     walPath = this.repositoryPath.resolve(WAL_DIRECTORY);
+  }
+
+  /** This node's write lock for the repository; ref transactions hold it end to end. */
+  ReentrantLock writeLock() {
+    return writeLock;
   }
 
   /** Conditionally re-reads the manifest and reports whether the repository exists. */

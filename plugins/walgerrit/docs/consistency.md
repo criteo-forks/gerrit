@@ -19,9 +19,15 @@ Objects may exist before their refs. Refs must never point to unavailable object
 Gerrit's `BatchRefUpdate` may update several refs atomically. The backend must validate every
 expected old object ID and publish either all requested ref changes or none of them.
 
-On a compare-and-swap conflict, the backend reloads the manifest and revalidates the requested old
-values. A real ref conflict is reported to Gerrit as a lock failure; it must not be silently
-overwritten.
+Within a node, ref transactions on one repository run one at a time: every handle on the node
+shares a per-repository lock, so a transaction always starts from the manifest the previous local
+one published, as JGit's reftable batch update assumes when it serializes writers on a single
+repository instance. Across nodes the manifest compare-and-swap is the only fence. A transaction
+that loses it to another node's ref change is re-run from scratch against the reloaded manifest,
+expected-value checks included, up to five times; independent updates to different refs therefore
+all land, as they do on Gerrit's file-based backends. A real ref conflict is reported to Gerrit as
+a lock failure; it must not be silently overwritten. The reftable a lost attempt already uploaded
+stays in the store unreferenced, like any other immutable file a failed publication leaves behind.
 
 The manifest carries a separate ref revision. Appending unreachable object packs is safe before ref
 publication and therefore does not invalidate a ref transaction. Only a change to the live

@@ -35,6 +35,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
 import org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsOutputStream;
 import org.eclipse.jgit.internal.storage.dfs.DfsPackDescription;
@@ -60,6 +61,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   private final long revalidateIntervalNanos;
   private final ThreadLocal<Long> refTransactionRevision = new ThreadLocal<>();
   private final ThreadLocal<Boolean> refTransactionCommitted = new ThreadLocal<>();
+  private final ThreadLocal<Boolean> refTransactionConflicted = new ThreadLocal<>();
   private final ThreadLocal<RefTransaction> refTransaction = new ThreadLocal<>();
   private volatile Set<ObjectId> shallowCommits = Collections.emptySet();
   private volatile long observedManifestRevision = -1;
@@ -82,6 +84,10 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   ManifestStore manifestStore() {
     return manifestStore;
+  }
+
+  String repositoryName() {
+    return getRepository().getDescription().getRepositoryName();
   }
 
   @Override
@@ -145,13 +151,21 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     if (logicalRefUpdate && logicalTransaction == null) {
       throw new IOException("Reftable publication has no recorded ref transaction");
     }
-    Manifest updated =
-        manifestStore.publish(
-            expectedRefRevision == null ? 0 : expectedRefRevision,
-            additions,
-            supersedes,
-            logicalRefUpdate,
-            logicalTransaction);
+    Manifest updated;
+    try {
+      updated =
+          manifestStore.publish(
+              expectedRefRevision == null ? 0 : expectedRefRevision,
+              additions,
+              supersedes,
+              logicalRefUpdate,
+              logicalTransaction);
+    } catch (ManifestConflictException conflict) {
+      // Another node changed refs since this transaction began. Nothing was committed; the
+      // batch update re-runs its checks against the newer manifest and tries again.
+      refTransactionConflicted.set(true);
+      throw conflict;
+    }
     afterOwnPublication(updated, compaction);
     if (logicalRefUpdate) {
       refTransactionCommitted.set(true);
@@ -229,6 +243,12 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     revalidateNow();
     refTransactionRevision.set(manifestStore.current().getRefRevision());
     refTransactionCommitted.set(false);
+    refTransactionConflicted.set(false);
+  }
+
+  /** This node's write lock for the repository, shared by every handle on it. */
+  ReentrantLock writeLock() {
+    return manifestStore.writeLock();
   }
 
   void recordRefTransaction(Collection<ReceiveCommand> commands) {
@@ -280,11 +300,17 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   void endRefTransaction() {
     refTransactionRevision.remove();
     refTransactionCommitted.remove();
+    refTransactionConflicted.remove();
     refTransaction.remove();
   }
 
   boolean refTransactionCommitted() {
     return Boolean.TRUE.equals(refTransactionCommitted.get());
+  }
+
+  /** Whether the current ref transaction lost the manifest CAS to another node's ref change. */
+  boolean refTransactionConflicted() {
+    return Boolean.TRUE.equals(refTransactionConflicted.get());
   }
 
   private boolean adoptObservedManifest() throws IOException {

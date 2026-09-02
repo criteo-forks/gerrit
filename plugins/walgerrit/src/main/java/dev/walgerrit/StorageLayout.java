@@ -42,6 +42,7 @@ final class StorageLayout {
   private final String manifestsPrefix;
   private final String repositoriesPrefix;
   private final ManifestCache manifestCache = new ManifestCache();
+  private final RepositoryLocks repositoryLocks = new RepositoryLocks();
 
   StorageLayout(Path root) {
     this(new FileObjectStore(root), root, root.resolve("index-events"), "");
@@ -70,6 +71,7 @@ final class StorageLayout {
         Clock.systemUTC(),
         ignored -> {},
         manifestCache,
+        repositoryLocks,
         manifestPrefix);
   }
 

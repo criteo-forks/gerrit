@@ -18,6 +18,8 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.locks.ReentrantLock;
 import org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableBatchRefUpdate;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableDatabase;
@@ -114,6 +116,8 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
 
   private static final class WalGitBatchRefUpdate extends DfsReftableBatchRefUpdate {
     private static final Logger logger = LoggerFactory.getLogger(WalGitBatchRefUpdate.class);
+    private static final int MAX_ATTEMPTS = 5;
+    private static final long RETRY_PAUSE_MILLIS = 20;
 
     private final LocalWalGitRefDatabase refDatabase;
     private final LocalWalGitObjectDatabase objectDatabase;
@@ -126,23 +130,77 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
       this.objectDatabase = objectDatabase;
     }
 
+    /**
+     * Runs the batch as one ref transaction. Handles on this node take turns per repository, so a
+     * transaction always starts from the manifest the previous local one published. A transaction
+     * that loses the manifest CAS to another node's ref change is re-run from scratch against the
+     * newer manifest, expected-value checks included, a bounded number of times; only a genuine
+     * conflict on the refs themselves, or exhausted attempts, surfaces as a lock failure.
+     */
     @Override
     public void execute(
         RevWalk walk, ProgressMonitor monitor, List<String> options) {
+      ReentrantLock nodeLock = objectDatabase.writeLock();
+      nodeLock.lock();
       try {
-        objectDatabase.beginRefTransaction();
-        refDatabase.refresh();
-        super.execute(walk, monitor, options);
-      } catch (IOException exception) {
-        logger.error("WalGerrit could not start a ref transaction", exception);
-        List<ReceiveCommand> pending =
-            ReceiveCommand.filter(getCommands(), ReceiveCommand.Result.NOT_ATTEMPTED);
-        if (!pending.isEmpty()) {
-          pending.get(0).setResult(ReceiveCommand.Result.LOCK_FAILURE, "io error");
-          ReceiveCommand.abort(pending);
+        for (int attempt = 1; ; attempt++) {
+          List<ReceiveCommand> pending = pending();
+          if (pending.isEmpty()) {
+            return;
+          }
+          try {
+            objectDatabase.beginRefTransaction();
+            refDatabase.refresh();
+            super.execute(walk, monitor, options);
+            if (!objectDatabase.refTransactionConflicted() || attempt >= MAX_ATTEMPTS) {
+              return;
+            }
+          } catch (IOException exception) {
+            logger.error("WalGerrit could not start a ref transaction", exception);
+            abort(pending);
+            return;
+          } finally {
+            objectDatabase.endRefTransaction();
+          }
+          logger.info(
+              "Refs of {} changed on another node during a ref transaction; retrying ({}/{})",
+              objectDatabase.repositoryName(),
+              attempt,
+              MAX_ATTEMPTS);
+          for (ReceiveCommand command : pending) {
+            command.setResult(ReceiveCommand.Result.NOT_ATTEMPTED);
+          }
+          if (!pause(attempt)) {
+            abort(pending);
+            return;
+          }
         }
       } finally {
-        objectDatabase.endRefTransaction();
+        nodeLock.unlock();
+      }
+    }
+
+    private List<ReceiveCommand> pending() {
+      return ReceiveCommand.filter(getCommands(), ReceiveCommand.Result.NOT_ATTEMPTED);
+    }
+
+    private static void abort(List<ReceiveCommand> pending) {
+      List<ReceiveCommand> open =
+          ReceiveCommand.filter(pending, ReceiveCommand.Result.NOT_ATTEMPTED);
+      if (!open.isEmpty()) {
+        open.get(0).setResult(ReceiveCommand.Result.LOCK_FAILURE, "io error");
+        ReceiveCommand.abort(open);
+      }
+    }
+
+    /** Brief jittered pause so two nodes hammering one repository do not collide in lockstep. */
+    private static boolean pause(int attempt) {
+      try {
+        Thread.sleep(ThreadLocalRandom.current().nextLong(1, RETRY_PAUSE_MILLIS * attempt + 1));
+        return true;
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        return false;
       }
     }
 
@@ -170,6 +228,10 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
                 repairFailure);
           }
           return;
+        }
+        if (objectDatabase.refTransactionConflicted()) {
+          // Nothing landed; execute() re-runs the transaction against the newer manifest.
+          throw exception;
         }
         logger.error("WalGerrit ref publication failed", exception);
         throw exception;
