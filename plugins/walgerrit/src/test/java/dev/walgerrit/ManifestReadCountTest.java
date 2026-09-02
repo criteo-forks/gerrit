@@ -171,6 +171,59 @@ class ManifestReadCountTest {
     assertEquals(0, store.writes());
   }
 
+  @Test
+  void foldingCostsOneReadPerMergedEntryAndOneCas() throws Exception {
+    Path bucket = root.resolve("bucket");
+    CountingObjectStore store = new CountingObjectStore(new FileObjectStore(bucket));
+    Config config = new Config();
+    config.setString("walgerrit", null, "storagePath", root.resolve("cache").toString());
+    config.setString("walgerrit", null, "indexCursorPath", root.resolve("cursors").toString());
+    config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
+    config.setString("walgerrit", null, "logSegmentEntries", "4");
+    config.setString("walgerrit", null, "logRetainEntries", "1000000");
+    WalGitConfiguration configuration = WalGitConfiguration.from(config, root);
+    WalGitRepositoryManager manager =
+        new WalGitRepositoryManager(
+            configuration,
+            new StorageLayout(
+                store, configuration.storagePath(), configuration.indexCursorPath(), ""));
+    Project.NameKey project = Project.nameKey("platform/fold");
+    try (Repository repository = manager.createRepository(project)) {
+      for (int i = 0; i < 4; i++) {
+        ObjectId commit = WalGitRepositoryManagerTest.insertCommit(repository, "fold " + i);
+        RefUpdate update = repository.updateRef("refs/heads/b" + i);
+        update.setNewObjectId(commit);
+        assertEquals(RefUpdate.Result.NEW, update.update());
+      }
+    }
+    IndexEventTailer tailer =
+        new IndexEventTailer(manager, (ignored, transaction) -> {}, GerritRuntime.DAEMON);
+    tailer.runOnce(); // replays nine entries, then folds two runs of four
+    store.reset();
+
+    tailer.runOnce();
+    assertEquals(1, store.count("LIST-versions manifests/"));
+    assertEquals(0, store.writes(), "an idle fold performs no write");
+    assertEquals(0, store.manifestReads(), "the folded manifest is already the caught-up version");
+
+    try (Repository repository = manager.openRepository(project)) {
+      for (int i = 0; i < 4; i++) {
+        ObjectId commit = WalGitRepositoryManagerTest.insertCommit(repository, "more " + i);
+        RefUpdate update = repository.updateRef("refs/heads/m" + i);
+        update.setNewObjectId(commit);
+        assertEquals(RefUpdate.Result.NEW, update.update());
+      }
+    }
+    store.reset();
+    tailer.runOnce();
+    // Eight new single entries: replay reads eight, folding two runs of four re-reads eight and
+    // writes two merged segments under one CAS.
+    assertEquals(0, store.manifestReads(), "this node published, so its cache is current");
+    assertEquals(16, store.count("GET log/*"));
+    assertEquals(2, store.count("PUT-if-absent log/*"));
+    assertEquals(1, store.count("CAS manifest.pb"));
+  }
+
   private WalGitRepositoryManager manager(ObjectStore store, String revalidateInterval) {
     Config config = new Config();
     config.setString("walgerrit", null, "storagePath", root.resolve("cache").toString());

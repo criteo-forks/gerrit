@@ -80,30 +80,73 @@ http_port="${GERRIT_HTTP_PORT:-$((20000 + RANDOM % 20000))}"
 listen_url="http://127.0.0.1:${http_port}/"
 git config --file "$site/etc/gerrit.config" httpd.listenUrl "$listen_url"
 readiness_marker="$site/data/walgerrit-index-events/READY"
-daemon_log="$site/logs/walgerrit-readiness-smoke.log"
-java -Duser.home="$site/home" -jar "$GERRIT_WAR" daemon -d "$site" --console-log \
-  >"$daemon_log" 2>&1 &
-daemon_pid=$!
 
+# Starts the daemon writing to the given log and waits until WalGerrit publishes readiness and
+# Gerrit answers over HTTP; fails if the process exits first.
+start_daemon() {
+  local log=$1
+  java -Duser.home="$site/home" -jar "$GERRIT_WAR" daemon -d "$site" --console-log \
+    >"$log" 2>&1 &
+  daemon_pid=$!
+  for _ in $(seq 1 480); do
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+      wait "$daemon_pid" || true
+      daemon_pid=""
+      cat "$log" >&2
+      echo "Gerrit exited before publishing WalGerrit readiness." >&2
+      exit 1
+    fi
+    if [[ -f "$readiness_marker" ]] && curl -fsS "$listen_url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  cat "$log" >&2
+  echo "Gerrit did not publish WalGerrit readiness in time." >&2
+  exit 1
+}
+
+stop_daemon() {
+  kill "$daemon_pid"
+  wait "$daemon_pid" || true
+  daemon_pid=""
+  test ! -e "$readiness_marker"
+}
+
+start_daemon "$site/logs/walgerrit-readiness-smoke.log"
+curl -fsS "$listen_url" >/dev/null
+stop_daemon
+
+# Fold the logs aggressively so the manifests acquire a retention floor, then simulate a replaced
+# node: with its cursors gone and the floor above zero, the daemon must rebuild every index from
+# repository state before it becomes ready, and it must still answer afterwards.
+git config --file "$site/etc/gerrit.config" walgerrit.logSegmentEntries 2
+git config --file "$site/etc/gerrit.config" walgerrit.logRetention 0
+git config --file "$site/etc/gerrit.config" walgerrit.logRetainEntries 1
+git config --file "$site/etc/gerrit.config" walgerrit.indexPollInterval "1 sec"
+fold_log="$site/logs/walgerrit-fold-smoke.log"
+start_daemon "$fold_log"
 for _ in $(seq 1 120); do
-  if ! kill -0 "$daemon_pid" 2>/dev/null; then
-    wait "$daemon_pid" || true
-    daemon_pid=""
-    cat "$daemon_log" >&2
-    echo "Gerrit exited before publishing WalGerrit readiness." >&2
-    exit 1
-  fi
-  if [[ -f "$readiness_marker" ]] && curl -fsS "$listen_url" >/dev/null; then
+  if grep -q "folded the log of All-Users" "$fold_log" \
+      && grep -q "folded the log of All-Projects" "$fold_log"; then
     break
   fi
-  sleep 0.25
+  sleep 0.5
 done
+grep -q "folded the log of All-Users" "$fold_log"
+grep -q "folded the log of All-Projects" "$fold_log"
+stop_daemon
 
-test -f "$readiness_marker"
-curl -fsS "$listen_url" >/dev/null
-kill "$daemon_pid"
-wait "$daemon_pid" || true
-daemon_pid=""
-test ! -e "$readiness_marker"
+rm -rf "$site/data/walgerrit-index-events"
+rebuild_log="$site/logs/walgerrit-rebuild-smoke.log"
+start_daemon "$rebuild_log"
+grep -q "is rebuilding this node's indexes from current repository state" "$rebuild_log"
+grep -q "rebuilt this node's indexes" "$rebuild_log"
+for index_name in accounts changes groups projects; do
+  grep -q "rebuilt the ${index_name} index" "$rebuild_log"
+done
+curl -fsS "${listen_url}projects/" | grep -q '"All-Projects"'
+stop_daemon
 
-echo "WalGerrit fork initialized, reindexed, caught up, and published readiness successfully."
+echo "WalGerrit fork initialized, reindexed, caught up, folded its logs, rebuilt indexes for a" \
+  "replaced node, and published readiness successfully."

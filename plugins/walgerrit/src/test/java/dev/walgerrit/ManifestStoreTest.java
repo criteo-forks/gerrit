@@ -20,6 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.walgerrit.proto.StorageProto.LogEntry;
+import dev.walgerrit.proto.StorageProto.LogSegment;
 import dev.walgerrit.proto.StorageProto.PackFile;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import java.nio.file.Path;
@@ -161,9 +162,9 @@ class ManifestStoreTest {
             .anyMatch(pack -> pack.getName().equals("compacted")));
     var lastLog = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
     LogEntry entry =
-        LogEntry.parseFrom(
+        LogSegment.parseFrom(
             java.nio.file.Files.readAllBytes(
-                temporaryDirectory.resolve("repo.git").resolve(lastLog.getKey())));
+                temporaryDirectory.resolve("repo.git").resolve(lastLog.getKey()))).getEntries(0);
     assertEquals(LogEntry.Kind.COMPACT, entry.getKind());
     assertEquals(List.of("old-1", "old-2"), entry.getSupersedesList());
   }

@@ -60,9 +60,11 @@ Delivery is at least once because Gerrit index replacements and deletions are id
 
 The cursor is safe across hard crashes only when every affected Lucene index commits each write to
 stable storage. WalGerrit therefore requires `commitWithin = 0` for accounts, both change
-sub-indexes, groups, and projects. A missing payload, sequence gap, cursor/history mismatch, or index
-failure leaves the cursor unacknowledged and stops progress for that repository instead of silently
-skipping data.
+sub-indexes, groups, and projects. A missing payload, sequence gap or index failure leaves the
+cursor unacknowledged and stops progress for that repository instead of silently skipping data. A
+cursor that can no longer be replayed at all, because it fell below the manifest's retention floor
+or names a transaction the manifest does not, makes the node rebuild its indexes from repository
+state and reseed every cursor before it serves again.
 
 Before Gerrit's serving listeners start, a daemon must complete a clean sweep of every repository.
 Only then does it publish its node-local readiness marker and gauge. A failed background sweep

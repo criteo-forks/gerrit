@@ -27,6 +27,7 @@ import dev.walgerrit.proto.StorageProto.IndexCursor;
 import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -45,6 +46,13 @@ import org.slf4j.LoggerFactory;
  * with the current version of its manifest. A repository is replayed only when that version
  * differs from the one this node last caught up to, so an unchanged repository costs nothing
  * beyond its share of the listing, and the sweep interval is the cross-node convergence latency.
+ * After replaying a repository the sweep folds its log, merging single-entry segments and applying
+ * the retention floor, so the manifest stays bounded regardless of the repository's age.
+ *
+ * <p>A cursor that cannot be advanced by replay, because it is below the floor, ahead of a
+ * rolled-back head, or names a transaction the manifest no longer does, makes the node rebuild all
+ * of its indexes from current repository state and reseed every cursor, the way a new node with an
+ * empty volume bootstraps. That happens before the node becomes ready.
  */
 @Singleton
 final class IndexEventTailer implements LifecycleListener {
@@ -56,6 +64,8 @@ final class IndexEventTailer implements LifecycleListener {
   private final String indexType;
   private final Config serverConfig;
   private final IndexEventReadiness readiness;
+  private final IndexRebuilder rebuilder;
+  private final FoldPolicy foldPolicy;
   /** Manifest version at which this node last confirmed each repository's cursor was at head. */
   private final Map<Project.NameKey, String> caughtUpVersions = new ConcurrentHashMap<>();
   private ScheduledExecutorService executor;
@@ -68,14 +78,16 @@ final class IndexEventTailer implements LifecycleListener {
       GerritRuntime runtime,
       IndexConfig indexConfig,
       @GerritServerConfig Config serverConfig,
-      IndexEventReadiness readiness) {
+      IndexEventReadiness readiness,
+      GerritIndexRebuilder rebuilder) {
     this(
         asWalGit(repositories),
         (IndexEventApplier) applier,
         runtime,
         indexConfig.type(),
         serverConfig,
-        readiness);
+        readiness,
+        rebuilder);
   }
 
   IndexEventTailer(
@@ -87,7 +99,8 @@ final class IndexEventTailer implements LifecycleListener {
         "lucene",
         new Config(),
         new IndexEventReadiness(
-            repositories.configuration().indexCursorPath().resolve("READY")));
+            repositories.configuration().indexCursorPath().resolve("READY")),
+        null);
   }
 
   IndexEventTailer(
@@ -103,7 +116,8 @@ final class IndexEventTailer implements LifecycleListener {
         indexType,
         serverConfig,
         new IndexEventReadiness(
-            repositories.configuration().indexCursorPath().resolve("READY")));
+            repositories.configuration().indexCursorPath().resolve("READY")),
+        null);
   }
 
   IndexEventTailer(
@@ -113,12 +127,25 @@ final class IndexEventTailer implements LifecycleListener {
       String indexType,
       Config serverConfig,
       IndexEventReadiness readiness) {
+    this(repositories, applier, runtime, indexType, serverConfig, readiness, null);
+  }
+
+  IndexEventTailer(
+      WalGitRepositoryManager repositories,
+      IndexEventApplier applier,
+      GerritRuntime runtime,
+      String indexType,
+      Config serverConfig,
+      IndexEventReadiness readiness,
+      IndexRebuilder rebuilder) {
     this.repositories = repositories;
     this.applier = applier;
     this.runtime = runtime;
     this.indexType = indexType;
     this.serverConfig = serverConfig;
     this.readiness = readiness;
+    this.rebuilder = rebuilder;
+    this.foldPolicy = FoldPolicy.of(repositories.configuration());
   }
 
   @Override
@@ -186,9 +213,31 @@ final class IndexEventTailer implements LifecycleListener {
     }
   }
 
+  /**
+   * One full sweep. If any repository's cursor cannot be advanced by replay, the node's indexes
+   * are rebuilt and every cursor reseeded, then the sweep runs once more to replay whatever was
+   * published during the rebuild.
+   */
   void runOnce() throws IOException {
+    Map<Project.NameKey, IndexRebuildRequiredException> stale = sweep();
+    if (stale.isEmpty()) {
+      return;
+    }
+    rebuildIndexes(stale);
+    Map<Project.NameKey, IndexRebuildRequiredException> stillStale = sweep();
+    if (!stillStale.isEmpty()) {
+      IOException failure =
+          new IOException(
+              "Index cursors still cannot be replayed after rebuilding: " + stillStale.keySet());
+      stillStale.values().forEach(failure::addSuppressed);
+      throw failure;
+    }
+  }
+
+  private Map<Project.NameKey, IndexRebuildRequiredException> sweep() throws IOException {
     NavigableMap<Project.NameKey, String> heads = repositories.storage().listManifestVersions();
     caughtUpVersions.keySet().retainAll(heads.keySet());
+    Map<Project.NameKey, IndexRebuildRequiredException> stale = new LinkedHashMap<>();
     Exception firstFailure = null;
     for (Map.Entry<Project.NameKey, String> head : heads.entrySet()) {
       Project.NameKey project = head.getKey();
@@ -197,6 +246,8 @@ final class IndexEventTailer implements LifecycleListener {
       }
       try {
         catchUp(project, head.getValue());
+      } catch (IndexRebuildRequiredException rebuildRequired) {
+        stale.put(project, rebuildRequired);
       } catch (IOException | RuntimeException exception) {
         logger.error("WalGerrit index-event replay failed for {}", project.get(), exception);
         if (firstFailure == null) {
@@ -212,6 +263,7 @@ final class IndexEventTailer implements LifecycleListener {
     if (firstFailure instanceof RuntimeException runtimeException) {
       throw runtimeException;
     }
+    return stale;
   }
 
   int catchUp(Project.NameKey project) throws IOException {
@@ -219,9 +271,11 @@ final class IndexEventTailer implements LifecycleListener {
   }
 
   /**
-   * Replays this repository's unseen WAL entries. With the version a listing reported, the manifest
-   * is taken from the node cache when it already holds that version; otherwise, and always without
-   * a listed version, one conditional read is made.
+   * Replays this repository's unseen WAL entries, then folds its log. With the version a listing
+   * reported, the manifest is taken from the node cache when it already holds that version;
+   * otherwise, and always without a listed version, one conditional read is made.
+   *
+   * @throws IndexRebuildRequiredException when the cursor cannot be advanced by replay
    */
   int catchUp(Project.NameKey project, String listedVersion) throws IOException {
     ManifestStore manifestStore = repositories.storage().manifestStore(project);
@@ -232,10 +286,10 @@ final class IndexEventTailer implements LifecycleListener {
     Manifest manifest = versioned.manifest();
     IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
     IndexCursor cursor = cursorStore.read();
-    validateCursor(project, manifestStore, manifest, cursor);
 
     List<LogEntry> entries =
-        manifestStore.readLogEntriesAfter(cursor.getSequence(), manifest);
+        manifestStore.readLogEntriesAfter(
+            cursor.getSequence(), cursor.getTransactionId(), manifest);
     int applied = 0;
     for (LogEntry entry : entries) {
       if (entry.getKind() == LogEntry.Kind.REF_UPDATE) {
@@ -245,13 +299,12 @@ final class IndexEventTailer implements LifecycleListener {
                   + entry.getSeq()
                   + " for "
                   + project.get()
-                  + " predates durable index events; run a full reindex and seed the cursor");
+                  + " has no ref transaction payload");
         }
         applier.apply(project, entry.getRefTransaction());
         applied++;
       }
-      cursorStore.write(
-          entry.getSeq(), manifestStore.logKeyForSequence(manifest, entry.getSeq()));
+      cursorStore.write(entry.getSeq(), entry.getTransactionId());
     }
     if (!entries.isEmpty()) {
       logger.info(
@@ -265,7 +318,90 @@ final class IndexEventTailer implements LifecycleListener {
     // handle may have cached meanwhile: the next listing must not skip entries this node has not
     // applied.
     caughtUpVersions.put(project, versioned.version());
+    fold(project, manifestStore, versioned);
     return applied;
+  }
+
+  /**
+   * Folds the repository's log after replay. A fold changes the manifest version without adding
+   * entries, so the folded version is recorded as caught up to spare the next sweep a pass.
+   */
+  private void fold(Project.NameKey project, ManifestStore manifestStore, VersionedManifest replayed) {
+    try {
+      VersionedManifest folded = manifestStore.fold(foldPolicy);
+      if (folded.manifest().getRevision() != replayed.manifest().getRevision()) {
+        if (folded.manifest().getHeadSeq() == replayed.manifest().getHeadSeq()) {
+          caughtUpVersions.put(project, folded.version());
+        }
+        logger.info(
+            "WalGerrit folded the log of {}: {} segments covering [{}, {}]",
+            project.get(),
+            folded.manifest().getLogSegmentsCount(),
+            ManifestStore.floor(folded.manifest()),
+            folded.manifest().getHeadSeq());
+      }
+    } catch (IOException | RuntimeException exception) {
+      // Folding is representation only and idempotent; the next sweep retries it.
+      logger.warn("WalGerrit could not fold the log of {}", project.get(), exception);
+    }
+  }
+
+  /**
+   * Rebuilds every index from current repository state and reseeds every cursor at the head each
+   * repository had before the rebuild began, so anything published meanwhile is replayed afterwards.
+   */
+  private void rebuildIndexes(Map<Project.NameKey, IndexRebuildRequiredException> stale)
+      throws IOException {
+    WalGitConfiguration configuration = repositories.configuration();
+    if (rebuilder == null || !configuration.indexRebuildOnStaleCursor()) {
+      IOException failure =
+          new IOException(
+              "Index cursors cannot be replayed for "
+                  + stale.keySet()
+                  + " and automatic rebuild is "
+                  + (rebuilder == null ? "unavailable" : "disabled")
+                  + "; run the offline reindex, remove the cursors under "
+                  + configuration.indexCursorPath()
+                  + ", and start again");
+      stale.values().forEach(failure::addSuppressed);
+      throw failure;
+    }
+    logger.warn(
+        "WalGerrit is rebuilding this node's indexes from current repository state because the "
+            + "cursors of {} cannot be replayed: {}",
+        stale.keySet(),
+        stale.values().stream().map(Throwable::getMessage).toList());
+    synchronized (this) {
+      if (participating) {
+        readiness.markNotReady();
+      }
+    }
+
+    Map<Project.NameKey, IndexCursor> seeds = new LinkedHashMap<>();
+    for (Map.Entry<Project.NameKey, String> head :
+        repositories.storage().listManifestVersions().entrySet()) {
+      ManifestStore manifestStore = repositories.storage().manifestStore(head.getKey());
+      Manifest manifest = manifestStore.currentOrRefresh(head.getValue()).manifest();
+      seeds.put(
+          head.getKey(),
+          IndexCursor.newBuilder()
+              .setSequence(manifest.getHeadSeq())
+              .setTransactionId(ManifestStore.lastTransactionId(manifest))
+              .build());
+    }
+
+    long started = System.nanoTime();
+    rebuilder.rebuildAll();
+
+    for (Map.Entry<Project.NameKey, IndexCursor> seed : seeds.entrySet()) {
+      new IndexCursorStore(repositories.storage().manifestStore(seed.getKey()).indexCursorPath())
+          .write(seed.getValue().getSequence(), seed.getValue().getTransactionId());
+    }
+    caughtUpVersions.clear();
+    logger.info(
+        "WalGerrit rebuilt this node's indexes in {} s and seeded cursors for {} repositories",
+        TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started),
+        seeds.size());
   }
 
   void runBackgroundSweep() {
@@ -305,32 +441,6 @@ final class IndexEventTailer implements LifecycleListener {
                 + name
                 + ".commitWithin = 0 before durable WAL index replay can start");
       }
-    }
-  }
-
-  private static void validateCursor(
-      Project.NameKey project,
-      ManifestStore manifestStore,
-      Manifest manifest,
-      IndexCursor cursor)
-      throws IOException {
-    if (cursor.getSequence() > manifest.getHeadSeq()) {
-      throw new IOException(
-          "Index cursor for "
-              + project.get()
-              + " is ahead of the WAL: "
-              + cursor.getSequence()
-              + " > "
-              + manifest.getHeadSeq());
-    }
-    String expectedLogKey =
-        manifestStore.logKeyForSequence(manifest, cursor.getSequence());
-    if (!cursor.getLogKey().equals(expectedLogKey)) {
-      throw new IOException(
-          "Index cursor history mismatch for "
-              + project.get()
-              + " at sequence "
-              + cursor.getSequence());
     }
   }
 

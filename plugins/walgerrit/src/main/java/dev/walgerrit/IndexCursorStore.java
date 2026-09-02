@@ -24,7 +24,11 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.UUID;
 
-/** Crash-safe node-local acknowledgement of WAL entries applied to local secondary indexes. */
+/**
+ * Crash-safe node-local acknowledgement of WAL entries applied to local secondary indexes. The
+ * cursor names the last applied entry by sequence and transaction id, so a manifest that was
+ * restored to an older version and diverged is detected rather than silently followed.
+ */
 final class IndexCursorStore {
   private final Path path;
 
@@ -39,10 +43,14 @@ final class IndexCursorStore {
     return IndexCursor.parseFrom(Files.readAllBytes(path));
   }
 
-  void write(long sequence, String logKey) throws IOException {
+  void write(long sequence, String transactionId) throws IOException {
     Files.createDirectories(path.getParent());
     byte[] bytes =
-        IndexCursor.newBuilder().setSequence(sequence).setLogKey(logKey).build().toByteArray();
+        IndexCursor.newBuilder()
+            .setSequence(sequence)
+            .setTransactionId(transactionId == null ? "" : transactionId)
+            .build()
+            .toByteArray();
     Path temporary =
         path.resolveSibling(path.getFileName() + "." + UUID.randomUUID() + ".tmp");
     try {

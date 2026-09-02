@@ -23,12 +23,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.config.GerritRuntime;
 import dev.walgerrit.proto.StorageProto.IndexCursor;
+import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.RefUpdate;
@@ -72,8 +76,7 @@ class IndexEventTailerTest {
     ManifestStore store = manager.storage().manifestStore(project);
     IndexCursor cursor = new IndexCursorStore(store.indexCursorPath()).read();
     assertEquals(store.read().getHeadSeq(), cursor.getSequence());
-    assertEquals(
-        store.logKeyForSequence(store.read(), cursor.getSequence()), cursor.getLogKey());
+    assertEquals(ManifestStore.lastTransactionId(store.read()), cursor.getTransactionId());
   }
 
   @Test
@@ -326,12 +329,254 @@ class IndexEventTailerTest {
         readiness);
   }
 
+  @Test
+  void cursorBelowTheFloorRebuildsAllIndexesAndReseedsCursors() throws Exception {
+    Path shared = storagePath.resolve("floor-shared");
+    WalGitRepositoryManager nodeA = foldingManager(shared, "node-a");
+    Project.NameKey project = Project.nameKey("platform/floor");
+    nodeA.createRepository(project).close();
+    IndexEventTailer tailerA = tailer(nodeA, new RecordingApplier());
+    for (int i = 0; i < 6; i++) {
+      publishRef(nodeA, project, Constants.R_HEADS + "b" + i);
+      tailerA.catchUp(project);
+    }
+    ManifestStore storeA = nodeA.storage().manifestStore(project);
+    Manifest folded = storeA.read();
+    assertTrue(ManifestStore.floor(folded) > 1, "aggressive retention moved the floor");
+
+    WalGitRepositoryManager nodeB = foldingManager(shared, "node-b");
+    RecordingApplier applierB = new RecordingApplier();
+    FakeRebuilder rebuilder = new FakeRebuilder();
+    IndexEventReadiness readiness = readiness("floor-node-b");
+    IndexEventTailer tailerB =
+        new IndexEventTailer(
+            nodeB, applierB, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(), readiness,
+            rebuilder);
+    tailerB.start();
+    try {
+      assertEquals(1, rebuilder.rebuilds.get(), "a fresh node below the floor rebuilds once");
+      assertTrue(applierB.transactions.isEmpty(), "history was rebuilt, not replayed");
+      IndexCursor cursor =
+          new IndexCursorStore(nodeB.storage().manifestStore(project).indexCursorPath()).read();
+      assertEquals(folded.getHeadSeq(), cursor.getSequence());
+      assertEquals(ManifestStore.lastTransactionId(folded), cursor.getTransactionId());
+      assertTrue(readiness.isReady());
+
+      ObjectId later = publishRef(nodeA, project, Constants.R_HEADS + "after-rebuild");
+      tailerB.runBackgroundSweep();
+      assertTrue(applierB.sawUpdate(Constants.R_HEADS + "after-rebuild", later));
+      assertEquals(1, rebuilder.rebuilds.get(), "later writes replay normally");
+    } finally {
+      tailerB.stop();
+    }
+  }
+
+  @Test
+  void writesLandingDuringTheRebuildAreReplayedFromTheSeed() throws Exception {
+    Path shared = storagePath.resolve("during-shared");
+    WalGitRepositoryManager nodeA = foldingManager(shared, "node-a");
+    Project.NameKey project = Project.nameKey("platform/during");
+    nodeA.createRepository(project).close();
+    IndexEventTailer tailerA = tailer(nodeA, new RecordingApplier());
+    for (int i = 0; i < 6; i++) {
+      publishRef(nodeA, project, Constants.R_HEADS + "b" + i);
+      tailerA.catchUp(project);
+    }
+
+    WalGitRepositoryManager nodeB = foldingManager(shared, "node-b");
+    RecordingApplier applierB = new RecordingApplier();
+    ObjectId[] concurrent = new ObjectId[1];
+    FakeRebuilder rebuilder = new FakeRebuilder();
+    rebuilder.duringRebuild =
+        () -> {
+          try {
+            concurrent[0] = publishRef(nodeA, project, Constants.R_HEADS + "concurrent");
+          } catch (Exception e) {
+            throw new IllegalStateException(e);
+          }
+        };
+    IndexEventTailer tailerB =
+        new IndexEventTailer(
+            nodeB, applierB, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(),
+            readiness("during-node-b"), rebuilder);
+    tailerB.start();
+    try {
+      assertEquals(1, rebuilder.rebuilds.get());
+      assertTrue(
+          applierB.sawUpdate(Constants.R_HEADS + "concurrent", concurrent[0]),
+          "the write that landed during the rebuild was replayed from the pre-rebuild seed");
+    } finally {
+      tailerB.stop();
+    }
+  }
+
+  @Test
+  void historyMismatchTriggersARebuild() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    Project.NameKey project = Project.nameKey("platform/mismatch");
+    manager.createRepository(project).close();
+    RecordingApplier applier = new RecordingApplier();
+    FakeRebuilder rebuilder = new FakeRebuilder();
+    IndexEventTailer tailer =
+        new IndexEventTailer(
+            manager, applier, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(),
+            readiness("mismatch-node"), rebuilder);
+    tailer.runOnce();
+    assertEquals(0, rebuilder.rebuilds.get());
+
+    ManifestStore store = manager.storage().manifestStore(project);
+    IndexCursorStore cursorStore = new IndexCursorStore(store.indexCursorPath());
+    cursorStore.write(cursorStore.read().getSequence(), "not-the-transaction-that-happened");
+
+    // A sweep skips repositories whose manifest did not change, so a cursor is re-examined when
+    // the node restarts, which a fresh tailer models.
+    IndexEventTailer restarted =
+        new IndexEventTailer(
+            manager, applier, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(),
+            readiness("mismatch-node"), rebuilder);
+    restarted.runOnce();
+    assertEquals(1, rebuilder.rebuilds.get(), "a cursor naming an unknown transaction rebuilds");
+    assertEquals(
+        ManifestStore.lastTransactionId(store.read()), cursorStore.read().getTransactionId());
+  }
+
+  @Test
+  void rebuildDisabledOrUnavailableFailsClosedWithGuidance() throws Exception {
+    Path shared = storagePath.resolve("closed-shared");
+    WalGitRepositoryManager nodeA = foldingManager(shared, "node-a");
+    Project.NameKey project = Project.nameKey("platform/closed");
+    nodeA.createRepository(project).close();
+    IndexEventTailer tailerA = tailer(nodeA, new RecordingApplier());
+    for (int i = 0; i < 6; i++) {
+      publishRef(nodeA, project, Constants.R_HEADS + "b" + i);
+      tailerA.catchUp(project);
+    }
+
+    IndexEventReadiness readiness = readiness("closed-node-b");
+    IndexEventTailer noRebuilder =
+        new IndexEventTailer(
+            foldingManager(shared, "node-b"), new RecordingApplier(), GerritRuntime.DAEMON,
+            "lucene", durableLuceneConfig(), readiness);
+    IllegalStateException failure = assertThrows(IllegalStateException.class, noRebuilder::start);
+    assertTrue(failure.getCause().getMessage().contains("offline reindex"));
+    assertFalse(readiness.isReady());
+
+    Config config = foldingConfig(shared, "node-c");
+    config.setBoolean("walgerrit", null, "indexRebuildOnStaleCursor", false);
+    WalGitRepositoryManager nodeC =
+        new WalGitRepositoryManager(
+            WalGitConfiguration.from(config, shared.resolveSibling("node-c-site")));
+    IndexEventTailer disabled =
+        new IndexEventTailer(
+            nodeC, new RecordingApplier(), GerritRuntime.DAEMON, "lucene", durableLuceneConfig(),
+            readiness("closed-node-c"), new FakeRebuilder());
+    failure = assertThrows(IllegalStateException.class, disabled::start);
+    assertTrue(failure.getCause().getMessage().contains("disabled"));
+  }
+
+  @Test
+  void replayContinuesFromACursorInsideAFoldedSegment() throws Exception {
+    Path shared = storagePath.resolve("mid-shared");
+    Config config = foldingConfig(shared, "node-a");
+    config.setString("walgerrit", null, "logRetainEntries", "1000000");
+    WalGitRepositoryManager nodeA =
+        new WalGitRepositoryManager(
+            WalGitConfiguration.from(config, shared.resolveSibling("node-a-site")));
+    Config configB = foldingConfig(shared, "node-b");
+    configB.setString("walgerrit", null, "logRetainEntries", "1000000");
+    WalGitRepositoryManager nodeB =
+        new WalGitRepositoryManager(
+            WalGitConfiguration.from(configB, shared.resolveSibling("node-b-site")));
+    Project.NameKey project = Project.nameKey("platform/mid");
+    nodeA.createRepository(project).close();
+
+    RecordingApplier applierB = new RecordingApplier();
+    IndexEventTailer tailerB = tailer(nodeB, applierB);
+    tailerB.catchUp(project);
+    ObjectId first = publishRef(nodeA, project, Constants.R_HEADS + "first");
+    tailerB.catchUp(project);
+    assertTrue(applierB.sawUpdate(Constants.R_HEADS + "first", first));
+
+    IndexEventTailer tailerA = tailer(nodeA, new RecordingApplier());
+    ObjectId second = publishRef(nodeA, project, Constants.R_HEADS + "second");
+    ObjectId third = publishRef(nodeA, project, Constants.R_HEADS + "third");
+    tailerA.catchUp(project);
+    Manifest folded = nodeA.storage().manifestStore(project).read();
+    assertTrue(
+        folded.getLogSegmentsList().stream().anyMatch(s -> s.getFirstSeq() != s.getLastSeq()),
+        "node A's sweep folded single entries into a segment");
+
+    tailerB.catchUp(project);
+    assertTrue(applierB.sawUpdate(Constants.R_HEADS + "second", second));
+    assertTrue(applierB.sawUpdate(Constants.R_HEADS + "third", third));
+    assertEquals(
+        folded.getHeadSeq(),
+        new IndexCursorStore(nodeB.storage().manifestStore(project).indexCursorPath())
+            .read()
+            .getSequence());
+  }
+
+  private static ObjectId publishRef(
+      WalGitRepositoryManager manager, Project.NameKey project, String ref) throws Exception {
+    try (Repository repository = manager.openRepository(project)) {
+      ObjectId commit = WalGitRepositoryManagerTest.insertCommit(repository, ref);
+      RefUpdate update = repository.updateRef(ref);
+      update.setNewObjectId(commit);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+      return commit;
+    }
+  }
+
+  /** Two-entry segments, immediate retention: the floor moves after a handful of writes. */
+  private static Config foldingConfig(Path sharedStore, String node) {
+    Config config = new Config();
+    config.setString("walgerrit", null, "storagePath", sharedStore.toString());
+    config.setString(
+        "walgerrit",
+        null,
+        "indexCursorPath",
+        sharedStore.resolveSibling(node + "-cursors").toString());
+    config.setString("walgerrit", null, "indexPollInterval", "1 hour");
+    config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
+    config.setString("walgerrit", null, "logSegmentEntries", "2");
+    config.setString("walgerrit", null, "logRetention", "0");
+    config.setString("walgerrit", null, "logRetainEntries", "1");
+    return config;
+  }
+
+  private static WalGitRepositoryManager foldingManager(Path sharedStore, String node) {
+    return new WalGitRepositoryManager(
+        WalGitConfiguration.from(
+            foldingConfig(sharedStore, node), sharedStore.resolveSibling(node + "-site")));
+  }
+
+  private static final class FakeRebuilder implements IndexRebuilder {
+    final AtomicInteger rebuilds = new AtomicInteger();
+    Runnable duringRebuild;
+
+    @Override
+    public void rebuildAll() throws IOException {
+      rebuilds.incrementAndGet();
+      if (duringRebuild != null) {
+        duringRebuild.run();
+      }
+    }
+  }
+
   private static final class RecordingApplier implements IndexEventApplier {
-    private final List<RefTransaction> transactions = new ArrayList<>();
+    private final List<RefTransaction> transactions = new CopyOnWriteArrayList<>();
 
     @Override
     public void apply(Project.NameKey project, RefTransaction transaction) {
       transactions.add(transaction);
+    }
+
+    boolean sawUpdate(String ref, ObjectId newValue) {
+      return transactions.stream()
+          .flatMap(transaction -> transaction.getUpdatesList().stream())
+          .anyMatch(
+              update ->
+                  update.getName().equals(ref) && update.getNewObjectId().equals(newValue.name()));
     }
   }
 }

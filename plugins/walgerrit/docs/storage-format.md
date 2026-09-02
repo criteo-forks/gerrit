@@ -31,10 +31,38 @@ keeps its lock files under `.object-locks/`. The S3 backend keeps the shared obj
 and the staging/cache tree on each node.
 
 `manifest.pb` contains the repository identity, object format, head sequence, overall revision,
-ref revision, live DFS file-set inventory, and immutable log references. `log/*.pb` records the
-additions and superseded files for one publication. A `REF_UPDATE` entry also contains the complete
-logical ref transaction (ref name, old/new object IDs, and new symbolic target). The schemas are in
-`src/main/proto/walgerrit.proto`.
+ref revision, live DFS file-set inventory, the retention floor `min_seq`, and references to the log
+segments covering `[min_seq, head_seq]`. Every `log/*.pb` object is a `LogSegment`: one entry when
+published, several consecutive entries after folding. An entry records the additions and superseded
+files for one publication and carries a `transaction_id` that is unique per publication attempt; a
+`REF_UPDATE` entry also contains the complete logical ref transaction (ref name, old/new object
+IDs, and new symbolic target). The schemas are in `src/main/proto/walgerrit.proto`; the manifest
+format version is 2.
+
+## Folding
+
+The manifest would otherwise grow by one segment reference per publication forever, and it is
+uploaded in full on every CAS. Folding keeps it bounded regardless of the repository's age, as a
+representation-only manifest change that alters no sequence number, ref revision or pack:
+
+- Runs of `walgerrit.logSegmentEntries` consecutive single-entry segments are merged into one
+  segment object whose reference records the last entry's transaction id and creation time.
+- The oldest segments drop below the floor once they are older than `walgerrit.logRetention` and at
+  least `walgerrit.logRetainEntries` newer entries remain referenced; both must hold, and the newest
+  segment is never dropped. `min_seq` then names the oldest entry still referenced.
+- Nothing is deleted. Folded objects stay in the store, so every transition ever published remains
+  available for audit and for recovery from an earlier manifest version. Only pack reclamation, a
+  separate maintenance step, ever removes objects.
+
+Folding runs on any node after its index sweep replays a repository; concurrent publications make
+its CAS retry with the merged segment reused.
+
+A follower's cursor names the last entry it applied by sequence and transaction id. Replay is
+exact while the entry the cursor names is still referenced by the manifest, because only then can
+its identity be checked. A cursor below the floor, ahead of the head, or naming a transaction the
+manifest does not, which happens after a manifest is restored to an older version and diverges,
+cannot be replayed, and the follower rebuilds its derived state instead. An empty cursor is
+replayable only while nothing has been folded.
 
 `indexCursorPath` is node-local and is not part of the shared object store. Its protobuf cursor
 identifies both the last applied sequence and the immutable log key at that sequence, which detects
@@ -63,7 +91,6 @@ publication. Reftable compaction may supersede an earlier reftable in the same t
 ## Deliberate limitations
 
 - SHA-1 repositories only, matching current Gerrit project storage.
-- No checkpoints or log-segment compaction yet.
 - No durable repository deletion or import workflow yet.
 - S3-compatible storage is implemented; GCS-native conditional requests are not.
 - The node-local immutable-file cache is not bounded yet.

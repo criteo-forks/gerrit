@@ -24,6 +24,7 @@ import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.git.RepositoryExistsException;
 import dev.walgerrit.proto.StorageProto.LogEntry;
+import dev.walgerrit.proto.StorageProto.LogSegment;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import java.nio.file.Files;
@@ -96,7 +97,7 @@ class WalGitRepositoryManagerTest {
     for (var log : manifest.getLogSegmentsList()) {
       Path logFile = repositoryPath.resolve(log.getKey());
       assertTrue(Files.isRegularFile(logFile));
-      LogEntry entry = LogEntry.parseFrom(Files.readAllBytes(logFile));
+      LogEntry entry = LogSegment.parseFrom(Files.readAllBytes(logFile)).getEntries(0);
       assertEquals(log.getFirstSeq(), entry.getSeq());
     }
   }

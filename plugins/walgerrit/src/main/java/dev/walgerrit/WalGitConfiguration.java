@@ -33,12 +33,25 @@ record WalGitConfiguration(
     Path indexCursorPath,
     boolean indexTailerEnabled,
     Duration indexPollInterval,
-    Duration manifestRevalidateInterval) {
+    Duration manifestRevalidateInterval,
+    int logSegmentEntries,
+    Duration logRetention,
+    long logRetainEntries,
+    boolean indexRebuildOnStaleCursor) {
   /**
    * Longest time an open repository handle serves reads without another conditional manifest
    * read. Every handle also revalidates when it is opened and when it starts a ref transaction.
    */
   static final Duration DEFAULT_MANIFEST_REVALIDATE_INTERVAL = Duration.ofSeconds(1);
+
+  /** Consecutive single-entry log segments merged into one segment by a fold. */
+  static final int DEFAULT_LOG_SEGMENT_ENTRIES = 256;
+
+  /** Minimum age of a log segment before retention may drop it below the manifest's floor. */
+  static final Duration DEFAULT_LOG_RETENTION = Duration.ofDays(30);
+
+  /** Minimum number of newer entries the manifest keeps referencing when a segment is dropped. */
+  static final long DEFAULT_LOG_RETAIN_ENTRIES = 10_000;
 
   private static final String SECTION = "walgerrit";
   private static final String BACKEND_KEY = "backend";
@@ -56,7 +69,11 @@ record WalGitConfiguration(
         storagePath.resolve("index-events"),
         true,
         Duration.ofSeconds(5),
-        DEFAULT_MANIFEST_REVALIDATE_INTERVAL);
+        DEFAULT_MANIFEST_REVALIDATE_INTERVAL,
+        DEFAULT_LOG_SEGMENT_ENTRIES,
+        DEFAULT_LOG_RETENTION,
+        DEFAULT_LOG_RETAIN_ENTRIES,
+        true);
   }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
@@ -99,7 +116,17 @@ record WalGitConfiguration(
                     null,
                     "manifestRevalidateInterval",
                     DEFAULT_MANIFEST_REVALIDATE_INTERVAL.toMillis(),
-                    TimeUnit.MILLISECONDS)));
+                    TimeUnit.MILLISECONDS)),
+            config.getInt(SECTION, null, "logSegmentEntries", DEFAULT_LOG_SEGMENT_ENTRIES),
+            Duration.ofMillis(
+                config.getTimeUnit(
+                    SECTION,
+                    null,
+                    "logRetention",
+                    DEFAULT_LOG_RETENTION.toMillis(),
+                    TimeUnit.MILLISECONDS)),
+            config.getLong(SECTION, null, "logRetainEntries", DEFAULT_LOG_RETAIN_ENTRIES),
+            config.getBoolean(SECTION, null, "indexRebuildOnStaleCursor", true));
     configuration.validate();
     return configuration;
   }
@@ -117,6 +144,15 @@ record WalGitConfiguration(
     if (manifestRevalidateInterval.isNegative()) {
       throw new IllegalArgumentException(
           "walgerrit.manifestRevalidateInterval must be zero or positive");
+    }
+    if (logSegmentEntries < 2) {
+      throw new IllegalArgumentException("walgerrit.logSegmentEntries must be at least 2");
+    }
+    if (logRetention.isNegative()) {
+      throw new IllegalArgumentException("walgerrit.logRetention must be zero or positive");
+    }
+    if (logRetainEntries < 1) {
+      throw new IllegalArgumentException("walgerrit.logRetainEntries must be at least 1");
     }
   }
 }

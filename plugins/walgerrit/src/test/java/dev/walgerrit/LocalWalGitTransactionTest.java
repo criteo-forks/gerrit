@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
 import dev.walgerrit.proto.StorageProto.LogEntry;
+import dev.walgerrit.proto.StorageProto.LogSegment;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -78,7 +79,7 @@ class LocalWalGitTransactionTest {
     assertEquals(sequenceBefore + 1, manifest.getHeadSeq());
     var lastLog = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
     LogEntry entry =
-        LogEntry.parseFrom(Files.readAllBytes(repositoryPath(project).resolve(lastLog.getKey())));
+        LogSegment.parseFrom(Files.readAllBytes(repositoryPath(project).resolve(lastLog.getKey()))).getEntries(0);
     assertEquals(LogEntry.Kind.REF_UPDATE, entry.getKind());
     assertEquals(1, entry.getAdditionsCount());
     assertTrue(entry.hasRefTransaction());
@@ -301,7 +302,7 @@ class LocalWalGitTransactionTest {
 
     var lastLog = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
     LogEntry entry =
-        LogEntry.parseFrom(Files.readAllBytes(repositoryPath.resolve(lastLog.getKey())));
+        LogSegment.parseFrom(Files.readAllBytes(repositoryPath.resolve(lastLog.getKey()))).getEntries(0);
     assertEquals(LogEntry.Kind.COMPACT, entry.getKind());
     assertEquals(compactedInputs, Set.copyOf(entry.getSupersedesList()));
     assertEquals(compacted.getName(), entry.getAdditions(0).getName());

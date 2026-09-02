@@ -16,7 +16,7 @@ notifications or gossip are only latency optimizations.
 5. Before Gerrit's SSH or HTTP listeners start, each daemon reads a fresh manifest for every
    repository and synchronously replays unseen entries in sequence order.
 6. After all synchronous index work for an entry succeeds, the daemon atomically writes its
-   node-local cursor with the sequence and immutable log key.
+   node-local cursor with the entry's sequence and transaction id.
 7. Only after a complete clean sweep does the daemon publish readiness and start periodic sweeps.
 
 If index work or the cursor write fails, the entry is retried. A crash after indexing but before the
@@ -115,6 +115,10 @@ after that sweep.
   indexTailerEnabled = true
   indexPollInterval = 5 sec
   indexCursorPath = data/walgerrit-index-events
+  logSegmentEntries = 256
+  logRetention = 30 days
+  logRetainEntries = 10000
+  indexRebuildOnStaleCursor = true
 ```
 
 `indexCursorPath` must be on node-local durable storage beside that node's Lucene indexes. Sharing
@@ -142,13 +146,47 @@ conditional check. WalGerrit does not need it while a sweep costs a handful of r
 sub-interval convergence is ever required, a peer wake-up can be added on the publication path
 without changing this contract.
 
+## Folding and the retention floor
+
+After replaying a repository, the sweep folds its log: runs of `walgerrit.logSegmentEntries`
+single-entry segments become one segment, and segments older than `walgerrit.logRetention` drop
+below the manifest's floor once `walgerrit.logRetainEntries` newer entries remain. The defaults are
+256 entries per segment, 30 days and 10,000 entries. Folding never deletes an object; see
+[storage format](storage-format.md#folding).
+
+A cursor is validated against the entry it names: at the head or a segment boundary from the
+manifest alone, inside a segment while that segment is read for replay, so validation never costs
+an extra read.
+
+## Rebuilding instead of replaying
+
+A cursor below the floor, ahead of the head, or naming a transaction the manifest no longer does
+cannot be advanced by replay. A brand-new node with an empty volume is the common case: every
+repository whose log has ever been folded is below its floor. Rather than replaying a long history
+one entry at a time, the node rebuilds all four indexes from current repository state, the way the
+offline `reindex` program does, emptying each index first so documents for deleted changes cannot
+survive:
+
+1. Record every repository's current head sequence and transaction id.
+2. Mark each index not ready, empty it, refill it with Gerrit's site indexer, mark it ready.
+3. Seed every cursor from the heads recorded in step one, then replay the tail published meanwhile.
+4. Publish readiness.
+
+At startup this runs before Gerrit opens its listeners, so the node serves nothing while an index
+is empty; a background sweep that detects the condition revokes readiness for the duration. The
+rebuild takes as long as an offline reindex of the site. With the default retention only a node that
+was down or broken for a month, or one with a fresh volume, ever takes this path; a node down for an
+hour replays its tail in seconds.
+
+`walgerrit.indexRebuildOnStaleCursor = false` disables the automatic rebuild; the daemon then refuses
+to become ready and names the repositories and the cursor directory in its error, and the remedy is
+the offline `reindex` followed by removing the cursors. If a rebuild is interrupted, Gerrit refuses
+to start until the offline `reindex` has run, because the index was marked not ready. To force a
+rebuild deliberately, stop the node and remove its cursor directory: on a folded repository the
+empty cursor is below the floor.
+
 ## Rollout and recovery boundary
 
-The current implementation is for fresh WalGerrit WAL history. Older `REF_UPDATE` entries do not
-contain the logical transaction payload. Encountering one deliberately stops that repository and
-asks for a full reindex plus cursor seed. That seed/recovery command is not implemented yet, so do
-not enable the tailer over legacy WalGerrit data.
-
-Likewise, retained WAL history is currently complete because checkpoints and WAL pruning are not
-implemented. Before pruning exists, it must coordinate a full index checkpoint and seed so a new or
-long-offline node never starts behind the oldest retained event.
+Manifest format version 2 is not readable by earlier WalGerrit builds and does not read their data;
+no deployment holds data in the earlier layout. A `REF_UPDATE` entry without its logical
+transaction payload is a corruption and stops replay for that repository.
