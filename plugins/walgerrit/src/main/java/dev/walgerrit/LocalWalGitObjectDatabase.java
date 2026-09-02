@@ -272,6 +272,11 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     observedManifestRevision = -1;
   }
 
+  /** The manifest revision this handle's pack list currently mirrors. */
+  long observedManifestRevision() {
+    return observedManifestRevision;
+  }
+
   void endRefTransaction() {
     refTransactionRevision.remove();
     refTransactionCommitted.remove();

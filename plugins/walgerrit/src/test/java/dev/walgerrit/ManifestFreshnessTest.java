@@ -108,10 +108,15 @@ class ManifestFreshnessTest {
       assertNull(stale.exactRef(MAIN));
       ObjectId winner = publishMain(writer, "from node A");
 
-      // The stale handle believes main does not exist and tries to create it.
+      // The stale handle believes main does not exist and tries to create it. Its own pack
+      // publish conflicts with node A's write and retries over the newer manifest, so by the time
+      // the ref transaction runs the handle may already see node A's ref; either way the create
+      // against an expected old value of "absent" must be refused.
       ObjectId loser = WalGitRepositoryManagerTest.insertCommit(stale, "from node B");
       RefUpdate create = stale.updateRef(MAIN);
+      create.setExpectedOldObjectId(ObjectId.zeroId());
       create.setNewObjectId(loser);
+      create.setForceUpdate(true);
       assertEquals(RefUpdate.Result.LOCK_FAILURE, create.update());
 
       // The transaction revalidated, so the handle now sees node A's ref and object.

@@ -148,6 +148,27 @@ class LocalWalGitTransactionTest {
   }
 
   @Test
+  void refReadAfterAnObjectReadStillSeesAnotherHandlesUpdate() throws Exception {
+    WalGitRepositoryManager manager = manager();
+    Project.NameKey project = Project.nameKey("platform/object-then-ref");
+    manager.createRepository(project).close();
+
+    try (Repository writer = manager.openRepository(project);
+        Repository reader = manager.openRepository(project)) {
+      assertNull(reader.exactRef(Constants.R_HEADS + "main"));
+      ObjectId commit = WalGitRepositoryManagerTest.insertCommit(writer, "written elsewhere");
+      RefUpdate update = writer.updateRef(Constants.R_HEADS + "main");
+      update.setNewObjectId(commit);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+
+      // The object read adopts the newer manifest in the object database first...
+      assertEquals(Constants.OBJ_COMMIT, reader.open(commit).getType());
+      // ...and the ref database must still notice that its reftable stack predates it.
+      assertEquals(commit, reader.exactRef(Constants.R_HEADS + "main").getObjectId());
+    }
+  }
+
+  @Test
   void staleExpectedOldValueFailsWithoutChangingTheWinningRef() throws Exception {
     WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/expected-old");

@@ -35,6 +35,8 @@ import org.slf4j.LoggerFactory;
 /** Reftable storage makes each Gerrit batch ref update one immutable DFS file. */
 final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   private final LocalWalGitObjectDatabase objectDatabase;
+  /** The manifest revision the cached reftable stack was built from. */
+  private volatile long stackRevision = -1;
 
   LocalWalGitRefDatabase(
       DfsRepository repository, LocalWalGitObjectDatabase objectDatabase) {
@@ -92,12 +94,22 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
 
   /**
    * Adopts a newer manifest if this node has observed one; a network read happens only when the
-   * handle exceeded its revalidation interval. The reftable stack is reloaded only on a change.
+   * handle exceeded its revalidation interval. The reftable stack is a cache of its own, separate
+   * from the object database's pack list, so it is reloaded whenever the manifest revision it was
+   * built from differs from the one the object database now mirrors, regardless of which read
+   * path adopted the newer manifest first.
    */
   private void revalidate() throws IOException {
-    if (objectDatabase.revalidateIfStale()) {
-      super.refresh();
+    objectDatabase.revalidateIfStale();
+    if (objectDatabase.observedManifestRevision() != stackRevision) {
+      refresh();
     }
+  }
+
+  @Override
+  public void refresh() {
+    super.refresh();
+    stackRevision = objectDatabase.observedManifestRevision();
   }
 
   private static final class WalGitBatchRefUpdate extends DfsReftableBatchRefUpdate {
