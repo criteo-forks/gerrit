@@ -25,6 +25,8 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.NavigableSet;
 import org.eclipse.jgit.errors.RepositoryNotFoundException;
+import org.eclipse.jgit.internal.storage.dfs.DfsBlockCache;
+import org.eclipse.jgit.internal.storage.dfs.DfsBlockCacheConfig;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Repository;
 
@@ -37,6 +39,7 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
   @Inject
   WalGitRepositoryManager(@GerritServerConfig Config serverConfig, @SitePath Path sitePath) {
     this(WalGitConfiguration.from(serverConfig, sitePath));
+    configureBlockCache(serverConfig);
   }
 
   WalGitRepositoryManager(WalGitConfiguration configuration) {
@@ -46,6 +49,21 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
   WalGitRepositoryManager(WalGitConfiguration configuration, StorageLayout storage) {
     this.configuration = configuration;
     this.storage = storage;
+  }
+
+  /**
+   * Sizes JGit's process-wide block cache, which holds pack blocks and indexes for every open
+   * repository. JGit's default of 32 MB suits a laptop; a server gets a tenth of its heap unless
+   * {@code core.dfs.blockLimit} says otherwise.
+   */
+  static void configureBlockCache(Config serverConfig) {
+    DfsBlockCacheConfig cacheConfig = new DfsBlockCacheConfig().fromConfig(serverConfig);
+    if (serverConfig.getString("core", "dfs", "blockLimit") == null) {
+      long blockSize = cacheConfig.getBlockSize();
+      long limit = Math.max(cacheConfig.getBlockLimit(), Runtime.getRuntime().maxMemory() / 10);
+      cacheConfig.setBlockLimit(limit - (limit % blockSize));
+    }
+    DfsBlockCache.reconfigure(cacheConfig);
   }
 
   @Override
