@@ -184,6 +184,25 @@ class S3ObjectStoreContractTest {
         scoped.getIfChanged("manifest", updated.version()).state());
   }
 
+  @Test
+  void listingReportsTheSameVersionAConditionalWriteReturned() throws Exception {
+    String prefix = "listing/" + UUID.randomUUID() + "/";
+    ObjectStore scoped = new PrefixedObjectStore(store, prefix);
+    ObjectStore.StoredObject created = scoped.putIfAbsent("manifests/a.git/manifest.pb", new byte[] {1});
+    ObjectStore.StoredObject updated =
+        scoped.compareAndSwap("manifests/a.git/manifest.pb", created.version(), new byte[] {2});
+    scoped.putIfAbsent("repos/a.git/log/1.pb", new byte[] {3});
+
+    List<ObjectStore.ObjectSummary> listed = scoped.listWithVersions("manifests/");
+
+    assertEquals(1, listed.size());
+    assertEquals("manifests/a.git/manifest.pb", listed.get(0).key());
+    assertEquals(updated.version(), listed.get(0).version());
+    assertEquals(
+        ObjectStore.ConditionalRead.State.UNCHANGED,
+        scoped.getIfChanged("manifests/a.git/manifest.pb", listed.get(0).version()).state());
+  }
+
   private static PackRef reftable(String name) {
     return PackRef.newBuilder()
         .setName(name)

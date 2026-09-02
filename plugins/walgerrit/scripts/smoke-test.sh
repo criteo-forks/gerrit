@@ -57,19 +57,21 @@ for index_name in accounts changes_open changes_closed groups projects; do
 done
 
 run_gerrit init --batch --no-auto-start -d "$site"
-test -f "$site/data/walgerrit/repos/All-Projects.git/manifest.pb"
-test -f "$site/data/walgerrit/repos/All-Users.git/manifest.pb"
+test -f "$site/data/walgerrit/manifests/All-Projects.git/manifest.pb"
+test -f "$site/data/walgerrit/manifests/All-Users.git/manifest.pb"
+test -d "$site/data/walgerrit/repos/All-Projects.git/wal"
+test -d "$site/data/walgerrit/repos/All-Users.git/wal"
 
-cp "$site/data/walgerrit/repos/All-Projects.git/manifest.pb" \
+cp "$site/data/walgerrit/manifests/All-Projects.git/manifest.pb" \
   "$site/home/All-Projects.manifest.before-reinit"
-cp "$site/data/walgerrit/repos/All-Users.git/manifest.pb" \
+cp "$site/data/walgerrit/manifests/All-Users.git/manifest.pb" \
   "$site/home/All-Users.manifest.before-reinit"
 
 run_gerrit init --batch --no-auto-start -d "$site"
 cmp "$site/home/All-Projects.manifest.before-reinit" \
-  "$site/data/walgerrit/repos/All-Projects.git/manifest.pb"
+  "$site/data/walgerrit/manifests/All-Projects.git/manifest.pb"
 cmp "$site/home/All-Users.manifest.before-reinit" \
-  "$site/data/walgerrit/repos/All-Users.git/manifest.pb"
+  "$site/data/walgerrit/manifests/All-Users.git/manifest.pb"
 
 run_gerrit reindex -d "$site"
 

@@ -23,6 +23,9 @@ import java.util.Optional;
 interface ObjectStore {
   record StoredObject(byte[] bytes, String version) {}
 
+  /** One listing entry: the key and the same opaque version a read of that key would return. */
+  record ObjectSummary(String key, String version) {}
+
   /** Outcome of a conditional read; exactly one state applies. */
   record ConditionalRead(State state, StoredObject object) {
     enum State {
@@ -76,4 +79,11 @@ interface ObjectStore {
   void download(String key, Path target) throws IOException;
 
   List<String> list(String prefix) throws IOException;
+
+  /**
+   * Lists every key below {@code prefix} with its current version, so a caller can find the
+   * objects that changed without reading any of them. Object stores return this from the listing
+   * itself; on S3 the version is the ETag of each listed object.
+   */
+  List<ObjectSummary> listWithVersions(String prefix) throws IOException;
 }

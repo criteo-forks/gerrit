@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
+import com.google.gerrit.server.config.GerritRuntime;
 import org.eclipse.jgit.lib.CommitBuilder;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
@@ -121,6 +122,55 @@ class ManifestReadCountTest {
     assertEquals(2 * cycles, store.count("CAS manifest.pb"), "one CAS per pack and per reftable");
   }
 
+  @Test
+  void sweepListsManifestsOnceAndReadsOnlyThoseThatChanged() throws Exception {
+    Path bucket = root.resolve("bucket");
+    CountingObjectStore store = new CountingObjectStore(new FileObjectStore(bucket));
+    WalGitRepositoryManager nodeA = manager(store, "0");
+    WalGitRepositoryManager nodeB =
+        new WalGitRepositoryManager(
+            WalGitConfiguration.from(new Config(), root.resolve("node-b")),
+            new StorageLayout(
+                new FileObjectStore(bucket), root.resolve("cache-b"), root.resolve("cursors-b"), ""));
+    List<Project.NameKey> projects =
+        List.of(
+            Project.nameKey("platform/one"),
+            Project.nameKey("platform/two"),
+            Project.nameKey("platform/three"));
+    for (Project.NameKey project : projects) {
+      nodeA.createRepository(project).close();
+    }
+    IndexEventTailer tailer =
+        new IndexEventTailer(nodeA, (project, transaction) -> {}, GerritRuntime.DAEMON);
+
+    store.reset();
+    tailer.runOnce();
+    assertEquals(1, store.count("LIST-versions manifests/"), "one listing enumerates every repository");
+    assertEquals(0, store.manifestReads(), "manifests this node published are served from its cache");
+    assertEquals(projects.size(), store.count("GET log/*"), "one WAL entry per new repository");
+
+    store.reset();
+    tailer.runOnce();
+    assertEquals(1, store.count("LIST-versions manifests/"));
+    assertEquals(0, store.manifestReads(), "an unchanged repository costs no read at all");
+    assertEquals(0, store.count("GET log/*"));
+
+    ObjectId commit;
+    try (Repository repository = nodeB.openRepository(projects.get(1))) {
+      commit = WalGitRepositoryManagerTest.insertCommit(repository, "from node b");
+      RefUpdate update = repository.updateRef(Constants.R_HEADS + "main");
+      update.setNewObjectId(commit);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+    }
+
+    store.reset();
+    tailer.runOnce();
+    assertEquals(1, store.count("LIST-versions manifests/"));
+    assertEquals(1, store.manifestReads(), "only the repository whose manifest version changed is read");
+    assertEquals(2, store.count("GET log/*"), "its pack and ref-update entries are replayed");
+    assertEquals(0, store.writes());
+  }
+
   private WalGitRepositoryManager manager(ObjectStore store, String revalidateInterval) {
     Config config = new Config();
     config.setString("walgerrit", null, "storagePath", root.resolve("cache").toString());
@@ -206,6 +256,10 @@ class ManifestReadCountTest {
     }
 
     private void record(String operation, String key) {
+      if (operation.startsWith("LIST")) {
+        counts.computeIfAbsent(operation + " " + key, ignored -> new AtomicLong()).incrementAndGet();
+        return;
+      }
       String normalized = key.substring(key.lastIndexOf('/') + 1);
       if (key.contains("/log/")) {
         normalized = "log/*";
@@ -257,6 +311,12 @@ class ManifestReadCountTest {
     public List<String> list(String prefix) throws IOException {
       record("LIST", prefix);
       return delegate.list(prefix);
+    }
+
+    @Override
+    public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
+      record("LIST-versions", prefix);
+      return delegate.listWithVersions(prefix);
     }
   }
 }

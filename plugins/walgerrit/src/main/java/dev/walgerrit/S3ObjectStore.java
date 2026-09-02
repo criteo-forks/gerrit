@@ -25,6 +25,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -47,6 +48,7 @@ import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
 /** S3-compatible object storage using ETags as opaque CAS versions. */
 final class S3ObjectStore implements ObjectStore, AutoCloseable {
@@ -234,7 +236,13 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
 
   @Override
   public List<String> list(String prefix) throws IOException {
-    List<String> keys = new ArrayList<>();
+    return listWithVersions(prefix).stream().map(ObjectSummary::key).toList();
+  }
+
+  /** ListObjectsV2 returns each object's ETag, so a listing is also a version check. */
+  @Override
+  public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
+    List<ObjectSummary> summaries = new ArrayList<>();
     String continuationToken = null;
     do {
       try {
@@ -245,7 +253,9 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
                 .continuationToken(continuationToken)
                 .build();
         ListObjectsV2Response response = client.listObjectsV2(request);
-        response.contents().forEach(object -> keys.add(object.key()));
+        for (S3Object object : response.contents()) {
+          summaries.add(new ObjectSummary(object.key(), version(object.eTag(), object.key())));
+        }
         continuationToken =
             Boolean.TRUE.equals(response.isTruncated()) ? response.nextContinuationToken() : null;
       } catch (S3Exception exception) {
@@ -254,8 +264,8 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
         throw io("list", prefix, exception);
       }
     } while (continuationToken != null);
-    keys.sort(String::compareTo);
-    return List.copyOf(keys);
+    summaries.sort(Comparator.comparing(ObjectSummary::key));
+    return List.copyOf(summaries);
   }
 
   @Override

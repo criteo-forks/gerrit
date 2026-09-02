@@ -67,6 +67,13 @@ final class PrefixedObjectStore implements ObjectStore {
         .toList();
   }
 
+  @Override
+  public List<ObjectSummary> listWithVersions(String keyPrefix) throws IOException {
+    return delegate.listWithVersions(full(keyPrefix)).stream()
+        .map(summary -> new ObjectSummary(summary.key().substring(prefix.length()), summary.version()))
+        .toList();
+  }
+
   private String full(String key) {
     return prefix + key;
   }

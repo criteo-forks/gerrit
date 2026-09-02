@@ -16,10 +16,11 @@ WalGit immutable packs, transaction log and manifest
 
 Gerrit continues to maintain its existing local Lucene indexes. Each manifest-committed ref
 transaction contains its exact logical ref updates. Every Gerrit node tails that durable WAL from a
-node-local cursor and synchronously applies the corresponding Gerrit index updates. Startup blocks
-on one clean full catch-up before the serving listeners start; subsequent full-sweep health is
-published through a metric and node-local readiness marker. No separate event broker is required
-for search convergence.
+node-local cursor and synchronously applies the corresponding Gerrit index updates. Manifests share
+one listable prefix, so each sweep discovers every repository and the version of its manifest with
+one listing and reads only the manifests that changed. Startup blocks on one clean full catch-up
+before the serving listeners start; subsequent full-sweep health is published through a metric and
+node-local readiness marker. No separate event broker is required for search convergence.
 
 ## Current implementation
 

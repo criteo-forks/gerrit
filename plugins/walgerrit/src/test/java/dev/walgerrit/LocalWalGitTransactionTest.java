@@ -344,7 +344,11 @@ class LocalWalGitTransactionTest {
   }
 
   private Manifest manifest(Project.NameKey project) throws Exception {
-    Path path = repositoryPath(project).resolve(ManifestStore.MANIFEST_FILE);
+    Path path =
+        storagePath
+            .resolve("manifests")
+            .resolve(project.get() + ".git")
+            .resolve(ManifestStore.MANIFEST_FILE);
     return Manifest.parseFrom(Files.readAllBytes(path));
   }
 

@@ -58,6 +58,7 @@ final class ManifestStore {
   private static final String WAL_DIRECTORY = "wal";
 
   private final ObjectStore objectStore;
+  private final ObjectStore manifestObjects;
   private final Path repositoryPath;
   private final Path indexCursorPath;
   private final Path stagingPath;
@@ -114,6 +115,7 @@ final class ManifestStore {
       IoConsumer<String> afterManifestCas) {
     this(
         objectStore,
+        objectStore,
         repositoryPath,
         indexCursorPath,
         repositoryName,
@@ -123,8 +125,14 @@ final class ManifestStore {
         repositoryName);
   }
 
+  /**
+   * @param objectStore holds the repository's immutable pack, index, reftable and log objects
+   * @param manifestObjects holds {@code manifest.pb}; kept apart so that all manifests share one
+   *     listable prefix
+   */
   ManifestStore(
       ObjectStore objectStore,
+      ObjectStore manifestObjects,
       Path repositoryPath,
       Path indexCursorPath,
       String repositoryName,
@@ -133,6 +141,7 @@ final class ManifestStore {
       ManifestCache cache,
       String cacheKey) {
     this.objectStore = objectStore;
+    this.manifestObjects = manifestObjects;
     this.repositoryPath = repositoryPath.toAbsolutePath().normalize();
     this.indexCursorPath = indexCursorPath.toAbsolutePath().normalize();
     this.repositoryName = repositoryName;
@@ -162,7 +171,7 @@ final class ManifestStore {
             .build();
     try {
       ObjectStore.StoredObject stored =
-          objectStore.putIfAbsent(MANIFEST_FILE, manifest.toByteArray());
+          manifestObjects.putIfAbsent(MANIFEST_FILE, manifest.toByteArray());
       cache.offer(cacheKey, new VersionedManifest(manifest, stored.version()));
       return true;
     } catch (ObjectAlreadyExistsException exception) {
@@ -190,6 +199,24 @@ final class ManifestStore {
   /** The newest manifest this node has observed; reads from the store only if nothing is cached. */
   Manifest current() throws IOException {
     return currentVersioned().manifest();
+  }
+
+  /** One conditional read; the result carries the version the store reported for it. */
+  VersionedManifest refreshVersionedManifest() throws IOException {
+    return refreshVersioned().orElseThrow(this::notFound);
+  }
+
+  /**
+   * The cached manifest when this node already holds exactly {@code version}, as reported by a
+   * listing; otherwise one conditional read. The result carries its own version so a caller can
+   * record precisely which manifest it acted on.
+   */
+  VersionedManifest currentOrRefresh(String version) throws IOException {
+    VersionedManifest known = cache.get(cacheKey);
+    if (known != null && known.version().equals(version)) {
+      return known;
+    }
+    return refreshVersionedManifest();
   }
 
   List<LogEntry> readLogEntriesAfter(long sequence, Manifest manifest) throws IOException {
@@ -355,7 +382,8 @@ final class ManifestStore {
 
       try {
         ObjectStore.StoredObject stored =
-            objectStore.compareAndSwap(MANIFEST_FILE, versioned.version(), updated.toByteArray());
+            manifestObjects.compareAndSwap(
+                MANIFEST_FILE, versioned.version(), updated.toByteArray());
         cache.offer(cacheKey, new VersionedManifest(updated, stored.version()));
         afterManifestCas.accept(logKey);
         return updated;
@@ -433,7 +461,7 @@ final class ManifestStore {
   private Optional<VersionedManifest> refreshVersioned() throws IOException {
     VersionedManifest known = cache.get(cacheKey);
     ConditionalRead read =
-        objectStore.getIfChanged(MANIFEST_FILE, known == null ? null : known.version());
+        manifestObjects.getIfChanged(MANIFEST_FILE, known == null ? null : known.version());
     return switch (read.state()) {
       case UNCHANGED -> {
         if (known == null) {

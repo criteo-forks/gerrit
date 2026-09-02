@@ -22,11 +22,15 @@ import com.google.gerrit.server.config.GerritRuntime;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import dev.walgerrit.ManifestCache.VersionedManifest;
 import dev.walgerrit.proto.StorageProto.IndexCursor;
 import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -34,7 +38,14 @@ import org.eclipse.jgit.lib.Config;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** Replays committed WAL ref transactions into this node's derived Gerrit indexes and caches. */
+/**
+ * Replays committed WAL ref transactions into this node's derived Gerrit indexes and caches.
+ *
+ * <p>Each sweep is one paginated listing of the manifests prefix, which yields every repository
+ * with the current version of its manifest. A repository is replayed only when that version
+ * differs from the one this node last caught up to, so an unchanged repository costs nothing
+ * beyond its share of the listing, and the sweep interval is the cross-node convergence latency.
+ */
 @Singleton
 final class IndexEventTailer implements LifecycleListener {
   private static final Logger logger = LoggerFactory.getLogger(IndexEventTailer.class);
@@ -45,6 +56,8 @@ final class IndexEventTailer implements LifecycleListener {
   private final String indexType;
   private final Config serverConfig;
   private final IndexEventReadiness readiness;
+  /** Manifest version at which this node last confirmed each repository's cursor was at head. */
+  private final Map<Project.NameKey, String> caughtUpVersions = new ConcurrentHashMap<>();
   private ScheduledExecutorService executor;
   private boolean participating;
 
@@ -174,10 +187,16 @@ final class IndexEventTailer implements LifecycleListener {
   }
 
   void runOnce() throws IOException {
+    NavigableMap<Project.NameKey, String> heads = repositories.storage().listManifestVersions();
+    caughtUpVersions.keySet().retainAll(heads.keySet());
     Exception firstFailure = null;
-    for (Project.NameKey project : repositories.list()) {
+    for (Map.Entry<Project.NameKey, String> head : heads.entrySet()) {
+      Project.NameKey project = head.getKey();
+      if (head.getValue().equals(caughtUpVersions.get(project))) {
+        continue;
+      }
       try {
-        catchUp(project);
+        catchUp(project, head.getValue());
       } catch (IOException | RuntimeException exception) {
         logger.error("WalGerrit index-event replay failed for {}", project.get(), exception);
         if (firstFailure == null) {
@@ -196,8 +215,21 @@ final class IndexEventTailer implements LifecycleListener {
   }
 
   int catchUp(Project.NameKey project) throws IOException {
+    return catchUp(project, null);
+  }
+
+  /**
+   * Replays this repository's unseen WAL entries. With the version a listing reported, the manifest
+   * is taken from the node cache when it already holds that version; otherwise, and always without
+   * a listed version, one conditional read is made.
+   */
+  int catchUp(Project.NameKey project, String listedVersion) throws IOException {
     ManifestStore manifestStore = repositories.storage().manifestStore(project);
-    Manifest manifest = manifestStore.read();
+    VersionedManifest versioned =
+        listedVersion == null
+            ? manifestStore.refreshVersionedManifest()
+            : manifestStore.currentOrRefresh(listedVersion);
+    Manifest manifest = versioned.manifest();
     IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
     IndexCursor cursor = cursorStore.read();
     validateCursor(project, manifestStore, manifest, cursor);
@@ -229,6 +261,10 @@ final class IndexEventTailer implements LifecycleListener {
           manifest.getHeadSeq(),
           applied);
     }
+    // Record the version of the manifest that was actually replayed, never a newer one another
+    // handle may have cached meanwhile: the next listing must not skip entries this node has not
+    // applied.
+    caughtUpVersions.put(project, versioned.version());
     return applied;
   }
 

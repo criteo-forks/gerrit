@@ -3,8 +3,10 @@
 The shared format mirrors the Continuity/WalGit layout while using JGit's native DFS files.
 
 ```text
+<object-store-prefix>/manifests/<project>.git/
+  manifest.pb                  # the CAS-replaced linearization point
+
 <object-store-prefix>/repos/<project>.git/
-  manifest.pb
   log/<sequence>-<transaction>.pb
   wal/<pack-id>.pack
   wal/<pack-id>.idx
@@ -18,9 +20,15 @@ The shared format mirrors the Continuity/WalGit layout while using JGit's native
 <indexCursorPath>/READY
 ```
 
+Manifests live under their own prefix, apart from the pack, index, reftable and log objects. One
+paginated listing of `manifests/` therefore enumerates every repository together with the current
+version of its manifest, the ETag on S3, at a cost proportional to the number of repositories. That
+listing is how repositories are discovered and how the index-event sweep finds the manifests that
+changed without reading any of them.
+
 The local backend maps the shared object-store prefix and cache onto the same filesystem tree and
-adds `manifest.lock`. The S3 backend keeps the shared objects in the bucket and the staging/cache
-tree on each node.
+keeps its lock files under `.object-locks/`. The S3 backend keeps the shared objects in the bucket
+and the staging/cache tree on each node.
 
 `manifest.pb` contains the repository identity, object format, head sequence, overall revision,
 ref revision, live DFS file-set inventory, and immutable log references. `log/*.pb` records the

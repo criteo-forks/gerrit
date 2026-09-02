@@ -59,9 +59,10 @@ Add the following to `etc/gerrit.config`:
   commitWithin = 0
 ```
 
-`storagePath` is relative to the Gerrit site unless it is absolute. Restart Gerrit. Repository data
-is now stored below `data/walgerrit/repos/`; `gerrit.basePath` is not used by this backend.
-`indexCursorPath` must be node-local even when the WAL storage is shared.
+`storagePath` is relative to the Gerrit site unless it is absolute. Restart Gerrit. Manifests are
+now stored below `data/walgerrit/manifests/` and immutable pack, reftable and log objects below
+`data/walgerrit/repos/`; `gerrit.basePath` is not used by this backend. `indexCursorPath` must be
+node-local even when the WAL storage is shared.
 
 Manifest freshness follows the Continuity model: a repository handle revalidates the manifest with
 one conditional read (`If-None-Match` on the manifest ETag) when Gerrit opens it and again when it
@@ -156,7 +157,6 @@ init/reindex path are implemented and tested. A two-node MinIO test passes proje
 reindexing. The S3 object-store fault suite also passes.
 
 It is not production-ready yet: compactor lease/fencing and generation-aware pack reclamation are
-still missing; index notification wakeups and scalable repository sweeping are not implemented;
-cursor-gap recovery and legacy-WAL cursor seeding need an operator command; the cache has no size
-bound; migration, deletion, replay-lag metrics, integrity tooling, and broader Gerrit acceptance
-coverage remain open.
+still missing; cursor-gap recovery and legacy-WAL cursor seeding need an operator command; the
+cache has no size bound; migration, deletion, replay-lag metrics, integrity tooling, and broader
+Gerrit acceptance coverage remain open.

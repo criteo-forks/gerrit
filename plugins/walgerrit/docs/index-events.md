@@ -120,8 +120,27 @@ after that sweep.
 `indexCursorPath` must be on node-local durable storage beside that node's Lucene indexes. Sharing
 it lets one node acknowledge work for another node and is invalid.
 
-The current sweep lists all repositories and reads their manifests. S3/GCS finalize notifications
-can later wake the same replay loop for low latency, while a slower full sweep remains the backstop.
+## Discovery and change detection
+
+Each sweep is one paginated listing of the `manifests/` prefix. Because every manifest lives under
+that prefix and nothing else does, the listing enumerates every repository together with the
+current version of its manifest, which on S3 is the object's ETag and is returned by the listing
+itself. The tailer remembers the version at which it last brought each repository's cursor to head
+and replays a repository only when the listed version differs, taking the manifest from the node
+cache when another handle already fetched that version and reading it conditionally otherwise. An
+unchanged repository therefore costs nothing beyond its share of the listing: a sweep over 4300
+repositories is five requests when nothing changed, plus one manifest read and its new log entries
+per repository that did.
+
+This is the only mechanism by which a node learns about other nodes' writes, so
+`indexPollInterval` is the cross-node search convergence latency. S3 lists are strongly consistent,
+so a manifest published anywhere appears in the next listing. A node that restarts forgets what it
+had caught up to and reads every manifest once during its startup sweep, exactly as before.
+
+Cursor's design adds gossip between replicas as a latency optimization on top of the same kind of
+conditional check. WalGerrit does not need it while a sweep costs a handful of requests; if
+sub-interval convergence is ever required, a peer wake-up can be added on the publication path
+without changing this contract.
 
 ## Rollout and recovery boundary
 

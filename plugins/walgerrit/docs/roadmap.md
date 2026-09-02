@@ -35,7 +35,10 @@
 - [x] Persist exact ref transactions in the WAL and replay them at least once into accounts,
   changes, groups, and projects indexes from node-local cursors.
 - [x] Block daemon startup on a full initial catch-up and publish node-local replay readiness.
-- [ ] Add object-store notification wakeups and a scalable sweep backstop.
+- [x] Discover repositories and changed manifests with one listing of the flat `manifests/`
+  prefix per sweep; read only manifests whose version changed.
+- [ ] Optional peer wake-ups if cross-node index convergence must be faster than the sweep
+  interval.
 - [ ] Add legacy-WAL/full-reindex cursor seeding and sequence-gap recovery tooling.
 
 ## Milestone 4: migration and operations

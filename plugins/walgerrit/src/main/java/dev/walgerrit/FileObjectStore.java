@@ -20,11 +20,13 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -157,6 +159,19 @@ final class FileObjectStore implements ObjectStore {
           .sorted()
           .toList();
     }
+  }
+
+  @Override
+  public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
+    List<ObjectSummary> summaries = new ArrayList<>();
+    for (String key : list(prefix)) {
+      try {
+        summaries.add(new ObjectSummary(key, version(Files.readAllBytes(resolve(key)))));
+      } catch (NoSuchFileException vanished) {
+        // A staging or temporary file that was renamed or removed after the walk saw it.
+      }
+    }
+    return List.copyOf(summaries);
   }
 
   private Path resolve(String key) throws IOException {

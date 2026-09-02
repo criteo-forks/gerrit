@@ -77,8 +77,9 @@ class WalGitRepositoryManagerTest {
     }
 
     Path repositoryPath = storagePath.resolve("repos/platform/example.git");
-    Manifest manifest =
-        Manifest.parseFrom(Files.readAllBytes(repositoryPath.resolve(ManifestStore.MANIFEST_FILE)));
+    Path manifestPath =
+        storagePath.resolve("manifests/platform/example.git").resolve(ManifestStore.MANIFEST_FILE);
+    Manifest manifest = Manifest.parseFrom(Files.readAllBytes(manifestPath));
     assertEquals(3, manifest.getHeadSeq());
     assertEquals(3, manifest.getRevision());
     assertEquals(3, manifest.getLogSegmentsCount());
