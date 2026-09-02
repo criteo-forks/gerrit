@@ -518,7 +518,8 @@ public class GerritServer implements AutoCloseable {
     daemon.setInMemory(true);
     daemon.setDatabaseForTesting(
         ImmutableList.of(
-            new InMemoryTestingDatabaseModule(cfg, site, inMemoryRepoManager),
+            WalGerritTestSupport.overrideRepositoryManager(
+                cfg, site, new InMemoryTestingDatabaseModule(cfg, site, inMemoryRepoManager)),
             new AbstractModule() {
               @Override
               protected void configure() {

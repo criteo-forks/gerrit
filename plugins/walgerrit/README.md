@@ -121,6 +121,28 @@ The test builds the backend, initializes a fresh Gerrit site, verifies the `All-
 `All-Users` manifests, and reindexes entirely through WalGerrit. The same module is loaded by daemon
 and batch programs; configuring a separate batch module would bind `GitRepositoryManager` twice.
 
+Gerrit's own acceptance suite can run on the WalGerrit backend. The in-memory test server binds
+`GitRepositoryManager` to WalGerrit's local backend whenever `GERRIT_WALGERRIT_JAR` names the built
+library, loading it at runtime so the test framework needs no build dependency on it:
+
+```bash
+plugins/walgerrit/scripts/acceptance-tests.sh                       # everything
+plugins/walgerrit/scripts/acceptance-tests.sh //javatests/com/google/gerrit/acceptance/api/change:api_change
+```
+
+`GERRIT_WALGERRIT_STORAGE` may point the repositories at a tmpfs. Tests annotated `@UseLocalDisk`
+keep running on the filesystem backend they ask for. The script passes
+`--define=acceptance_heap=large`, which lifts the groups' 256 MB test heap to 512 MB: a test JVM
+keeps every server it started reachable, and WalGerrit's per-server footprint is larger than the
+in-memory manager's, so the biggest groups (`rest_account`) run out of heap otherwise.
+
+Ten cases in four groups fail by design on any backend other than the in-memory manager, because
+they assert on instrumentation that only `InMemoryRepositoryManager` provides: the four
+`GitRepositoryReferenceCountingManagerIT` cases in `acceptance_framework_tests` (open-handle
+reference counting) and the six `RefUpdateContext` cases in `git:DirectPushRefUpdateContextIT`,
+`git:HttpSubmitOnPushIT` and `git:SshSubmitOnPushIT` (the `RefUpdateContextCollector`). Everything
+else in the suite passes on WalGerrit.
+
 ## Storage model
 
 For every repository, WalGerrit writes:

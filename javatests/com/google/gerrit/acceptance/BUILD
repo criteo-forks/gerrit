@@ -1,5 +1,11 @@
 load("//tools/bzl:junit.bzl", "junit_tests")
 
+config_setting(
+    name = "larger_heap",
+    define_values = {"acceptance_heap": "large"},
+    visibility = ["//visibility:public"],
+)
+
 junit_tests(
     name = "acceptance_framework_tests",
     srcs = glob(["**/*.java"]),

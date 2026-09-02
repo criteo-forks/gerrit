@@ -29,7 +29,8 @@
 
 - [x] Initialize and reindex `All-Projects` and `All-Users` through WalGerrit.
 - [x] Push `refs/for/*`, comment, vote, and submit.
-- [ ] Exercise change edits and the wider Gerrit acceptance matrix.
+- [x] Run Gerrit's acceptance suite on the backend (`scripts/acceptance-tests.sh`); every case
+      passes except ten that assert on in-memory-manager-only instrumentation (see README).
 - [x] Run two Gerrit instances against one S3-compatible backend with independent local Lucene
   indexes, including restart.
 - [x] Persist exact ref transactions in the WAL and replay them at least once into accounts,
