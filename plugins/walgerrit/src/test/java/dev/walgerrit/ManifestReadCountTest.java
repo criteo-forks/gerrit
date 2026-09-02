@@ -371,5 +371,11 @@ class ManifestReadCountTest {
       record("LIST-versions", prefix);
       return delegate.listWithVersions(prefix);
     }
+
+    @Override
+    public void delete(String key) throws IOException {
+      record("DELETE", key);
+      delegate.delete(key);
+    }
   }
 }

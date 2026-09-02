@@ -61,6 +61,11 @@ final class PrefixedObjectStore implements ObjectStore {
   }
 
   @Override
+  public void delete(String key) throws IOException {
+    delegate.delete(full(key));
+  }
+
+  @Override
   public List<String> list(String keyPrefix) throws IOException {
     return delegate.list(full(keyPrefix)).stream()
         .map(key -> key.substring(prefix.length()))
@@ -70,7 +75,12 @@ final class PrefixedObjectStore implements ObjectStore {
   @Override
   public List<ObjectSummary> listWithVersions(String keyPrefix) throws IOException {
     return delegate.listWithVersions(full(keyPrefix)).stream()
-        .map(summary -> new ObjectSummary(summary.key().substring(prefix.length()), summary.version()))
+        .map(
+            summary ->
+                new ObjectSummary(
+                    summary.key().substring(prefix.length()),
+                    summary.version(),
+                    summary.lastModifiedEpochMillis()))
         .toList();
   }
 

@@ -162,6 +162,16 @@ final class FileObjectStore implements ObjectStore {
   }
 
   @Override
+  public void delete(String key) throws IOException {
+    withLock(
+        key,
+        () -> {
+          Files.deleteIfExists(resolve(key));
+          return null;
+        });
+  }
+
+  @Override
   public List<String> list(String prefix) throws IOException {
     Path start = listingRoot(prefix);
     if (!Files.isDirectory(start)) {
@@ -223,7 +233,12 @@ final class FileObjectStore implements ObjectStore {
     List<ObjectSummary> summaries = new ArrayList<>();
     for (String key : list(prefix)) {
       try {
-        summaries.add(new ObjectSummary(key, version(Files.readAllBytes(resolve(key)))));
+        Path path = resolve(key);
+        summaries.add(
+            new ObjectSummary(
+                key,
+                version(Files.readAllBytes(path)),
+                Files.getLastModifiedTime(path).toMillis()));
       } catch (NoSuchFileException vanished) {
         // A staging or temporary file that was renamed or removed after the walk saw it.
       }

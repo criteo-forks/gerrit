@@ -222,5 +222,10 @@ class ConcurrentWritersTest {
     public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
       return delegate.listWithVersions(prefix);
     }
+
+    @Override
+    public void delete(String key) throws IOException {
+      delegate.delete(key);
+    }
   }
 }

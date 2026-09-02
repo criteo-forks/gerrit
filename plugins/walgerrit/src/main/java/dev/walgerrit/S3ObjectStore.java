@@ -39,6 +39,7 @@ import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
@@ -235,6 +236,20 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
   }
 
   @Override
+  public void delete(String key) throws IOException {
+    try {
+      client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
+    } catch (S3Exception exception) {
+      if (exception.statusCode() == NOT_FOUND) {
+        return;
+      }
+      throw io("delete", key, exception);
+    } catch (RuntimeException exception) {
+      throw io("delete", key, exception);
+    }
+  }
+
+  @Override
   public List<String> list(String prefix) throws IOException {
     return listWithVersions(prefix).stream().map(ObjectSummary::key).toList();
   }
@@ -254,7 +269,11 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
                 .build();
         ListObjectsV2Response response = client.listObjectsV2(request);
         for (S3Object object : response.contents()) {
-          summaries.add(new ObjectSummary(object.key(), version(object.eTag(), object.key())));
+          summaries.add(
+              new ObjectSummary(
+                  object.key(),
+                  version(object.eTag(), object.key()),
+                  object.lastModified() == null ? 0 : object.lastModified().toEpochMilli()));
         }
         continuationToken =
             Boolean.TRUE.equals(response.isTruncated()) ? response.nextContinuationToken() : null;

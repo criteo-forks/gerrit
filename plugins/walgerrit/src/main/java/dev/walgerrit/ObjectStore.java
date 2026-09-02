@@ -23,8 +23,11 @@ import java.util.Optional;
 interface ObjectStore {
   record StoredObject(byte[] bytes, String version) {}
 
-  /** One listing entry: the key and the same opaque version a read of that key would return. */
-  record ObjectSummary(String key, String version) {}
+  /**
+   * One listing entry: the key, the same opaque version a read of that key would return, and the
+   * time the object was last written, as the store reports it.
+   */
+  record ObjectSummary(String key, String version, long lastModifiedEpochMillis) {}
 
   /** Outcome of a conditional read; exactly one state applies. */
   record ConditionalRead(State state, StoredObject object) {
@@ -77,6 +80,12 @@ interface ObjectStore {
   void uploadIfAbsent(String key, Path source) throws IOException;
 
   void download(String key, Path target) throws IOException;
+
+  /**
+   * Removes {@code key}; a missing key is not an error. On a versioned bucket this leaves a delete
+   * marker, so the data stays recoverable for the bucket's non-current-version retention.
+   */
+  void delete(String key) throws IOException;
 
   List<String> list(String prefix) throws IOException;
 
