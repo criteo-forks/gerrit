@@ -26,6 +26,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -44,24 +45,39 @@ import org.eclipse.jgit.internal.storage.pack.PackExt;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.transport.ReceiveCommand;
 
-/** JGit DFS object database backed by immutable local files and a CAS manifest. */
+/**
+ * JGit DFS object database backed by immutable local files and a CAS manifest.
+ *
+ * <p>Freshness contract: the manifest is revalidated with a conditional read when the handle is
+ * opened, when a ref transaction begins, when {@code scanForRepoChanges} is requested, and at most
+ * once per {@code manifestRevalidateInterval} in between. Every JGit lookup in between is served
+ * from JGit's in-memory pack list, which mirrors the newest manifest this node has observed.
+ */
 final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   private static final int SHA1_BYTES = 20;
 
   private final ManifestStore manifestStore;
+  private final long revalidateIntervalNanos;
   private final ThreadLocal<Long> refTransactionRevision = new ThreadLocal<>();
   private final ThreadLocal<Boolean> refTransactionCommitted = new ThreadLocal<>();
   private final ThreadLocal<RefTransaction> refTransaction = new ThreadLocal<>();
   private volatile Set<ObjectId> shallowCommits = Collections.emptySet();
   private volatile long observedManifestRevision = -1;
+  private volatile long lastRevalidationNanos;
 
-  LocalWalGitObjectDatabase(DfsRepository repository, ManifestStore manifestStore) {
+  LocalWalGitObjectDatabase(
+      DfsRepository repository, ManifestStore manifestStore, Duration revalidateInterval)
+      throws IOException {
     super(repository, new DfsReaderOptions());
     this.manifestStore = manifestStore;
+    this.revalidateIntervalNanos = revalidateInterval.toNanos();
     // JGit 7.7 can synthesize multi-pack-index descriptions. WalGerrit's manifest currently
     // records independent immutable pack families, not MIDX coverage, so keep this representation
     // disabled even if a future repository config attempts to enable it.
     setUseMultipackIndex(false);
+    // The manager revalidated the manifest when it opened this handle; start from that view.
+    observedManifestRevision = manifestStore.current().getRevision();
+    lastRevalidationNanos = System.nanoTime();
   }
 
   ManifestStore manifestStore() {
@@ -78,6 +94,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   protected void commitPackImpl(
       Collection<DfsPackDescription> descriptions, Collection<DfsPackDescription> replacements)
       throws IOException {
+    boolean compaction = false;
     for (DfsPackDescription description : descriptions) {
       switch (description.getPackSource()) {
         case GC:
@@ -86,6 +103,8 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
           throw new IOException(
               "DfsGarbageCollector publication is disabled; use the leased DfsPackCompactor path");
         case COMPACT:
+          compaction = true;
+          break;
         case INSERT:
         case RECEIVE:
           break;
@@ -111,8 +130,6 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
       }
     }
 
-    boolean writesReftable =
-        descriptions.stream().anyMatch(description -> description.hasFileExt(PackExt.REFTABLE));
     boolean logicalRefUpdate =
         descriptions.stream()
             .anyMatch(
@@ -128,18 +145,16 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     if (logicalRefUpdate && logicalTransaction == null) {
       throw new IOException("Reftable publication has no recorded ref transaction");
     }
-    manifestStore.publish(
-        expectedRefRevision == null ? 0 : expectedRefRevision,
-        additions,
-        supersedes,
-        logicalRefUpdate,
-        logicalTransaction);
+    Manifest updated =
+        manifestStore.publish(
+            expectedRefRevision == null ? 0 : expectedRefRevision,
+            additions,
+            supersedes,
+            logicalRefUpdate,
+            logicalTransaction);
+    afterOwnPublication(updated, compaction);
     if (logicalRefUpdate) {
       refTransactionCommitted.set(true);
-    } else if (writesReftable) {
-      // Representation-only reftable compaction changes the stack generation,
-      // but it is not a logical ref transaction and does not require one.
-      clearCache();
     }
   }
 
@@ -152,9 +167,10 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     }
   }
 
+  /** Enumerates the newest manifest this node has observed; never a network read by itself. */
   @Override
   protected List<DfsPackDescription> listPacks() throws IOException {
-    Manifest manifest = manifestStore.read();
+    Manifest manifest = manifestStore.current();
     List<DfsPackDescription> descriptions = new ArrayList<>(manifest.getPacksCount());
     for (PackRef pack : manifest.getPacksList()) {
       descriptions.add(fromPackRef(pack));
@@ -164,7 +180,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   @Override
   public PackList getPackList() throws IOException {
-    revalidateManifest();
+    revalidateIfStale();
     return super.getPackList();
   }
 
@@ -197,19 +213,22 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   @Override
   public long getApproximateObjectCount() {
     try {
-      return manifestStore.read().getPacksList().stream().mapToLong(PackRef::getObjectCount).sum();
+      return manifestStore.current().getPacksList().stream()
+          .mapToLong(PackRef::getObjectCount)
+          .sum();
     } catch (IOException exception) {
       return -1;
     }
   }
 
+  /**
+   * Starts a ref transaction: one conditional manifest read so expected-value checks run against
+   * the current global state, then remember the reftable-stack generation the CAS must match.
+   */
   void beginRefTransaction() throws IOException {
-    Manifest manifest = manifestStore.read();
-    refTransactionRevision.set(manifest.getRefRevision());
+    revalidateNow();
+    refTransactionRevision.set(manifestStore.current().getRefRevision());
     refTransactionCommitted.set(false);
-    // JGit's DFS pack list is intentionally cached. A new transaction must
-    // revalidate the manifest, just like a conditional GET in remote WalGit.
-    clearCache();
   }
 
   void recordRefTransaction(Collection<ReceiveCommand> commands) {
@@ -228,19 +247,24 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     refTransaction.set(transaction.build());
   }
 
-  boolean revalidateManifest() throws IOException {
-    long revision = manifestStore.read().getRevision();
-    if (revision == observedManifestRevision) {
-      return false;
+  /**
+   * Adopts the newest manifest this node has observed, after a conditional read if the handle has
+   * gone longer than the configured interval without one. Returns whether the view changed.
+   */
+  boolean revalidateIfStale() throws IOException {
+    long now = System.nanoTime();
+    if (revalidateIntervalNanos > 0 && now - lastRevalidationNanos >= revalidateIntervalNanos) {
+      manifestStore.refresh();
+      lastRevalidationNanos = now;
     }
-    synchronized (this) {
-      if (revision == observedManifestRevision) {
-        return false;
-      }
-      clearCache();
-      observedManifestRevision = revision;
-      return true;
-    }
+    return adoptObservedManifest();
+  }
+
+  /** Forces one conditional manifest read and adopts the result. Returns whether the view changed. */
+  boolean revalidateNow() throws IOException {
+    manifestStore.refresh();
+    lastRevalidationNanos = System.nanoTime();
+    return adoptObservedManifest();
   }
 
   void invalidateCaches() {
@@ -256,6 +280,38 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   boolean refTransactionCommitted() {
     return Boolean.TRUE.equals(refTransactionCommitted.get());
+  }
+
+  private boolean adoptObservedManifest() throws IOException {
+    long latest = manifestStore.current().getRevision();
+    if (latest == observedManifestRevision) {
+      return false;
+    }
+    synchronized (this) {
+      if (latest == observedManifestRevision) {
+        return false;
+      }
+      clearCache();
+      observedManifestRevision = latest;
+      return true;
+    }
+  }
+
+  /**
+   * After this handle published, JGit adds the new pack or reftable to its own in-memory list, so
+   * the list still mirrors the manifest when the publication was the only change. A compaction
+   * (JGit does not update the list itself) or a manifest that absorbed other writers' work in the
+   * meantime requires a rescan from the cached manifest; no network read is involved either way.
+   */
+  private void afterOwnPublication(Manifest updated, boolean compaction) {
+    synchronized (this) {
+      long previous = observedManifestRevision;
+      observedManifestRevision = updated.getRevision();
+      lastRevalidationNanos = System.nanoTime();
+      if (compaction || updated.getRevision() != previous + 1) {
+        clearCache();
+      }
+    }
   }
 
   private PackRef toPackRef(DfsPackDescription description) throws IOException {

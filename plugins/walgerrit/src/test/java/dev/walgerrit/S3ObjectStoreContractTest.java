@@ -160,6 +160,30 @@ class S3ObjectStoreContractTest {
     assertEquals(1, second.read().getRefRevision());
   }
 
+  @Test
+  void conditionalReadsAnswerUnchangedWithoutABody() throws Exception {
+    String prefix = "conditional/" + UUID.randomUUID() + "/";
+    ObjectStore scoped = new PrefixedObjectStore(store, prefix);
+
+    assertEquals(
+        ObjectStore.ConditionalRead.State.ABSENT,
+        scoped.getIfChanged("manifest", null).state());
+    ObjectStore.StoredObject created = scoped.putIfAbsent("manifest", new byte[] {1});
+    assertEquals(
+        ObjectStore.ConditionalRead.State.UNCHANGED,
+        scoped.getIfChanged("manifest", created.version()).state());
+
+    ObjectStore.StoredObject updated =
+        scoped.compareAndSwap("manifest", created.version(), new byte[] {2});
+    ObjectStore.ConditionalRead changed = scoped.getIfChanged("manifest", created.version());
+    assertEquals(ObjectStore.ConditionalRead.State.CHANGED, changed.state());
+    assertArrayEquals(new byte[] {2}, changed.object().bytes());
+    assertEquals(updated.version(), changed.object().version());
+    assertEquals(
+        ObjectStore.ConditionalRead.State.UNCHANGED,
+        scoped.getIfChanged("manifest", updated.version()).state());
+  }
+
   private static PackRef reftable(String name) {
     return PackRef.newBuilder()
         .setName(name)

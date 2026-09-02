@@ -23,10 +23,10 @@ import org.eclipse.jgit.internal.storage.dfs.DfsReftableBatchRefUpdate;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
 import org.eclipse.jgit.lib.BatchRefUpdate;
+import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ProgressMonitor;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.ReflogReader;
-import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.ReceiveCommand;
 import org.slf4j.Logger;
@@ -90,8 +90,12 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
     return super.getTipsWithSha1(id);
   }
 
+  /**
+   * Adopts a newer manifest if this node has observed one; a network read happens only when the
+   * handle exceeded its revalidation interval. The reftable stack is reloaded only on a change.
+   */
   private void revalidate() throws IOException {
-    if (objectDatabase.revalidateManifest()) {
+    if (objectDatabase.revalidateIfStale()) {
       super.refresh();
     }
   }

@@ -63,6 +63,15 @@ Add the following to `etc/gerrit.config`:
 is now stored below `data/walgerrit/repos/`; `gerrit.basePath` is not used by this backend.
 `indexCursorPath` must be node-local even when the WAL storage is shared.
 
+Manifest freshness follows the Continuity model: a repository handle revalidates the manifest with
+one conditional read (`If-None-Match` on the manifest ETag) when Gerrit opens it and again when it
+starts a ref transaction. Between those points, JGit's in-memory pack list and reftable stack serve
+every lookup. `walgerrit.manifestRevalidateInterval` (default `1 sec`) bounds how long a long-lived
+handle may serve reads without another conditional read; `0` disables the periodic check so only
+opens, ref transactions and `scanForRepoChanges` revalidate. All handles on a node share the newest
+manifest any of them observed, including the index-event tailer, so a handle adopts a newer
+manifest as soon as its node has seen one. See [Consistency](docs/consistency.md#freshness).
+
 Daemon startup synchronously catches every node-local index cursor up to a freshly read manifest
 before Gerrit's SSH and HTTP listeners start. A successful full sweep publishes the gauge
 `walgerrit/index_events/ready` and creates `<indexCursorPath>/READY`; a later failed sweep or orderly

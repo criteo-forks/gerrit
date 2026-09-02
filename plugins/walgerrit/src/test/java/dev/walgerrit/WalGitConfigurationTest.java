@@ -41,6 +41,7 @@ class WalGitConfigurationTest {
         configuration.indexCursorPath());
     assertTrue(configuration.indexTailerEnabled());
     assertEquals(Duration.ofSeconds(5), configuration.indexPollInterval());
+    assertEquals(Duration.ofSeconds(1), configuration.manifestRevalidateInterval());
   }
 
   @Test
@@ -68,6 +69,7 @@ class WalGitConfigurationTest {
     config.setBoolean("walgerrit", null, "indexTailerEnabled", false);
     config.setString("walgerrit", null, "indexPollInterval", "250 ms");
     config.setString("walgerrit", null, "indexCursorPath", "data/index-cursors");
+    config.setString("walgerrit", null, "manifestRevalidateInterval", "250 ms");
 
     WalGitConfiguration configuration = WalGitConfiguration.from(config, sitePath);
 
@@ -82,6 +84,17 @@ class WalGitConfigurationTest {
         configuration.indexCursorPath());
     assertFalse(configuration.indexTailerEnabled());
     assertEquals(Duration.ofMillis(250), configuration.indexPollInterval());
+    assertEquals(Duration.ofMillis(250), configuration.manifestRevalidateInterval());
+  }
+
+  @Test
+  void zeroManifestRevalidateIntervalDisablesPeriodicRevalidation() {
+    Config config = new Config();
+    config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
+
+    WalGitConfiguration configuration = WalGitConfiguration.from(config, sitePath);
+
+    assertEquals(Duration.ZERO, configuration.manifestRevalidateInterval());
   }
 
   @Test

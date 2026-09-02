@@ -51,6 +51,8 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 /** S3-compatible object storage using ETags as opaque CAS versions. */
 final class S3ObjectStore implements ObjectStore, AutoCloseable {
   private static final String SHA256_METADATA = "walgerrit-sha256";
+  private static final int NOT_MODIFIED = 304;
+  private static final int NOT_FOUND = 404;
 
   private final S3Client client;
   private final String bucket;
@@ -84,12 +86,45 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
       return Optional.of(
           new StoredObject(response.asByteArray(), version(response.response().eTag(), key)));
     } catch (S3Exception exception) {
-      if (exception.statusCode() == 404) {
+      if (exception.statusCode() == NOT_FOUND) {
         return Optional.empty();
       }
       throw io("get", key, exception);
     } catch (RuntimeException exception) {
       throw io("get", key, exception);
+    }
+  }
+
+  /**
+   * Conditional GET: {@code If-None-Match} with the known ETag. An unchanged object costs one round
+   * trip with no body ({@code 304 Not Modified}), which is what keeps manifest revalidation cheap.
+   */
+  @Override
+  public ConditionalRead getIfChanged(String key, String knownVersion) throws IOException {
+    if (knownVersion == null || knownVersion.isBlank()) {
+      return get(key).map(ConditionalRead::changed).orElseGet(ConditionalRead::absent);
+    }
+    try {
+      ResponseBytes<GetObjectResponse> response =
+          client.getObject(
+              GetObjectRequest.builder()
+                  .bucket(bucket)
+                  .key(key)
+                  .ifNoneMatch(entityTag(knownVersion))
+                  .build(),
+              ResponseTransformer.toBytes());
+      return ConditionalRead.changed(
+          new StoredObject(response.asByteArray(), version(response.response().eTag(), key)));
+    } catch (S3Exception exception) {
+      if (exception.statusCode() == NOT_MODIFIED) {
+        return ConditionalRead.unchanged();
+      }
+      if (exception.statusCode() == NOT_FOUND) {
+        return ConditionalRead.absent();
+      }
+      throw io("conditional get", key, exception);
+    } catch (RuntimeException exception) {
+      throw io("conditional get", key, exception);
     }
   }
 
@@ -125,13 +160,13 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
               PutObjectRequest.builder()
                   .bucket(bucket)
                   .key(key)
-                  .ifMatch(expectedVersion)
+                  .ifMatch(entityTag(expectedVersion))
                   .contentLength((long) bytes.length)
                   .build(),
               RequestBody.fromBytes(bytes));
       return new StoredObject(bytes, version(response.eTag(), key));
     } catch (S3Exception exception) {
-      if (isPreconditionFailure(exception) || exception.statusCode() == 404) {
+      if (isPreconditionFailure(exception) || exception.statusCode() == NOT_FOUND) {
         throw new ObjectStoreConflictException(key);
       }
       throw io("conditional put", key, exception);
@@ -262,11 +297,17 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
     return exception.statusCode() == 409 || exception.statusCode() == 412;
   }
 
+  /** Versions are stored unquoted; opaque equality is all WalGerrit relies on. */
   private static String version(String eTag, String key) throws IOException {
     if (eTag == null || eTag.isBlank()) {
       throw new IOException("S3 returned no ETag for " + key);
     }
     return eTag.replace("\"", "");
+  }
+
+  /** Conditional headers carry the ETag in its RFC 7232 quoted form, as S3 itself emits it. */
+  private static String entityTag(String version) {
+    return version.startsWith("\"") ? version : "\"" + version + "\"";
   }
 
   private static String digest(Path path) throws IOException {

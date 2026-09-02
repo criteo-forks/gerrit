@@ -21,6 +21,8 @@
 - [x] Replace local object operations with conditional S3 requests.
 - [x] Materialize immutable packs into a node-local cache on demand.
 - [x] Exercise concurrent writers, CAS conflicts, and ambiguous-success fault points against MinIO.
+- [x] Revalidate manifests with conditional reads once per repository handle and ref transaction
+  instead of on every JGit lookup; pin the round-trip budget in tests.
 - [ ] Add a size bound and eviction policy to the local pack cache.
 
 ## Milestone 3: Gerrit workflows

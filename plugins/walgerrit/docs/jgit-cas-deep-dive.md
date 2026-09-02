@@ -41,8 +41,12 @@ The backend must preserve these properties:
    harmless orphans.
 4. Objects may become available before their refs. A ref may never become visible before all of its
    objects are available.
-5. Each read request revalidates the manifest. Local disk and JGit memory state are caches, not
-   authority.
+5. Each repository handle revalidates the manifest with a conditional read when it is opened, when
+   it starts a ref transaction, and at most once per configured interval in between. Local disk and
+   JGit memory state are caches, not authority, and they mirror the newest manifest the node has
+   observed. Revalidating on every JGit lookup instead is not the contract: JGit consults the pack
+   list once per inserted, received and looked-up object, so that would turn every object into an
+   object-store round trip.
 6. A ref transaction validates all expected old values and publishes all accepted commands in one
    CAS, or publishes none of them.
 7. Once the manifest CAS lands, the operation is committed even if the response is lost or the
@@ -96,7 +100,7 @@ Writer affinity and batching reduce contention, but correctness never depends on
 | Full DFS garbage collection | `DfsGarbageCollector` snapshots refs and packs, then commits several outputs and removals together | It is not the production maintenance path | Gerrit GC is disabled and the backend rejects its `GC`, `GC_REST`, and `UNREACHABLE_GARBAGE` publications |
 | MIDX | Optional `DfsMidxWriter`; covered-pack relationships live in `DfsPackDescription` | Persist the MIDX base and covered-pack graph before enabling it | Keep disabled until the manifest schema supports it |
 | Ref rename | `DfsRefRename` creates the destination and deletes the source as two updates; JGit contains a TODO to batch them | Provide an atomic WalGerrit override before exposing rename to plugins | Gerrit core does not currently call it, but it is not acceptable as a general API |
-| Cache refresh | `DfsRepository.scanForRepoChanges` clears ref and object caches | A newly opened repository starts from a fresh manifest; mutations force refresh before expected-ref validation | Fits with backend policy; long-lived readers need an explicit request-boundary revalidation contract |
+| Cache refresh | `DfsRepository.scanForRepoChanges` clears ref and object caches; `DfsReader` and `DfsInserter` consult `getPackList()` for every object | A newly opened handle starts from one conditional manifest read; ref transactions force another; `getPackList()` serves JGit's in-memory list and only adopts a newer manifest the node has already observed or one fetched after the revalidation interval | Fits; the handle is the request boundary, mirroring Cursor's one conditional GET per request |
 
 The relevant JGit sources are
 [`DfsObjDatabase`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsObjDatabase.java),

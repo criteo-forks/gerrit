@@ -29,10 +29,13 @@ immutable `wal/` objects, writes an immutable log entry, and compare-and-swaps `
 manifest CAS is the only publication point.
 
 The filesystem implementation uses an OS file lock plus a JVM lock to serialize manifest CAS on one
-shared local filesystem. S3 uses conditional object requests. Object-only pack additions can merge
-over a newer manifest because they do not make refs visible. Ref updates require the reftable-stack
-revision they were prepared against. Compaction verifies that every superseded input is still live
-while preserving concurrent additions.
+shared local filesystem. S3 uses conditional object requests for both directions: `If-Match` on the
+manifest CAS and `If-None-Match` on manifest reads, so an unchanged manifest costs one round trip
+without a body. Each node keeps the newest manifest it observed per repository; handles revalidate
+at open, at ref-transaction begin and at a bounded interval, never per JGit lookup. Object-only pack
+additions can merge over a newer manifest because they do not make refs visible. Ref updates require
+the reftable-stack revision they were prepared against. Compaction verifies that every superseded
+input is still live while preserving concurrent additions.
 
 ## Target components
 

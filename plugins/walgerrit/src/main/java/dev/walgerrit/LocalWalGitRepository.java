@@ -16,6 +16,7 @@ package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
 import java.io.IOException;
+import java.time.Duration;
 import org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsRefDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
@@ -30,11 +31,16 @@ final class LocalWalGitRepository extends DfsRepository {
   private volatile String gitwebDescription;
 
   LocalWalGitRepository(Project.NameKey name, ManifestStore manifestStore) throws IOException {
+    this(name, manifestStore, WalGitConfiguration.DEFAULT_MANIFEST_REVALIDATE_INTERVAL);
+  }
+
+  LocalWalGitRepository(
+      Project.NameKey name, ManifestStore manifestStore, Duration revalidateInterval)
+      throws IOException {
     super(
         new Builder()
             .setRepositoryDescription(new DfsRepositoryDescription(name.get())));
-    manifestStore.read();
-    objectDatabase = new LocalWalGitObjectDatabase(this, manifestStore);
+    objectDatabase = new LocalWalGitObjectDatabase(this, manifestStore, revalidateInterval);
     refDatabase = new LocalWalGitRefDatabase(this, objectDatabase);
   }
 
@@ -46,6 +52,13 @@ final class LocalWalGitRepository extends DfsRepository {
   @Override
   public RefDatabase getRefDatabase() {
     return refDatabase;
+  }
+
+  /** Callers asking for a rescan get one conditional manifest read, then JGit's cache reset. */
+  @Override
+  public void scanForRepoChanges() throws IOException {
+    objectDatabase.revalidateNow();
+    super.scanForRepoChanges();
   }
 
   @Override

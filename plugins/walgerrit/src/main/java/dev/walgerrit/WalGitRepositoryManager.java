@@ -40,26 +40,12 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
   }
 
   WalGitRepositoryManager(WalGitConfiguration configuration) {
+    this(configuration, storageFor(configuration));
+  }
+
+  WalGitRepositoryManager(WalGitConfiguration configuration, StorageLayout storage) {
     this.configuration = configuration;
-    storage =
-        switch (configuration.backend()) {
-          case LOCAL ->
-              new StorageLayout(
-                  new FileObjectStore(configuration.storagePath()),
-                  configuration.storagePath(),
-                  configuration.indexCursorPath(),
-                  "");
-          case S3 ->
-              new StorageLayout(
-                  new S3ObjectStore(
-                      configuration.s3Bucket(),
-                      configuration.s3Region(),
-                      configuration.s3Endpoint(),
-                      configuration.s3PathStyle()),
-                  configuration.storagePath(),
-                  configuration.indexCursorPath(),
-                  configuration.s3Prefix());
-        };
+    this.storage = storage;
   }
 
   @Override
@@ -71,6 +57,7 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
     }
   }
 
+  /** Opening a handle is the request-level freshness boundary: exactly one conditional read. */
   @Override
   public Repository openRepository(Project.NameKey name)
       throws RepositoryNotFoundException, IOException {
@@ -120,11 +107,13 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
     return storage;
   }
 
-  private static LocalWalGitRepository openInitialized(
+  private LocalWalGitRepository openInitialized(
       Project.NameKey name, ManifestStore manifestStore) throws IOException {
-    LocalWalGitRepository repository = new LocalWalGitRepository(name, manifestStore);
+    LocalWalGitRepository repository =
+        new LocalWalGitRepository(
+            name, manifestStore, configuration.manifestRevalidateInterval());
     if (!repository.exists()) {
-      if (manifestStore.read().getRevision() != 0) {
+      if (manifestStore.current().getRevision() != 0) {
         repository.close();
         throw new IOException("Repository has a manifest but no ref state: " + name.get());
       }
@@ -132,5 +121,26 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
       repository.create(true);
     }
     return repository;
+  }
+
+  private static StorageLayout storageFor(WalGitConfiguration configuration) {
+    return switch (configuration.backend()) {
+      case LOCAL ->
+          new StorageLayout(
+              new FileObjectStore(configuration.storagePath()),
+              configuration.storagePath(),
+              configuration.indexCursorPath(),
+              "");
+      case S3 ->
+          new StorageLayout(
+              new S3ObjectStore(
+                  configuration.s3Bucket(),
+                  configuration.s3Region(),
+                  configuration.s3Endpoint(),
+                  configuration.s3PathStyle()),
+              configuration.storagePath(),
+              configuration.indexCursorPath(),
+              configuration.s3Prefix());
+    };
   }
 }

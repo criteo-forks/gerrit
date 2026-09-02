@@ -23,7 +23,48 @@ import java.util.Optional;
 interface ObjectStore {
   record StoredObject(byte[] bytes, String version) {}
 
+  /** Outcome of a conditional read; exactly one state applies. */
+  record ConditionalRead(State state, StoredObject object) {
+    enum State {
+      /** The stored version equals the caller's known version; no body was transferred. */
+      UNCHANGED,
+      /** The object exists with a different version; {@code object} carries it. */
+      CHANGED,
+      /** No object exists under the key. */
+      ABSENT
+    }
+
+    static ConditionalRead unchanged() {
+      return new ConditionalRead(State.UNCHANGED, null);
+    }
+
+    static ConditionalRead changed(StoredObject object) {
+      return new ConditionalRead(State.CHANGED, object);
+    }
+
+    static ConditionalRead absent() {
+      return new ConditionalRead(State.ABSENT, null);
+    }
+  }
+
   Optional<StoredObject> get(String key) throws IOException;
+
+  /**
+   * Reads {@code key} only if its current version differs from {@code knownVersion}.
+   *
+   * <p>Stores with a native conditional GET answer {@link ConditionalRead.State#UNCHANGED} without
+   * transferring the body. A {@code null} known version always fetches the object.
+   */
+  default ConditionalRead getIfChanged(String key, String knownVersion) throws IOException {
+    Optional<StoredObject> current = get(key);
+    if (current.isEmpty()) {
+      return ConditionalRead.absent();
+    }
+    if (knownVersion != null && knownVersion.equals(current.get().version())) {
+      return ConditionalRead.unchanged();
+    }
+    return ConditionalRead.changed(current.get());
+  }
 
   StoredObject putIfAbsent(String key, byte[] bytes) throws IOException;
 

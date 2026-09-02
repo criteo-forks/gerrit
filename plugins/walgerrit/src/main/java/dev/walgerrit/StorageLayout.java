@@ -30,6 +30,7 @@ final class StorageLayout {
   private final Path cacheRepositoriesPath;
   private final Path indexCursorRepositoriesPath;
   private final String repositoriesPrefix;
+  private final ManifestCache manifestCache = new ManifestCache();
 
   StorageLayout(Path root) {
     this(new FileObjectStore(root), root, root.resolve("index-events"), "");
@@ -50,13 +51,16 @@ final class StorageLayout {
 
   ManifestStore manifestStore(Project.NameKey name) throws IOException {
     String relative = repositoryRelativePath(name);
+    String objectPrefix = repositoriesPrefix + "/" + relative;
     return new ManifestStore(
-        new PrefixedObjectStore(objectStore, repositoriesPrefix + "/" + relative),
+        new PrefixedObjectStore(objectStore, objectPrefix),
         cacheRepositoriesPath.resolve(relative),
         indexCursorRepositoriesPath.resolve(relative + ".cursor"),
         name.get(),
         Clock.systemUTC(),
-        ignored -> {});
+        ignored -> {},
+        manifestCache,
+        objectPrefix);
   }
 
   NavigableSet<Project.NameKey> listProjects() throws IOException {

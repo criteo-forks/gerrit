@@ -32,7 +32,14 @@ record WalGitConfiguration(
     boolean s3PathStyle,
     Path indexCursorPath,
     boolean indexTailerEnabled,
-    Duration indexPollInterval) {
+    Duration indexPollInterval,
+    Duration manifestRevalidateInterval) {
+  /**
+   * Longest time an open repository handle serves reads without another conditional manifest
+   * read. Every handle also revalidates when it is opened and when it starts a ref transaction.
+   */
+  static final Duration DEFAULT_MANIFEST_REVALIDATE_INTERVAL = Duration.ofSeconds(1);
+
   private static final String SECTION = "walgerrit";
   private static final String BACKEND_KEY = "backend";
   private static final String STORAGE_PATH_KEY = "storagePath";
@@ -48,7 +55,8 @@ record WalGitConfiguration(
         false,
         storagePath.resolve("index-events"),
         true,
-        Duration.ofSeconds(5));
+        Duration.ofSeconds(5),
+        DEFAULT_MANIFEST_REVALIDATE_INTERVAL);
   }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
@@ -84,6 +92,13 @@ record WalGitConfiguration(
                     null,
                     "indexPollInterval",
                     TimeUnit.SECONDS.toMillis(5),
+                    TimeUnit.MILLISECONDS)),
+            Duration.ofMillis(
+                config.getTimeUnit(
+                    SECTION,
+                    null,
+                    "manifestRevalidateInterval",
+                    DEFAULT_MANIFEST_REVALIDATE_INTERVAL.toMillis(),
                     TimeUnit.MILLISECONDS)));
     configuration.validate();
     return configuration;
@@ -98,6 +113,10 @@ record WalGitConfiguration(
     }
     if (indexPollInterval.isZero() || indexPollInterval.isNegative()) {
       throw new IllegalArgumentException("walgerrit.indexPollInterval must be positive");
+    }
+    if (manifestRevalidateInterval.isNegative()) {
+      throw new IllegalArgumentException(
+          "walgerrit.manifestRevalidateInterval must be zero or positive");
     }
   }
 }

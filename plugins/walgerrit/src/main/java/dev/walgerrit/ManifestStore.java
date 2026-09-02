@@ -14,6 +14,8 @@
 
 package dev.walgerrit;
 
+import dev.walgerrit.ManifestCache.VersionedManifest;
+import dev.walgerrit.ObjectStore.ConditionalRead;
 import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.LogRef;
 import dev.walgerrit.proto.StorageProto.Manifest;
@@ -33,9 +35,18 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
-/** Durable protobuf manifest and immutable transaction-log storage for one repository. */
+/**
+ * Durable protobuf manifest and immutable transaction-log storage for one repository.
+ *
+ * <p>Manifest reads go through the node-wide {@link ManifestCache}. {@link #refresh()} performs one
+ * conditional read against the newest version this node has observed, so an unchanged manifest
+ * costs a round trip without a body; {@link #current()} serves the cached manifest without touching
+ * the object store at all. Callers choose the freshness boundary; this class never reads the
+ * manifest on its own initiative except to establish a CAS base.
+ */
 final class ManifestStore {
   static final String MANIFEST_FILE = "manifest.pb";
 
@@ -54,6 +65,8 @@ final class ManifestStore {
   private final String repositoryName;
   private final Clock clock;
   private final IoConsumer<String> afterManifestCas;
+  private final ManifestCache cache;
+  private final String cacheKey;
 
   ManifestStore(Path repositoryPath, String repositoryName) {
     this(repositoryPath, repositoryName, Clock.systemUTC(), ignored -> {});
@@ -99,18 +112,41 @@ final class ManifestStore {
       String repositoryName,
       Clock clock,
       IoConsumer<String> afterManifestCas) {
+    this(
+        objectStore,
+        repositoryPath,
+        indexCursorPath,
+        repositoryName,
+        clock,
+        afterManifestCas,
+        new ManifestCache(),
+        repositoryName);
+  }
+
+  ManifestStore(
+      ObjectStore objectStore,
+      Path repositoryPath,
+      Path indexCursorPath,
+      String repositoryName,
+      Clock clock,
+      IoConsumer<String> afterManifestCas,
+      ManifestCache cache,
+      String cacheKey) {
     this.objectStore = objectStore;
     this.repositoryPath = repositoryPath.toAbsolutePath().normalize();
     this.indexCursorPath = indexCursorPath.toAbsolutePath().normalize();
     this.repositoryName = repositoryName;
     this.clock = clock;
     this.afterManifestCas = afterManifestCas;
+    this.cache = cache;
+    this.cacheKey = cacheKey;
     stagingPath = this.repositoryPath.resolve(STAGING_DIRECTORY);
     walPath = this.repositoryPath.resolve(WAL_DIRECTORY);
   }
 
+  /** Conditionally re-reads the manifest and reports whether the repository exists. */
   boolean exists() throws IOException {
-    return objectStore.get(MANIFEST_FILE).isPresent();
+    return refreshIfPresent().isPresent();
   }
 
   boolean create() throws IOException {
@@ -125,15 +161,35 @@ final class ManifestStore {
             .setWriter(writerIdentity())
             .build();
     try {
-      objectStore.putIfAbsent(MANIFEST_FILE, manifest.toByteArray());
+      ObjectStore.StoredObject stored =
+          objectStore.putIfAbsent(MANIFEST_FILE, manifest.toByteArray());
+      cache.offer(cacheKey, new VersionedManifest(manifest, stored.version()));
       return true;
     } catch (ObjectAlreadyExistsException exception) {
       return false;
     }
   }
 
+  /** Same as {@link #refresh()}; kept for callers that want the "read from the store" wording. */
   Manifest read() throws IOException {
-    return readVersioned().manifest();
+    return refresh();
+  }
+
+  /**
+   * Re-reads the manifest from the object store, conditionally on the newest version this node has
+   * observed, and returns the newest manifest known afterwards.
+   */
+  Manifest refresh() throws IOException {
+    return refreshVersioned().orElseThrow(this::notFound).manifest();
+  }
+
+  Optional<Manifest> refreshIfPresent() throws IOException {
+    return refreshVersioned().map(VersionedManifest::manifest);
+  }
+
+  /** The newest manifest this node has observed; reads from the store only if nothing is cached. */
+  Manifest current() throws IOException {
+    return currentVersioned().manifest();
   }
 
   List<LogEntry> readLogEntriesAfter(long sequence, Manifest manifest) throws IOException {
@@ -230,7 +286,10 @@ final class ManifestStore {
       throws IOException {
     createCacheDirectories();
     for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
-      VersionedManifest versioned = readVersioned();
+      // The first attempt is optimistic against the manifest this node already observed; the
+      // conditional write rejects a stale version, and every retry re-reads conditionally.
+      VersionedManifest versioned =
+          attempt == 0 ? currentVersioned() : refreshVersioned().orElseThrow(this::notFound);
       Manifest current = versioned.manifest();
       if (requireExactRefRevision && current.getRefRevision() != expectedRefRevision) {
         throw new ManifestConflictException(expectedRefRevision, current.getRefRevision());
@@ -295,7 +354,9 @@ final class ManifestStore {
               .build();
 
       try {
-        objectStore.compareAndSwap(MANIFEST_FILE, versioned.version(), updated.toByteArray());
+        ObjectStore.StoredObject stored =
+            objectStore.compareAndSwap(MANIFEST_FILE, versioned.version(), updated.toByteArray());
+        cache.offer(cacheKey, new VersionedManifest(updated, stored.version()));
         afterManifestCas.accept(logKey);
         return updated;
       } catch (ObjectStoreConflictException conflict) {
@@ -303,7 +364,7 @@ final class ManifestStore {
         // A ref publication retries only while ref_revision remains unchanged.
       } catch (IOException ambiguous) {
         try {
-          Manifest fresh = read();
+          Manifest fresh = refresh();
           if (containsLog(fresh, logKey)) {
             return fresh;
           }
@@ -361,14 +422,42 @@ final class ManifestStore {
     return indexCursorPath;
   }
 
-  private VersionedManifest readVersioned() throws IOException {
-    ObjectStore.StoredObject stored =
-        objectStore
-            .get(MANIFEST_FILE)
-            .orElseThrow(() -> new IOException("Manifest not found: " + repositoryName));
-    Manifest manifest = Manifest.parseFrom(stored.bytes());
-    validate(manifest);
-    return new VersionedManifest(manifest, stored.version());
+  private VersionedManifest currentVersioned() throws IOException {
+    VersionedManifest known = cache.get(cacheKey);
+    if (known != null) {
+      return known;
+    }
+    return refreshVersioned().orElseThrow(this::notFound);
+  }
+
+  private Optional<VersionedManifest> refreshVersioned() throws IOException {
+    VersionedManifest known = cache.get(cacheKey);
+    ConditionalRead read =
+        objectStore.getIfChanged(MANIFEST_FILE, known == null ? null : known.version());
+    return switch (read.state()) {
+      case UNCHANGED -> {
+        if (known == null) {
+          throw new IOException(
+              "Object store reported an unchanged manifest without a known version: "
+                  + repositoryName);
+        }
+        yield Optional.of(known);
+      }
+      case ABSENT -> {
+        cache.evict(cacheKey);
+        yield Optional.empty();
+      }
+      case CHANGED -> {
+        Manifest manifest = Manifest.parseFrom(read.object().bytes());
+        validate(manifest);
+        yield Optional.of(
+            cache.offer(cacheKey, new VersionedManifest(manifest, read.object().version())));
+      }
+    };
+  }
+
+  private IOException notFound() {
+    return new IOException("Manifest not found: " + repositoryName);
   }
 
   private void createCacheDirectories() throws IOException {
@@ -444,8 +533,6 @@ final class ManifestStore {
     String host = System.getenv().getOrDefault("HOSTNAME", "localhost");
     return host + ":" + ProcessHandle.current().pid();
   }
-
-  private record VersionedManifest(Manifest manifest, String version) {}
 
   @FunctionalInterface
   interface IoConsumer<T> {

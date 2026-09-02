@@ -27,6 +27,29 @@ The manifest carries a separate ref revision. Appending unreachable object packs
 publication and therefore does not invalidate a ref transaction. Only a change to the live
 reftable stack advances the ref revision.
 
+## Freshness
+
+Local disk and JGit memory state are caches; the manifest in the object store is the authority. A
+handle establishes freshness with one conditional read of the manifest, using the newest version
+this node has observed as the `If-None-Match` token, at these points:
+
+1. when `GitRepositoryManager` opens or creates the repository;
+2. when a ref transaction begins, before JGit validates expected old values;
+3. when a caller asks for `scanForRepoChanges`;
+4. at most once per `walgerrit.manifestRevalidateInterval` within a long-lived handle (`0`
+   disables this periodic check).
+
+Between those points every object and ref lookup is served from JGit's in-memory pack list and
+reftable stack, which mirror the newest manifest the node has observed. A manifest observed by any
+handle on the node, including the index-event tailer's sweep, is adopted by every other handle on
+its next lookup without a further read. A handle's own publications update the node's view
+directly from the CAS response.
+
+This gives the same guarantee Cursor describes: a write acknowledged anywhere is visible to every
+request that starts afterwards on any node, and a ref transaction never validates against a view
+older than its own start. Within one request, reads are a consistent snapshot rather than a live
+feed of other nodes' writes.
+
 ## Derived state
 
 Lucene indexes and caches are not part of the Git transaction. They are updated after publication

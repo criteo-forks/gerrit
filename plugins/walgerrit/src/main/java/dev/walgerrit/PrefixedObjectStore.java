@@ -35,6 +35,11 @@ final class PrefixedObjectStore implements ObjectStore {
   }
 
   @Override
+  public ConditionalRead getIfChanged(String key, String knownVersion) throws IOException {
+    return delegate.getIfChanged(full(key), knownVersion);
+  }
+
+  @Override
   public StoredObject putIfAbsent(String key, byte[] bytes) throws IOException {
     return delegate.putIfAbsent(full(key), bytes);
   }

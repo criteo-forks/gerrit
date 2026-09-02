@@ -128,7 +128,7 @@ class LocalWalGitTransactionTest {
   }
 
   @Test
-  void longLivedRepositoryRevalidatesRefsAndObjectsBeforeReads() throws Exception {
+  void handleAdoptsManifestsPublishedByTheSameNode() throws Exception {
     WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/read-freshness");
     manager.createRepository(project).close();
