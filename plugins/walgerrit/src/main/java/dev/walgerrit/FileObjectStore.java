@@ -64,6 +64,10 @@ final class FileObjectStore implements ObjectStore {
     lockRoot = this.root.resolve(".object-locks");
   }
 
+  Path root() {
+    return root;
+  }
+
   @Override
   public Optional<StoredObject> get(String key) throws IOException {
     Path path = resolve(key);

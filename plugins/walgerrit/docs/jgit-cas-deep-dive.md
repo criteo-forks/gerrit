@@ -173,7 +173,8 @@ behavior.
 Ordinary Gerrit nodes never run JGit GC independently. `canPerformGC()` remains `false`, and the
 publication hook rejects all `DfsGarbageCollector` pack sources as defense in depth.
 
-A separate compactor does the following:
+This model is implemented by `Compactor`, `CompactionPolicy`, `CompactionLease` and `Reclaimer`;
+[compaction.md](compaction.md) describes the shipped behaviour. The compactor does the following:
 
 1. Acquire a per-repository compaction lease. The lease prevents duplicate expensive work; it is not
    the correctness mechanism.

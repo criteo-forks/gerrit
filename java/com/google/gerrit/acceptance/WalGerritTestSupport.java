@@ -40,6 +40,8 @@ import org.eclipse.jgit.lib.Config;
 final class WalGerritTestSupport {
   private static final String JAR_ENV = "GERRIT_WALGERRIT_JAR";
   private static final String STORAGE_ENV = "GERRIT_WALGERRIT_STORAGE";
+  /** Set to {@code aggressive} to compact after every couple of writes, racing the tests. */
+  private static final String COMPACTION_ENV = "GERRIT_WALGERRIT_COMPACTION";
   private static final String DB_MODULE = "dev.walgerrit.WalGitModule";
 
   /**
@@ -88,6 +90,12 @@ final class WalGerritTestSupport {
         "indexCursorPath",
         storage.resolveSibling(storage.getFileName() + "-cursors").toString());
     cfg.setBoolean("walgerrit", null, "indexTailerEnabled", false);
+    if ("aggressive".equals(System.getenv(COMPACTION_ENV))) {
+      // Every repository is compacted a few writes after it is touched, on the server's own
+      // compaction thread, so reads and writes throughout the suite race real compactions.
+      cfg.setInt("walgerrit", null, "compactMinPacks", 2);
+      cfg.setInt("walgerrit", null, "compactMinReftables", 2);
+    }
   }
 
   private static Path jar() {

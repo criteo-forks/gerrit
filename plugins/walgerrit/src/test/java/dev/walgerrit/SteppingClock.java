@@ -11,17 +11,38 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package dev.walgerrit;
 
-import com.google.gerrit.lifecycle.LifecycleModule;
-import com.google.gerrit.server.git.GitRepositoryManager;
-import com.google.inject.Scopes;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 
-abstract class AbstractWalGitModule extends LifecycleModule {
+/** A clock tests move by hand. */
+final class SteppingClock extends Clock {
+  private Instant now;
+
+  SteppingClock(Instant start) {
+    now = start;
+  }
+
+  void advance(Duration by) {
+    now = now.plus(by);
+  }
+
   @Override
-  protected final void configure() {
-    bind(GitRepositoryManager.class).to(WalGitRepositoryManager.class).in(Scopes.SINGLETON);
-    listener().to(CompactionService.class);
+  public ZoneId getZone() {
+    return ZoneOffset.UTC;
+  }
+
+  @Override
+  public Clock withZone(ZoneId zone) {
+    return this;
+  }
+
+  @Override
+  public Instant instant() {
+    return now;
   }
 }

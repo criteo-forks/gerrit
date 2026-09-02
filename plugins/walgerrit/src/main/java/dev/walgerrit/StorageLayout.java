@@ -15,6 +15,7 @@
 package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
+import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -22,6 +23,7 @@ import java.util.NavigableMap;
 import java.util.NavigableSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.function.BiConsumer;
 
 /**
  * Maps Gerrit project names onto object-store keys and node-local cache paths.
@@ -34,6 +36,7 @@ import java.util.TreeSet;
 final class StorageLayout {
   private static final String MANIFESTS_DIRECTORY = "manifests";
   private static final String REPOSITORIES_DIRECTORY = "repos";
+  private static final String LEASES_DIRECTORY = "leases";
   private static final String REPOSITORY_SUFFIX = ".git";
 
   private final ObjectStore objectStore;
@@ -41,8 +44,11 @@ final class StorageLayout {
   private final Path indexCursorRepositoriesPath;
   private final String manifestsPrefix;
   private final String repositoriesPrefix;
+  private final String leasesPrefix;
+  private final boolean cacheIsStore;
   private final ManifestCache manifestCache = new ManifestCache();
   private final RepositoryLocks repositoryLocks = new RepositoryLocks();
+  private volatile BiConsumer<Project.NameKey, Manifest> publicationListener = (name, manifest) -> {};
 
   StorageLayout(Path root) {
     this(new FileObjectStore(root), root, root.resolve("index-events"), "");
@@ -57,6 +63,35 @@ final class StorageLayout {
     String normalizedPrefix = prefix == null ? "" : prefix.replaceAll("/+$", "");
     manifestsPrefix = under(normalizedPrefix, MANIFESTS_DIRECTORY);
     repositoriesPrefix = under(normalizedPrefix, REPOSITORIES_DIRECTORY);
+    leasesPrefix = under(normalizedPrefix, LEASES_DIRECTORY);
+    cacheIsStore =
+        objectStore instanceof FileObjectStore files
+            && files.root().equals(cacheRoot.toAbsolutePath().normalize());
+  }
+
+  /**
+   * Whether the node-local cache directory is the store itself, as with the local backend. Then
+   * a cached file is the only copy, so nothing may evict it; only reclamation's grace rule deletes.
+   */
+  boolean cacheIsStore() {
+    return cacheIsStore;
+  }
+
+  /** Observes every manifest a store created by this layout publishes. */
+  void onPublication(BiConsumer<Project.NameKey, Manifest> listener) {
+    publicationListener = listener;
+  }
+
+  Path cacheRepositoriesPath() {
+    return cacheRepositoriesPath;
+  }
+
+  CompactionLease compactionLease(Project.NameKey name) throws IOException {
+    return new CompactionLease(
+        objectStore,
+        leasesPrefix + "/" + repositoryRelativePath(name) + "/" + CompactionLease.FILE,
+        Clock.systemUTC(),
+        ManifestStore.writerIdentity());
   }
 
   ManifestStore manifestStore(Project.NameKey name) throws IOException {
@@ -70,9 +105,11 @@ final class StorageLayout {
         name.get(),
         Clock.systemUTC(),
         ignored -> {},
+        manifest -> publicationListener.accept(name, manifest),
         manifestCache,
         repositoryLocks,
-        manifestPrefix);
+        manifestPrefix,
+        cacheIsStore);
   }
 
   /** Every repository, from one listing of the manifests prefix. */

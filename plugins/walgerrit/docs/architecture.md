@@ -52,7 +52,9 @@ input is still live while preserving concurrent additions.
 6. **Implemented:** WAL-native, at-least-once convergence of each node's accounts, changes, groups,
    and projects Lucene indexes from exact ref transactions, including synchronous initial catch-up
    and a readiness signal that is revoked after an incomplete sweep.
-7. **Next:** add the separate per-repository compaction lease, cursor recovery tooling, scalable
-   notification-driven index wakeups, and bounded cache eviction.
-8. **Later:** reader-generation-aware reclamation, import, integrity checking, checkpoints,
-   deletion, and snapshots. Ordinary Gerrit nodes never run independent GC.
+7. **Implemented:** writer-triggered geometric compaction of object packs and whole-stack reftable
+   compaction, fenced by a per-repository lease, a startup and periodic sweep, grace-period
+   reclamation of unreferenced files, a bounded node-local cache and a heap-sized block cache
+   ([compaction.md](compaction.md)).
+8. **Later:** import, integrity checking, deletion, snapshots and a multi-pack index. Ordinary
+   Gerrit nodes never run independent GC; objects are re-packed, never dropped.

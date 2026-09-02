@@ -89,6 +89,14 @@ only after synchronous Lucene writes; allowing Lucene to defer its disk commit c
 an acknowledged index event after a hard crash. The daemon refuses to start the tailer without
 these settings. A later batched index-checkpoint implementation can remove this performance cost.
 
+Compaction runs on every node: after a write, the node rolls undersized packs up geometrically and
+merges a deep reftable stack, publishing each result through the manifest CAS, and a sweep every
+`walgerrit.reclaimInterval` (default `6h`) deletes files the manifest no longer references once they
+are older than `walgerrit.reclaimGrace` (default `24h`). The defaults suit production; the keys
+`compactMinPacks`, `compactGeometricFactor`, `compactMaxPackSize`, `compactMinReftables`,
+`compactionLeaseDuration`, `reclaimEnabled`, `cacheSizeLimit` and JGit's `core.dfs.blockLimit` tune
+it. See [Compaction and reclamation](docs/compaction.md).
+
 For S3-compatible storage, use a node-local cache as `storagePath` and configure the shared bucket:
 
 ```ini
@@ -130,7 +138,9 @@ plugins/walgerrit/scripts/acceptance-tests.sh                       # everything
 plugins/walgerrit/scripts/acceptance-tests.sh //javatests/com/google/gerrit/acceptance/api/change:api_change
 ```
 
-`GERRIT_WALGERRIT_STORAGE` may point the repositories at a tmpfs. Tests annotated `@UseLocalDisk`
+`GERRIT_WALGERRIT_STORAGE` may point the repositories at a tmpfs, and
+`GERRIT_WALGERRIT_COMPACTION=aggressive` makes every test server compact after two writes so the
+whole suite races real compactions. Tests annotated `@UseLocalDisk`
 keep running on the filesystem backend they ask for. The script passes
 `--define=acceptance_heap=large`, which lifts the groups' 256 MB test heap to 512 MB: a test JVM
 keeps every server it started reachable, and WalGerrit's per-server footprint is larger than the
@@ -186,6 +196,7 @@ A node whose index cursors cannot be replayed, including a new node with an empt
 repository logs have been folded, rebuilds its indexes from current repository state before it
 becomes ready. See [WAL-driven index events](docs/index-events.md#rebuilding-instead-of-replaying).
 
-It is not production-ready yet: compactor lease/fencing and generation-aware pack reclamation are
-still missing; the cache has no size bound; migration, deletion, replay-lag metrics, integrity
-tooling, and broader Gerrit acceptance coverage remain open.
+Compaction, reclamation and cache bounds are implemented and exercised by the unit suite, the smoke
+test and an acceptance-suite run with aggressive thresholds. Still open before production: import
+and migration tooling, durable repository deletion, replay-lag metrics, integrity checking, and a
+pooled HTTP client for S3.

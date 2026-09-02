@@ -82,8 +82,13 @@ daemon's most recently completed full index-event sweep was clean.
    S3.
 
 Only step 5 makes a transaction visible. A process death before it can leave immutable orphan files
-or an orphan log entry, but cannot expose partial refs. Orphan reclamation belongs to a later
-maintenance milestone.
+or an orphan log entry, but cannot expose partial refs. Orphan files are reclaimed by the rule in
+[compaction.md](compaction.md#reclamation) once they are older than the grace period; log entries
+are never deleted.
+
+`leases/<project>.git/compaction` holds the repository's compaction lease, a small protobuf with an
+owner and an expiry, kept apart from the manifests prefix so a listing of manifests stays a listing
+of repositories.
 
 JGit represents a batch ref update as one reftable file, so all refs in that batch share one manifest
 publication. Reftable compaction may supersede an earlier reftable in the same transaction.
@@ -93,6 +98,7 @@ publication. Reftable compaction may supersede an earlier reftable in the same t
 - SHA-1 repositories only, matching current Gerrit project storage.
 - No durable repository deletion or import workflow yet.
 - S3-compatible storage is implemented; GCS-native conditional requests are not.
-- The node-local immutable-file cache is not bounded yet.
+- With the local backend the node-local cache is the store, so it cannot be bounded; the object
+  store backends bound it with `walgerrit.cacheSizeLimit`.
 - Immutable file names are random DFS pack identifiers; Git pack checksums are recorded in the
   manifest. The object-store milestone can use the checksum as the remote content key.

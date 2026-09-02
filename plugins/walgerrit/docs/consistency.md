@@ -56,6 +56,19 @@ request that starts afterwards on any node, and a ref transaction never validate
 older than its own start. Within one request, reads are a consistent snapshot rather than a live
 feed of other nodes' writes.
 
+## Compaction
+
+Compaction changes how a repository is stored, never what it contains. A compacted pack holds the
+same objects as the packs it supersedes and a compacted reftable the same refs as the stack it
+replaces, and both enter the live set through the same manifest CAS as a write, with the added
+check that every superseded file is still live. A reader therefore sees either the old files or the
+new ones, both complete, and a writer racing a compaction on another node either lands first, in
+which case the compaction's manifest update merges the writer's additions, or lands second and
+re-runs against the compacted manifest. On the same node a reftable compaction publishes under the
+repository's write lock, so it waits for the transaction in flight rather than failing it. Superseded files stay in the store for the reclamation grace period, which
+bounds how long a reader may keep using a manifest it read earlier. See
+[compaction.md](compaction.md).
+
 ## Derived state
 
 Lucene indexes and caches are not part of the Git transaction. They are updated after publication

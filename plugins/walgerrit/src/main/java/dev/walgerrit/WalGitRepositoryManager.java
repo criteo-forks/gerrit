@@ -35,6 +35,7 @@ import org.eclipse.jgit.lib.Repository;
 public final class WalGitRepositoryManager implements GitRepositoryManager {
   private final WalGitConfiguration configuration;
   private final StorageLayout storage;
+  private final Compactor compactor;
 
   @Inject
   WalGitRepositoryManager(@GerritServerConfig Config serverConfig, @SitePath Path sitePath) {
@@ -49,6 +50,8 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
   WalGitRepositoryManager(WalGitConfiguration configuration, StorageLayout storage) {
     this.configuration = configuration;
     this.storage = storage;
+    this.compactor = new Compactor(this);
+    storage.onPublication(compactor::consider);
   }
 
   /**
@@ -119,6 +122,10 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
 
   WalGitConfiguration configuration() {
     return configuration;
+  }
+
+  Compactor compactor() {
+    return compactor;
   }
 
   StorageLayout storage() {

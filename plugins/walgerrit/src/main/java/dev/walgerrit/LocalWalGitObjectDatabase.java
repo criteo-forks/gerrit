@@ -151,6 +151,16 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     if (logicalRefUpdate && logicalTransaction == null) {
       throw new IOException("Reftable publication has no recorded ref transaction");
     }
+    // A reftable compaction advances the ref revision, which would make a ref transaction in
+    // flight on this node lose its CAS and re-run. Publishing it under the node's write lock
+    // instead lets local transactions finish first and start their successors from the compacted
+    // manifest; writers on other nodes are still fenced by the CAS alone.
+    boolean reftableCompaction =
+        compaction && descriptions.stream().anyMatch(d -> d.hasFileExt(PackExt.REFTABLE));
+    ReentrantLock nodeLock = manifestStore.writeLock();
+    if (reftableCompaction) {
+      nodeLock.lock();
+    }
     Manifest updated;
     try {
       updated =
@@ -165,6 +175,10 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
       // batch update re-runs its checks against the newer manifest and tries again.
       refTransactionConflicted.set(true);
       throw conflict;
+    } finally {
+      if (reftableCompaction) {
+        nodeLock.unlock();
+      }
     }
     afterOwnPublication(updated, compaction);
     if (logicalRefUpdate) {
@@ -398,7 +412,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     return description;
   }
 
-  private static String packName(DfsPackDescription description) {
+  static String packName(DfsPackDescription description) {
     String fileName = description.getFileName(PackExt.PACK);
     String suffix = "." + PackExt.PACK.getExtension();
     return fileName.endsWith(suffix)

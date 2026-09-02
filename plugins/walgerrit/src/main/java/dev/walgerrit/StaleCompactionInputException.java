@@ -11,17 +11,19 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package dev.walgerrit;
 
-import com.google.gerrit.lifecycle.LifecycleModule;
-import com.google.gerrit.server.git.GitRepositoryManager;
-import com.google.inject.Scopes;
+import java.io.IOException;
 
-abstract class AbstractWalGitModule extends LifecycleModule {
-  @Override
-  protected final void configure() {
-    bind(GitRepositoryManager.class).to(WalGitRepositoryManager.class).in(Scopes.SINGLETON);
-    listener().to(CompactionService.class);
+/**
+ * A publication asked to supersede a pack the manifest no longer lists, so its inputs were already
+ * replaced by another compaction. Nothing was committed; the caller's uploaded output is unreferenced
+ * and may be deleted.
+ */
+final class StaleCompactionInputException extends IOException {
+  private static final long serialVersionUID = 1L;
+
+  StaleCompactionInputException(String packName) {
+    super("Cannot supersede a pack that is no longer live: " + packName);
   }
 }

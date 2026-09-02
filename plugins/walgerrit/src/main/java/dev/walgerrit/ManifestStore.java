@@ -40,6 +40,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 /**
  * Durable protobuf manifest and immutable transaction-log storage for one repository.
@@ -54,6 +56,8 @@ final class ManifestStore {
   static final String MANIFEST_FILE = "manifest.pb";
 
   private static final int FORMAT_VERSION = 2;
+  /** Cached files younger than this are never evicted: they may await their publication. */
+  static final java.time.Duration EVICTION_MIN_AGE = java.time.Duration.ofMinutes(10);
   private static final int MAX_CAS_ATTEMPTS = 64;
   private static final String OBJECT_FORMAT = "sha1";
   private static final String LOG_DIRECTORY = "log";
@@ -69,9 +73,11 @@ final class ManifestStore {
   private final String repositoryName;
   private final Clock clock;
   private final IoConsumer<String> afterManifestCas;
+  private final Consumer<Manifest> afterPublish;
   private final ManifestCache cache;
   private final String cacheKey;
   private final ReentrantLock writeLock;
+  private final boolean cacheIsStore;
 
   ManifestStore(Path repositoryPath, String repositoryName) {
     this(repositoryPath, repositoryName, Clock.systemUTC(), ignored -> {});
@@ -125,15 +131,22 @@ final class ManifestStore {
         repositoryName,
         clock,
         afterManifestCas,
+        ignored -> {},
         new ManifestCache(),
         new RepositoryLocks(),
-        repositoryName);
+        repositoryName,
+        objectStore instanceof FileObjectStore files
+            && files.root().equals(repositoryPath.toAbsolutePath().normalize()));
   }
 
   /**
    * @param objectStore holds the repository's immutable pack, index, reftable and log objects
    * @param manifestObjects holds {@code manifest.pb}; kept apart so that all manifests share one
    *     listable prefix
+   * @param afterPublish sees every manifest this store publishes, after the CAS; the compactor
+   *     evaluates its policy there
+   * @param cacheIsStore whether the cache directory is the store itself, so cached files are the
+   *     only copies and eviction must leave them alone
    */
   ManifestStore(
       ObjectStore objectStore,
@@ -143,9 +156,11 @@ final class ManifestStore {
       String repositoryName,
       Clock clock,
       IoConsumer<String> afterManifestCas,
+      Consumer<Manifest> afterPublish,
       ManifestCache cache,
       RepositoryLocks locks,
-      String cacheKey) {
+      String cacheKey,
+      boolean cacheIsStore) {
     this.objectStore = objectStore;
     this.manifestObjects = manifestObjects;
     this.repositoryPath = repositoryPath.toAbsolutePath().normalize();
@@ -153,9 +168,11 @@ final class ManifestStore {
     this.repositoryName = repositoryName;
     this.clock = clock;
     this.afterManifestCas = afterManifestCas;
+    this.afterPublish = afterPublish;
     this.cache = cache;
     this.cacheKey = cacheKey;
     this.writeLock = locks.forRepository(cacheKey);
+    this.cacheIsStore = cacheIsStore;
     stagingPath = this.repositoryPath.resolve(STAGING_DIRECTORY);
     walPath = this.repositoryPath.resolve(WAL_DIRECTORY);
   }
@@ -518,7 +535,7 @@ final class ManifestStore {
       }
       for (String superseded : supersedes) {
         if (livePacks.remove(superseded) == null) {
-          throw new IOException("Cannot supersede a pack that is no longer live: " + superseded);
+          throw new StaleCompactionInputException(superseded);
         }
       }
 
@@ -575,6 +592,7 @@ final class ManifestStore {
                 MANIFEST_FILE, versioned.version(), updated.toByteArray());
         cache.offer(cacheKey, new VersionedManifest(updated, stored.version()));
         afterManifestCas.accept(logKey);
+        afterPublish.accept(updated);
         return updated;
       } catch (ObjectStoreConflictException conflict) {
         // An object-only publication may merge a concurrent ref/object append.
@@ -583,6 +601,7 @@ final class ManifestStore {
         try {
           Manifest fresh = refresh();
           if (transactionLanded(fresh, sequence, transactionId)) {
+            afterPublish.accept(fresh);
             return fresh;
           }
         } catch (IOException verificationFailure) {
@@ -621,6 +640,71 @@ final class ManifestStore {
     }
     moveAtomic(source, target);
     forceDirectory(walPath);
+  }
+
+  /** Every file name, extension included, that the manifest references beneath {@code wal/}. */
+  static java.util.Set<String> liveFileNames(Manifest manifest) {
+    java.util.Set<String> names = new java.util.HashSet<>();
+    for (PackRef pack : manifest.getPacksList()) {
+      for (var file : pack.getFilesList()) {
+        names.add(pack.getName() + "." + file.getExtension());
+      }
+    }
+    return names;
+  }
+
+  /** Every object beneath {@code wal/}, keyed by file name, with the store's timestamps. */
+  List<ObjectStore.ObjectSummary> listWalObjects() throws IOException {
+    String prefix = WAL_DIRECTORY + "/";
+    List<ObjectStore.ObjectSummary> files = new ArrayList<>();
+    for (ObjectStore.ObjectSummary object : objectStore.listWithVersions(prefix)) {
+      if (object.key().startsWith(prefix) && object.key().length() > prefix.length()) {
+        files.add(
+            new ObjectStore.ObjectSummary(
+                object.key().substring(prefix.length()),
+                object.version(),
+                object.lastModifiedEpochMillis()));
+      }
+    }
+    return files;
+  }
+
+  void deleteWalObject(String fileName) throws IOException {
+    objectStore.delete(WAL_DIRECTORY + "/" + fileName);
+  }
+
+  void deleteLocalFile(String fileName) throws IOException {
+    Files.deleteIfExists(walPath.resolve(fileName));
+  }
+
+  /**
+   * Deletes cached files that are not in {@code live}, except files written within the last
+   * {@link #EVICTION_MIN_AGE}, which may be uploads whose publication has not landed yet. A handle
+   * that still needs an evicted file fetches it again from the store, which keeps it for the
+   * reclamation grace period. Does nothing when the cache is the store: there the copy is the only
+   * one, and only reclamation, with its grace period, may delete it.
+   */
+  int evictLocalFilesExcept(java.util.Set<String> live) throws IOException {
+    if (cacheIsStore || !Files.isDirectory(walPath)) {
+      return 0;
+    }
+    long youngest = clock.millis() - EVICTION_MIN_AGE.toMillis();
+    int evicted = 0;
+    try (Stream<Path> files = Files.list(walPath)) {
+      for (Path file : (Iterable<Path>) files::iterator) {
+        String name = file.getFileName().toString();
+        if (live.contains(name) || !Files.isRegularFile(file)) {
+          continue;
+        }
+        if (Files.getLastModifiedTime(file).toMillis() > youngest) {
+          continue;
+        }
+        if (Files.deleteIfExists(file)) {
+          evicted++;
+        }
+      }
+    }
+    return evicted;
   }
 
   void discardStagingFile(String fileName) {
@@ -764,7 +848,7 @@ final class ManifestStore {
     }
   }
 
-  private static String writerIdentity() {
+  static String writerIdentity() {
     String host = System.getenv().getOrDefault("HOSTNAME", "localhost");
     return host + ":" + ProcessHandle.current().pid();
   }

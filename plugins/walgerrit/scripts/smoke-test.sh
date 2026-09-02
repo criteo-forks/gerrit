@@ -148,5 +148,36 @@ done
 curl -fsS "${listen_url}projects/" | grep -q '"All-Projects"'
 stop_daemon
 
+# Compaction: with the thresholds at two, the daemon's startup sweep finds All-Projects overdue
+# (init leaves it two undersized packs), rolls them up, and with no grace period the sweep reclaims
+# every file the manifests no longer reference, including the tables JGit already folded at commit
+# time. The daemon must keep answering throughout, and a fresh daemon must start on the result.
+git config --file "$site/etc/gerrit.config" walgerrit.compactMinPacks 2
+git config --file "$site/etc/gerrit.config" walgerrit.compactMinReftables 2
+git config --file "$site/etc/gerrit.config" walgerrit.reclaimGrace 0
+git config --file "$site/etc/gerrit.config" walgerrit.reclaimInterval "2 sec"
+compaction_log="$site/logs/walgerrit-compaction-smoke.log"
+start_daemon "$compaction_log"
+for _ in $(seq 1 240); do
+  if grep -q "WalGerrit compacted .* of All-Projects" "$compaction_log" \
+      && grep -qE "WalGerrit reclaimed [1-9][0-9]* unreferenced" "$compaction_log"; then
+    break
+  fi
+  sleep 0.5
+done
+grep -q "WalGerrit compacted .* of All-Projects" "$compaction_log"
+grep -qE "WalGerrit reclaimed [1-9][0-9]* unreferenced" "$compaction_log"
+! grep -q "WalGerrit compaction of .* failed" "$compaction_log"
+! grep -q "WalGerrit sweep failed" "$compaction_log"
+curl -fsS "${listen_url}projects/" | grep -q '"All-Projects"'
+stop_daemon
+
+restart_log="$site/logs/walgerrit-after-compaction-smoke.log"
+start_daemon "$restart_log"
+curl -fsS "${listen_url}projects/" | grep -q '"All-Projects"'
+curl -fsS "${listen_url}accounts/?q=is:active&n=1" >/dev/null
+stop_daemon
+run_gerrit reindex -d "$site"
+
 echo "WalGerrit fork initialized, reindexed, caught up, folded its logs, rebuilt indexes for a" \
-  "replaced node, and published readiness successfully."
+  "replaced node, compacted and reclaimed its repositories, and published readiness successfully."

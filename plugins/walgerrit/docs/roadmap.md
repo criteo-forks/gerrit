@@ -46,10 +46,13 @@
 ## Milestone 4: migration and operations
 
 - Import all repositories with full object-closure verification.
-- Add snapshots, integrity checks, and orphan cleanup.
+- Add snapshots and integrity checks.
 - [x] Publish `DfsPackCompactor` output as one exact add-and-supersede manifest transaction while
   retaining old files.
-- Add the per-repository compaction lease, scheduling, and reader-generation-aware physical
-  reclamation.
+- [x] Compact on the writing node with a geometric pack policy and whole-stack reftable compaction,
+  fenced by a per-repository lease, with a startup and periodic sweep for overdue repositories
+  (see [compaction.md](compaction.md)).
+- [x] Reclaim unreferenced files after a grace period, evict superseded files from the node-local
+  cache, bound the cache, and size JGit's block cache from the heap.
 - Add index replay lag/error metrics and operational alerts.
 - Document cutover and rollback.

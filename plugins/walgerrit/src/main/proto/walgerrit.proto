@@ -117,3 +117,12 @@ message IndexCursor {
   // transaction_id of the entry at sequence; empty at sequence 0.
   string transaction_id = 2;
 }
+
+// Stored at leases/<repo>.git/compaction. Holding it only avoids duplicate
+// work: the manifest CAS, with its check that every superseded pack is still
+// live, is what keeps two compactors from corrupting anything. A lease whose
+// expiry has passed, including a released one (expiry 0), may be taken over.
+message CompactionLease {
+  string owner = 1;
+  int64 expires_at_epoch_millis = 2;
+}
