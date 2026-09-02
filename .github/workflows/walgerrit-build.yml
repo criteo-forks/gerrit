@@ -40,8 +40,33 @@ jobs:
           cache: maven
           cache-dependency-path: plugins/walgerrit/pom.xml
 
+      - name: Start MinIO so the S3 contract tests run
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/minio \
+            https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
+          echo "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  /tmp/minio" | sha256sum -c -
+          chmod +x /tmp/minio
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER=walgerrit MINIO_ROOT_PASSWORD=walgerrit-secret \
+            nohup /tmp/minio server /tmp/minio-data --address 127.0.0.1:9123 --console-address 127.0.0.1:9124 \
+            > /tmp/minio.log 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -fs -o /dev/null http://127.0.0.1:9123/minio/health/live && exit 0
+            sleep 1
+          done
+          cat /tmp/minio.log
+          echo "MinIO did not become healthy" >&2
+          exit 1
+
       - name: Test and package WalGerrit
         working-directory: plugins/walgerrit
+        env:
+          WALGERRIT_S3_TEST_ENDPOINT: http://127.0.0.1:9123
+          WALGERRIT_S3_TEST_BUCKET: walgerrit-ci
+          AWS_ACCESS_KEY_ID: walgerrit
+          AWS_SECRET_ACCESS_KEY: walgerrit-secret
+          AWS_REGION: us-east-1
         run: ./mvnw --batch-mode --no-transfer-progress verify
 
       - name: Build Gerrit 3.14.2 release WAR
