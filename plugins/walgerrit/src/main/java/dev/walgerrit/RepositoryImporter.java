@@ -307,10 +307,12 @@ public final class RepositoryImporter {
     }
   }
 
+  /** Every ref, peeled: the reftable writer records a tag's target alongside the tag itself. */
   private static Map<String, Ref> sourceRefs(Repository source) throws IOException {
     Map<String, Ref> refs = new TreeMap<>();
-    for (Ref ref : source.getRefDatabase().getRefsByPrefix(RefDatabase.ALL)) {
-      refs.put(ref.getName(), ref);
+    RefDatabase database = source.getRefDatabase();
+    for (Ref ref : database.getRefsByPrefix(RefDatabase.ALL)) {
+      refs.put(ref.getName(), ref.isSymbolic() || ref.isPeeled() ? ref : database.peel(ref));
     }
     Ref head = source.exactRef(Constants.HEAD);
     if (head != null) {

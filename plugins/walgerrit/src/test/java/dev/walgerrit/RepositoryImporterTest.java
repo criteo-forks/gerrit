@@ -55,7 +55,23 @@ class RepositoryImporterTest {
       expected.put("refs/changes/01/1/1", commitAndRef(bare, "refs/changes/01/1/1", "patch set"));
       expected.put("refs/changes/01/1/meta", commitAndRef(bare, "refs/changes/01/1/meta", "meta"));
       expected.put("refs/meta/config", commitAndRef(bare, "refs/meta/config", "config"));
+      ObjectId tagged = expected.get(Constants.R_HEADS + "main");
+      ObjectId tag =
+          Git.wrap(bare)
+              .tag()
+              .setObjectId(bare.parseCommit(tagged))
+              .setName("v1")
+              .setMessage("annotated")
+              .setTagger(new org.eclipse.jgit.lib.PersonIdent("T", "t@example.test"))
+              .call()
+              .getObjectId();
+      expected.put(Constants.R_TAGS + "v1", tag);
       repack(bare);
+      // A loose ref written after the repack is unpeeled, as refs are after 'git repack' alone.
+      RefUpdate alias = bare.updateRef(Constants.R_HEADS + "alias");
+      alias.setNewObjectId(tagged);
+      assertEquals(RefUpdate.Result.NEW, alias.update());
+      expected.put(Constants.R_HEADS + "alias", tagged);
     }
     WalGitRepositoryManager manager = manager("node-a");
     RepositoryImporter importer = new RepositoryImporter(manager, new PrintStream(System.out), true);
@@ -68,8 +84,14 @@ class RepositoryImporterTest {
     try (Repository imported = manager.openRepository(project)) {
       for (Map.Entry<String, ObjectId> ref : expected.entrySet()) {
         assertEquals(ref.getValue(), imported.exactRef(ref.getKey()).getObjectId(), ref.getKey());
-        assertEquals(Constants.OBJ_COMMIT, imported.open(ref.getValue()).getType());
+        assertNotNull(imported.open(ref.getValue()));
       }
+      Ref tagRef = imported.exactRef(Constants.R_TAGS + "v1");
+      assertEquals(Constants.OBJ_TAG, imported.open(tagRef.getObjectId()).getType());
+      assertEquals(
+          expected.get(Constants.R_HEADS + "main"),
+          imported.getRefDatabase().peel(tagRef).getPeeledObjectId(),
+          "the annotated tag is peeled to the commit it tags");
       Ref head = imported.exactRef(Constants.HEAD);
       assertNotNull(head);
       assertTrue(head.isSymbolic());
