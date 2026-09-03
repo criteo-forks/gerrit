@@ -46,10 +46,8 @@ Add the following to `etc/gerrit.config`:
   backend = local
   storagePath = data/walgerrit
   indexCursorPath = data/walgerrit-index-events
-  # Log folding and retention; the manifest stays bounded regardless of repository age.
-  logSegmentEntries = 256
-  logRetention = 30 days
-  logRetainEntries = 10000
+  # A node further behind than this many log entries rebuilds its indexes instead of replaying.
+  indexReplayLimit = 10000
 
 [index "accounts"]
   commitWithin = 0
@@ -196,9 +194,8 @@ init/reindex path are implemented and tested. A two-node MinIO test passes proje
 `refs/for/*` push, cross-node review/vote, submit, search convergence, and restart without manual
 reindexing. The S3 object-store fault suite also passes.
 
-A node whose index cursors cannot be replayed, including a new node with an empty volume once
-repository logs have been folded, rebuilds its indexes from current repository state before it
-becomes ready. See [WAL-driven index events](docs/index-events.md#rebuilding-instead-of-replaying).
+A node whose index cursors cannot be replayed, including a new node with an empty volume on a busy
+site, rebuilds its indexes from current repository state before it becomes ready. See [WAL-driven index events](docs/index-events.md#rebuilding-instead-of-replaying).
 
 Compaction, reclamation and cache bounds are implemented and exercised by the unit suite, the smoke
 test and an acceptance-suite run with aggressive thresholds. Still open before production: import

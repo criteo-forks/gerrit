@@ -87,7 +87,10 @@ interface ObjectStore {
    */
   void delete(String key) throws IOException;
 
-  List<String> list(String prefix) throws IOException;
+  /** Every key below {@code prefix}; the versions are discarded. */
+  default List<String> list(String prefix) throws IOException {
+    return listWithVersions(prefix).stream().map(ObjectSummary::key).toList();
+  }
 
   /**
    * Lists every key below {@code prefix} with its current version, so a caller can find the

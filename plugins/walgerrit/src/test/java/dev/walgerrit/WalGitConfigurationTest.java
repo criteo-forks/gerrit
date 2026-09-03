@@ -42,46 +42,30 @@ class WalGitConfigurationTest {
     assertTrue(configuration.indexTailerEnabled());
     assertEquals(Duration.ofSeconds(5), configuration.indexPollInterval());
     assertEquals(Duration.ofSeconds(1), configuration.manifestRevalidateInterval());
-    assertEquals(256, configuration.logSegmentEntries());
-    assertEquals(Duration.ofDays(30), configuration.logRetention());
-    assertEquals(10_000, configuration.logRetainEntries());
+    assertEquals(10_000, configuration.indexReplayLimit());
     assertTrue(configuration.indexRebuildOnStaleCursor());
   }
 
   @Test
-  void configuresLogFoldingAndRebuildBehaviour() {
+  void configuresReplayLimitAndRebuildBehaviour() {
     Config config = new Config();
-    config.setString("walgerrit", null, "logSegmentEntries", "64");
-    config.setString("walgerrit", null, "logRetention", "7 days");
-    config.setString("walgerrit", null, "logRetainEntries", "500");
+    config.setString("walgerrit", null, "indexReplayLimit", "500");
     config.setBoolean("walgerrit", null, "indexRebuildOnStaleCursor", false);
-
     WalGitConfiguration configuration = WalGitConfiguration.from(config, sitePath);
-
-    assertEquals(64, configuration.logSegmentEntries());
-    assertEquals(Duration.ofDays(7), configuration.logRetention());
-    assertEquals(500, configuration.logRetainEntries());
+    assertEquals(500, configuration.indexReplayLimit());
     assertFalse(configuration.indexRebuildOnStaleCursor());
   }
 
   @Test
-  void rejectsDegenerateFoldSettings() {
-    Config tooSmall = new Config();
-    tooSmall.setString("walgerrit", null, "logSegmentEntries", "1");
-    assertTrue(
-        assertThrows(
-                IllegalArgumentException.class, () -> WalGitConfiguration.from(tooSmall, sitePath))
-            .getMessage()
-            .contains("logSegmentEntries"));
-
-    Config nothingRetained = new Config();
-    nothingRetained.setString("walgerrit", null, "logRetainEntries", "0");
+  void rejectsAReplayLimitBelowOne() {
+    Config nothingReplayed = new Config();
+    nothingReplayed.setString("walgerrit", null, "indexReplayLimit", "0");
     assertTrue(
         assertThrows(
                 IllegalArgumentException.class,
-                () -> WalGitConfiguration.from(nothingRetained, sitePath))
+                () -> WalGitConfiguration.from(nothingReplayed, sitePath))
             .getMessage()
-            .contains("logRetainEntries"));
+            .contains("indexReplayLimit"));
   }
 
   @Test

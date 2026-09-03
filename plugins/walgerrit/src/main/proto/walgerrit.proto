@@ -13,21 +13,17 @@ message Manifest {
   string object_format = 3;
   uint64 head_seq = 4;
   repeated PackRef packs = 5;
-  // Log segments covering [min_seq, head_seq]: ascending, contiguous and
-  // non-overlapping. Bounded by folding: runs of single-entry segments are
-  // merged, and segments older than the retention rule drop below min_seq.
-  repeated LogRef log_segments = 6;
   uint64 revision = 7;
   int64 updated_at_epoch_millis = 8;
   string writer = 9;
   // Changes only when the live reftable stack changes. Object-pack appends
   // deliberately do not invalidate a ref transaction based on this value.
   uint64 ref_revision = 10;
-  // Sequence of the oldest entry the manifest still references; 0 means every
-  // entry since creation. Entries below it were folded away from the manifest
-  // by retention. Their objects stay in the store, but a follower whose cursor
-  // is below this floor rebuilds its derived state instead of replaying.
-  uint64 min_seq = 11;
+  // transaction_id of the entry at head_seq; empty while head_seq is 0. Log
+  // entries form a chain, each naming the transaction id of the entry before
+  // it, so a follower walks back from here with deterministic keys,
+  // log/<seq>-<transaction_id>.pb, and the manifest needs no table of entries.
+  string head_transaction_id = 12;
 }
 
 message PackRef {
@@ -51,20 +47,7 @@ message PackFile {
   uint32 block_size = 3;
 }
 
-// One immutable log object holding the entries [first_seq, last_seq].
-message LogRef {
-  string key = 1;
-  uint64 first_seq = 2;
-  uint64 last_seq = 3;
-  uint64 size = 4;
-  bool sealed = 5;
-  // transaction_id of the entry at last_seq, so a follower whose cursor sits
-  // on a segment boundary can validate it without reading the segment.
-  string last_transaction_id = 6;
-  // created_at of the entry at last_seq; drives time-based retention.
-  int64 last_created_at_epoch_millis = 7;
-}
-
+// One immutable log object, log/<seq>-<transaction_id>.pb.
 message LogEntry {
   enum Kind {
     KIND_UNSPECIFIED = 0;
@@ -89,12 +72,10 @@ message LogEntry {
   // the manifest. Followers keep it in their cursor to detect a manifest that
   // was rolled back to an older version and then diverged.
   string transaction_id = 9;
-}
-
-// Every log object is one segment: a single entry when published, several
-// consecutive entries after folding.
-message LogSegment {
-  repeated LogEntry entries = 1;
+  // transaction_id of the entry at seq - 1; empty for the first entry. Only
+  // entries reachable from the manifest's head through this chain are history;
+  // an entry written by a publication that lost its CAS is never referenced.
+  string previous_transaction_id = 10;
 }
 
 message RefUpdate {

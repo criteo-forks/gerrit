@@ -81,8 +81,8 @@ The cursor is safe across hard crashes only when every affected Lucene index com
 stable storage. WalGerrit therefore requires `commitWithin = 0` for accounts, both change
 sub-indexes, groups, and projects. A missing payload, sequence gap or index failure leaves the
 cursor unacknowledged and stops progress for that repository instead of silently skipping data. A
-cursor that can no longer be replayed at all, because it fell below the manifest's retention floor
-or names a transaction the manifest does not, makes the node rebuild its indexes from repository
+cursor that can no longer be replayed at all, because it names a transaction the chain does not
+or is further behind than the replay limit, makes the node rebuild its indexes from repository
 state and reseed every cursor before it serves again.
 
 Before Gerrit's serving listeners start, a daemon must complete a clean sweep of every repository.

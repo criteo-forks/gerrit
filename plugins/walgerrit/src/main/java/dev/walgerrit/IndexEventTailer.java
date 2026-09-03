@@ -46,10 +46,8 @@ import org.slf4j.LoggerFactory;
  * with the current version of its manifest. A repository is replayed only when that version
  * differs from the one this node last caught up to, so an unchanged repository costs nothing
  * beyond its share of the listing, and the sweep interval is the cross-node convergence latency.
- * After replaying a repository the sweep folds its log, merging single-entry segments and applying
- * the retention floor, so the manifest stays bounded regardless of the repository's age.
  *
- * <p>A cursor that cannot be advanced by replay, because it is below the floor, ahead of a
+ * <p>A cursor that cannot be advanced by replay, because it is too far behind, ahead of a
  * rolled-back head, or names a transaction the manifest no longer does, makes the node rebuild all
  * of its indexes from current repository state and reseed every cursor, the way a new node with an
  * empty volume bootstraps. That happens before the node becomes ready.
@@ -65,7 +63,6 @@ final class IndexEventTailer implements LifecycleListener {
   private final Config serverConfig;
   private final IndexEventReadiness readiness;
   private final IndexRebuilder rebuilder;
-  private final FoldPolicy foldPolicy;
   /** Manifest version at which this node last confirmed each repository's cursor was at head. */
   private final Map<Project.NameKey, String> caughtUpVersions = new ConcurrentHashMap<>();
   private ScheduledExecutorService executor;
@@ -108,33 +105,6 @@ final class IndexEventTailer implements LifecycleListener {
       IndexEventApplier applier,
       GerritRuntime runtime,
       String indexType,
-      Config serverConfig) {
-    this(
-        repositories,
-        applier,
-        runtime,
-        indexType,
-        serverConfig,
-        new IndexEventReadiness(
-            repositories.configuration().indexCursorPath().resolve("READY")),
-        null);
-  }
-
-  IndexEventTailer(
-      WalGitRepositoryManager repositories,
-      IndexEventApplier applier,
-      GerritRuntime runtime,
-      String indexType,
-      Config serverConfig,
-      IndexEventReadiness readiness) {
-    this(repositories, applier, runtime, indexType, serverConfig, readiness, null);
-  }
-
-  IndexEventTailer(
-      WalGitRepositoryManager repositories,
-      IndexEventApplier applier,
-      GerritRuntime runtime,
-      String indexType,
       Config serverConfig,
       IndexEventReadiness readiness,
       IndexRebuilder rebuilder) {
@@ -145,7 +115,6 @@ final class IndexEventTailer implements LifecycleListener {
     this.serverConfig = serverConfig;
     this.readiness = readiness;
     this.rebuilder = rebuilder;
-    this.foldPolicy = FoldPolicy.of(repositories.configuration());
   }
 
   @Override
@@ -271,9 +240,9 @@ final class IndexEventTailer implements LifecycleListener {
   }
 
   /**
-   * Replays this repository's unseen WAL entries, then folds its log. With the version a listing
-   * reported, the manifest is taken from the node cache when it already holds that version;
-   * otherwise, and always without a listed version, one conditional read is made.
+   * Replays this repository's unseen WAL entries. With the version a listing reported, the
+   * manifest is taken from the node cache when it already holds that version; otherwise, and
+   * always without a listed version, one conditional read is made.
    *
    * @throws IndexRebuildRequiredException when the cursor cannot be advanced by replay
    */
@@ -289,7 +258,10 @@ final class IndexEventTailer implements LifecycleListener {
 
     List<LogEntry> entries =
         manifestStore.readLogEntriesAfter(
-            cursor.getSequence(), cursor.getTransactionId(), manifest);
+            cursor.getSequence(),
+            cursor.getTransactionId(),
+            manifest,
+            repositories.configuration().indexReplayLimit());
     int applied = 0;
     for (LogEntry entry : entries) {
       if (entry.getKind() == LogEntry.Kind.REF_UPDATE) {
@@ -318,32 +290,7 @@ final class IndexEventTailer implements LifecycleListener {
     // handle may have cached meanwhile: the next listing must not skip entries this node has not
     // applied.
     caughtUpVersions.put(project, versioned.version());
-    fold(project, manifestStore, versioned);
     return applied;
-  }
-
-  /**
-   * Folds the repository's log after replay. A fold changes the manifest version without adding
-   * entries, so the folded version is recorded as caught up to spare the next sweep a pass.
-   */
-  private void fold(Project.NameKey project, ManifestStore manifestStore, VersionedManifest replayed) {
-    try {
-      VersionedManifest folded = manifestStore.fold(foldPolicy);
-      if (folded.manifest().getRevision() != replayed.manifest().getRevision()) {
-        if (folded.manifest().getHeadSeq() == replayed.manifest().getHeadSeq()) {
-          caughtUpVersions.put(project, folded.version());
-        }
-        logger.info(
-            "WalGerrit folded the log of {}: {} segments covering [{}, {}]",
-            project.get(),
-            folded.manifest().getLogSegmentsCount(),
-            ManifestStore.floor(folded.manifest()),
-            folded.manifest().getHeadSeq());
-      }
-    } catch (IOException | RuntimeException exception) {
-      // Folding is representation only and idempotent; the next sweep retries it.
-      logger.warn("WalGerrit could not fold the log of {}", project.get(), exception);
-    }
   }
 
   /**
@@ -386,7 +333,7 @@ final class IndexEventTailer implements LifecycleListener {
           head.getKey(),
           IndexCursor.newBuilder()
               .setSequence(manifest.getHeadSeq())
-              .setTransactionId(ManifestStore.lastTransactionId(manifest))
+              .setTransactionId(manifest.getHeadTransactionId())
               .build());
     }
 

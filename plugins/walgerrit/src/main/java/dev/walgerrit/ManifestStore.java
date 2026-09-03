@@ -17,8 +17,6 @@ package dev.walgerrit;
 import dev.walgerrit.ManifestCache.VersionedManifest;
 import dev.walgerrit.ObjectStore.ConditionalRead;
 import dev.walgerrit.proto.StorageProto.LogEntry;
-import dev.walgerrit.proto.StorageProto.LogRef;
-import dev.walgerrit.proto.StorageProto.LogSegment;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
@@ -30,10 +28,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Clock;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
-import java.util.HashMap;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -55,7 +53,7 @@ import java.util.stream.Stream;
 final class ManifestStore {
   static final String MANIFEST_FILE = "manifest.pb";
 
-  private static final int FORMAT_VERSION = 2;
+  private static final int FORMAT_VERSION = 3;
   /** Cached files younger than this are never evicted: they may await their publication. */
   static final java.time.Duration EVICTION_MIN_AGE = java.time.Duration.ofMinutes(10);
   private static final int MAX_CAS_ATTEMPTS = 64;
@@ -72,7 +70,6 @@ final class ManifestStore {
   private final Path walPath;
   private final String repositoryName;
   private final Clock clock;
-  private final IoConsumer<String> afterManifestCas;
   private final Consumer<Manifest> afterPublish;
   private final ManifestCache cache;
   private final String cacheKey;
@@ -80,57 +77,18 @@ final class ManifestStore {
   private final boolean cacheIsStore;
 
   ManifestStore(Path repositoryPath, String repositoryName) {
-    this(repositoryPath, repositoryName, Clock.systemUTC(), ignored -> {});
+    this(new FileObjectStore(repositoryPath), repositoryPath, repositoryName);
   }
 
-  ManifestStore(Path repositoryPath, String repositoryName, Clock clock) {
-    this(repositoryPath, repositoryName, clock, ignored -> {});
-  }
-
-  ManifestStore(
-      Path repositoryPath,
-      String repositoryName,
-      Clock clock,
-      IoConsumer<Path> afterManifestCas) {
+  /** A store of its own for tests and tools: fresh node-wide caches, no publication listener. */
+  ManifestStore(ObjectStore objectStore, Path repositoryPath, String repositoryName) {
     this(
-        new FileObjectStore(repositoryPath),
-        repositoryPath,
-        repositoryPath.resolve("index-events.cursor"),
-        repositoryName,
-        clock,
-        ignored -> afterManifestCas.accept(repositoryPath.resolve(MANIFEST_FILE)));
-  }
-
-  ManifestStore(
-      ObjectStore objectStore,
-      Path repositoryPath,
-      String repositoryName,
-      Clock clock,
-      IoConsumer<String> afterManifestCas) {
-    this(
+        objectStore,
         objectStore,
         repositoryPath,
         repositoryPath.resolve("index-events.cursor"),
         repositoryName,
-        clock,
-        afterManifestCas);
-  }
-
-  ManifestStore(
-      ObjectStore objectStore,
-      Path repositoryPath,
-      Path indexCursorPath,
-      String repositoryName,
-      Clock clock,
-      IoConsumer<String> afterManifestCas) {
-    this(
-        objectStore,
-        objectStore,
-        repositoryPath,
-        indexCursorPath,
-        repositoryName,
-        clock,
-        afterManifestCas,
+        Clock.systemUTC(),
         ignored -> {},
         new ManifestCache(),
         new RepositoryLocks(),
@@ -155,7 +113,6 @@ final class ManifestStore {
       Path indexCursorPath,
       String repositoryName,
       Clock clock,
-      IoConsumer<String> afterManifestCas,
       Consumer<Manifest> afterPublish,
       ManifestCache cache,
       RepositoryLocks locks,
@@ -167,7 +124,6 @@ final class ManifestStore {
     this.indexCursorPath = indexCursorPath.toAbsolutePath().normalize();
     this.repositoryName = repositoryName;
     this.clock = clock;
-    this.afterManifestCas = afterManifestCas;
     this.afterPublish = afterPublish;
     this.cache = cache;
     this.cacheKey = cacheKey;
@@ -248,249 +204,64 @@ final class ManifestStore {
     return refreshVersionedManifest();
   }
 
-  /** The oldest sequence the manifest still references, or 1 when it references everything. */
-  static long floor(Manifest manifest) {
-    return Math.max(1, manifest.getMinSeq());
-  }
-
-  /** The transaction id of the entry at the manifest's head; empty for an empty repository. */
-  static String lastTransactionId(Manifest manifest) {
-    String last = "";
-    long lastSeq = 0;
-    for (LogRef segment : manifest.getLogSegmentsList()) {
-      if (segment.getLastSeq() >= lastSeq) {
-        lastSeq = segment.getLastSeq();
-        last = segment.getLastTransactionId();
-      }
-    }
-    return last;
+  /** The key of the log entry with this sequence and transaction id. */
+  static String logKey(long sequence, String transactionId) {
+    return String.format("%s/%016x-%s.pb", LOG_DIRECTORY, sequence, transactionId);
   }
 
   /**
-   * Returns the entries after a follower's cursor, validating the cursor first. The cursor is
-   * valid when the entry it names is still referenced by the manifest, so it can be checked to
-   * carry the same transaction id, and it is not beyond the head. An empty cursor is valid only
-   * while nothing has been folded. At a segment boundary or at head the identity check reads
-   * nothing; inside a segment it is made against the entry while the segment is read anyway.
+   * Returns the entries after a follower's cursor, oldest first, by walking the chain back from
+   * the manifest's head: each entry names the transaction id of the one before it, so every key is
+   * known without a listing, and the id the walk arrives at for the cursor's sequence must be the
+   * one the cursor recorded. One object is read per entry behind the cursor.
    *
-   * @throws IndexRebuildRequiredException when the cursor cannot be advanced by replay
+   * @throws IndexRebuildRequiredException when the cursor is ahead of the head (the manifest was
+   *     rolled back), names a transaction the chain does not (history diverged), or is more than
+   *     {@code limit} entries behind, where rebuilding is cheaper than replaying
    */
-  List<LogEntry> readLogEntriesAfter(long sequence, String transactionId, Manifest manifest)
-      throws IOException {
+  List<LogEntry> readLogEntriesAfter(
+      long sequence, String transactionId, Manifest manifest, long limit) throws IOException {
     long head = manifest.getHeadSeq();
-    long floor = floor(manifest);
     if (sequence > head) {
       throw new IndexRebuildRequiredException(
           repositoryName,
           "cursor " + sequence + " is ahead of head " + head + ", so the manifest was rolled back");
     }
-    boolean referenced = sequence == 0 ? floor == 1 : sequence >= floor;
-    if (!referenced) {
+    if (head - sequence > limit) {
       throw new IndexRebuildRequiredException(
-          repositoryName, "cursor " + sequence + " is below the retention floor " + floor);
-    }
-    List<LogRef> segments = new ArrayList<>(manifest.getLogSegmentsList());
-    segments.sort(Comparator.comparingLong(LogRef::getFirstSeq));
-    if (sequence > 0) {
-      LogRef covering =
-          segments.stream()
-              .filter(s -> s.getFirstSeq() <= sequence && sequence <= s.getLastSeq())
-              .findFirst()
-              .orElseThrow(
-                  () ->
-                      new IndexRebuildRequiredException(
-                          repositoryName, "no log segment covers cursor " + sequence));
-      if (covering.getLastSeq() == sequence
-          && !covering.getLastTransactionId().equals(transactionId)) {
-        throw new IndexRebuildRequiredException(
-            repositoryName, "history mismatch at sequence " + sequence);
-      }
-    }
-    List<LogEntry> entries = new ArrayList<>();
-    long expected = sequence + 1;
-    for (LogRef segment : segments) {
-      if (segment.getLastSeq() <= sequence) {
-        continue;
-      }
-      for (LogEntry entry : readSegment(segment).getEntriesList()) {
-        if (entry.getSeq() < segment.getFirstSeq() || entry.getSeq() > segment.getLastSeq()) {
-          throw new IOException(
-              "Log segment "
-                  + segment.getKey()
-                  + " holds entry "
-                  + entry.getSeq()
-                  + " outside its range");
-        }
-        if (entry.getSeq() == sequence) {
-          if (!entry.getTransactionId().equals(transactionId)) {
-            throw new IndexRebuildRequiredException(
-                repositoryName, "history mismatch at sequence " + sequence);
-          }
-          continue;
-        }
-        if (entry.getSeq() < sequence) {
-          continue;
-        }
-        if (entry.getSeq() != expected) {
-          throw new IOException(
-              "WAL gap for "
-                  + repositoryName
-                  + ": expected sequence "
-                  + expected
-                  + " but found "
-                  + entry.getSeq());
-        }
-        entries.add(entry);
-        expected++;
-      }
-    }
-    if (expected != head + 1) {
-      throw new IOException(
-          "WAL gap for "
-              + repositoryName
-              + ": expected through "
+          repositoryName,
+          "cursor "
+              + sequence
+              + " is "
+              + (head - sequence)
+              + " entries behind head "
               + head
-              + " but reached "
-              + (expected - 1));
+              + ", more than the replay limit of "
+              + limit);
     }
-    return entries;
+    Deque<LogEntry> entries = new ArrayDeque<>();
+    String expectedId = manifest.getHeadTransactionId();
+    for (long seq = head; seq > sequence; seq--) {
+      LogEntry entry = readEntry(seq, expectedId);
+      entries.addFirst(entry);
+      expectedId = entry.getPreviousTransactionId();
+    }
+    if (!expectedId.equals(transactionId == null ? "" : transactionId)) {
+      throw new IndexRebuildRequiredException(
+          repositoryName, "history mismatch at sequence " + sequence);
+    }
+    return List.copyOf(entries);
   }
 
-  private LogSegment readSegment(LogRef segment) throws IOException {
+  private LogEntry readEntry(long sequence, String transactionId) throws IOException {
+    String key = logKey(sequence, transactionId);
     ObjectStore.StoredObject stored =
-        objectStore
-            .get(segment.getKey())
-            .orElseThrow(() -> new IOException("WAL segment not found: " + segment.getKey()));
-    return LogSegment.parseFrom(stored.bytes());
-  }
-
-  /**
-   * Folds the log: merges runs of single-entry segments into one segment and drops the oldest
-   * segments below the floor once the retention rule allows. Representation only: no sequence,
-   * ref revision or pack changes, and no object is deleted. Returns the manifest afterwards.
-   */
-  VersionedManifest fold(FoldPolicy policy) throws IOException {
-    Map<List<String>, LogRef> mergedRuns = new HashMap<>();
-    for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
-      VersionedManifest versioned =
-          attempt == 0 ? currentVersioned() : refreshVersionedManifest();
-      Manifest current = versioned.manifest();
-      List<LogRef> segments = new ArrayList<>(current.getLogSegmentsList());
-      segments.sort(Comparator.comparingLong(LogRef::getFirstSeq));
-      long now = clock.millis();
-      boolean changed = false;
-
-      int merges = 0;
-      int index = 0;
-      while (index < segments.size() && merges < policy.maxMergesPerPass()) {
-        int end = index;
-        while (end < segments.size()
-            && isSingleEntry(segments.get(end))
-            && (end == index
-                || segments.get(end).getFirstSeq() == segments.get(end - 1).getLastSeq() + 1)) {
-          end++;
-        }
-        if (end - index >= policy.segmentEntries()) {
-          List<LogRef> run = List.copyOf(segments.subList(index, index + policy.segmentEntries()));
-          List<String> runKeys = run.stream().map(LogRef::getKey).toList();
-          LogRef merged = mergedRuns.get(runKeys);
-          if (merged == null) {
-            merged = writeMergedSegment(run);
-            mergedRuns.put(runKeys, merged);
-          }
-          segments.subList(index, index + policy.segmentEntries()).clear();
-          segments.add(index, merged);
-          changed = true;
-          merges++;
-          index++;
-        } else {
-          index = Math.max(end, index + 1);
-        }
-      }
-
-      long minSeq = current.getMinSeq();
-      while (segments.size() > 1) {
-        LogRef oldest = segments.get(0);
-        boolean oldEnough =
-            oldest.getLastCreatedAtEpochMillis() <= now - policy.retainFor().toMillis();
-        boolean enoughRetained =
-            current.getHeadSeq() - oldest.getLastSeq() >= policy.retainEntries();
-        if (!oldEnough || !enoughRetained) {
-          break;
-        }
-        segments.remove(0);
-        minSeq = segments.get(0).getFirstSeq();
-        changed = true;
-      }
-
-      if (!changed) {
-        return versioned;
-      }
-      Manifest updated =
-          current.toBuilder()
-              .clearLogSegments()
-              .addAllLogSegments(segments)
-              .setMinSeq(minSeq)
-              .setRevision(current.getRevision() + 1)
-              .setUpdatedAtEpochMillis(now)
-              .setWriter(writerIdentity())
-              .build();
-      try {
-        ObjectStore.StoredObject stored =
-            manifestObjects.compareAndSwap(
-                MANIFEST_FILE, versioned.version(), updated.toByteArray());
-        VersionedManifest folded = new VersionedManifest(updated, stored.version());
-        cache.offer(cacheKey, folded);
-        return folded;
-      } catch (ObjectStoreConflictException conflict) {
-        // A publication landed meanwhile. Retry over the new manifest; segments already merged
-        // in this pass are reused when their run is still present.
-      }
+        objectStore.get(key).orElseThrow(() -> new IOException("WAL entry not found: " + key));
+    LogEntry entry = LogEntry.parseFrom(stored.bytes());
+    if (entry.getSeq() != sequence || !entry.getTransactionId().equals(transactionId)) {
+      throw new IOException("WAL entry " + key + " does not describe itself");
     }
-    throw new IOException(
-        "Manifest fold did not converge after " + MAX_CAS_ATTEMPTS + " attempts");
-  }
-
-  private static boolean isSingleEntry(LogRef segment) {
-    return segment.getFirstSeq() == segment.getLastSeq();
-  }
-
-  private LogRef writeMergedSegment(List<LogRef> run) throws IOException {
-    LogSegment.Builder merged = LogSegment.newBuilder();
-    long expected = run.get(0).getFirstSeq();
-    for (LogRef single : run) {
-      for (LogEntry entry : readSegment(single).getEntriesList()) {
-        if (entry.getSeq() != expected) {
-          throw new IOException(
-              "Cannot fold "
-                  + repositoryName
-                  + ": expected sequence "
-                  + expected
-                  + " in "
-                  + single.getKey()
-                  + " but found "
-                  + entry.getSeq());
-        }
-        merged.addEntries(entry);
-        expected++;
-      }
-    }
-    LogRef last = run.get(run.size() - 1);
-    byte[] bytes = merged.build().toByteArray();
-    String key =
-        String.format(
-            "%s/%016x-%016x-%s.pb",
-            LOG_DIRECTORY, run.get(0).getFirstSeq(), last.getLastSeq(), UUID.randomUUID());
-    objectStore.putIfAbsent(key, bytes);
-    return LogRef.newBuilder()
-        .setKey(key)
-        .setFirstSeq(run.get(0).getFirstSeq())
-        .setLastSeq(last.getLastSeq())
-        .setSize(bytes.length)
-        .setSealed(true)
-        .setLastTransactionId(last.getLastTransactionId())
-        .setLastCreatedAtEpochMillis(last.getLastCreatedAtEpochMillis())
-        .build();
+    return entry;
   }
 
   Manifest publish(
@@ -548,7 +319,8 @@ final class ManifestStore {
               .setCreatedAtEpochMillis(now)
               .setWriter(writer)
               .setBaseRevision(current.getRevision())
-              .setTransactionId(transactionId);
+              .setTransactionId(transactionId)
+              .setPreviousTransactionId(current.getHeadTransactionId());
       if (refTransaction != null) {
         entry.setRefTransaction(refTransaction);
       }
@@ -560,26 +332,14 @@ final class ManifestStore {
         entry.addAdditions(published);
       }
 
-      byte[] logBytes = LogSegment.newBuilder().addEntries(entry.build()).build().toByteArray();
-      String logKey = String.format("%s/%016x-%s.pb", LOG_DIRECTORY, sequence, transactionId);
-      objectStore.putIfAbsent(logKey, logBytes);
+      objectStore.putIfAbsent(logKey(sequence, transactionId), entry.build().toByteArray());
 
-      LogRef logRef =
-          LogRef.newBuilder()
-              .setKey(logKey)
-              .setFirstSeq(sequence)
-              .setLastSeq(sequence)
-              .setSize(logBytes.length)
-              .setSealed(true)
-              .setLastTransactionId(transactionId)
-              .setLastCreatedAtEpochMillis(now)
-              .build();
       Manifest updated =
           current.toBuilder()
               .setHeadSeq(sequence)
+              .setHeadTransactionId(transactionId)
               .clearPacks()
               .addAllPacks(livePacks.values())
-              .addLogSegments(logRef)
               .setRevision(current.getRevision() + 1)
               .setRefRevision(current.getRefRevision() + (changesRefs ? 1 : 0))
               .setUpdatedAtEpochMillis(now)
@@ -591,7 +351,6 @@ final class ManifestStore {
             manifestObjects.compareAndSwap(
                 MANIFEST_FILE, versioned.version(), updated.toByteArray());
         cache.offer(cacheKey, new VersionedManifest(updated, stored.version()));
-        afterManifestCas.accept(logKey);
         afterPublish.accept(updated);
         return updated;
       } catch (ObjectStoreConflictException conflict) {
@@ -678,10 +437,6 @@ final class ManifestStore {
 
   void deleteWalObject(String fileName) throws IOException {
     objectStore.delete(WAL_DIRECTORY + "/" + fileName);
-  }
-
-  void deleteLocalFile(String fileName) throws IOException {
-    Files.deleteIfExists(walPath.resolve(fileName));
   }
 
   /**
@@ -791,26 +546,20 @@ final class ManifestStore {
   }
 
   /**
-   * Whether the manifest references this publication attempt. A segment ending at the sequence
-   * is matched by its last transaction id; a folded segment covering it is read to compare.
+   * Whether the manifest's history contains this publication attempt: the chain from the head
+   * passes through the attempt's transaction id at its sequence. No read when the attempt is the
+   * head itself.
    */
   private boolean transactionLanded(Manifest manifest, long sequence, String transactionId)
       throws IOException {
-    for (LogRef segment : manifest.getLogSegmentsList()) {
-      if (segment.getFirstSeq() > sequence || segment.getLastSeq() < sequence) {
-        continue;
-      }
-      if (segment.getLastSeq() == sequence) {
-        return segment.getLastTransactionId().equals(transactionId);
-      }
-      for (LogEntry entry : readSegment(segment).getEntriesList()) {
-        if (entry.getSeq() == sequence) {
-          return entry.getTransactionId().equals(transactionId);
-        }
-      }
+    if (manifest.getHeadSeq() < sequence) {
       return false;
     }
-    return false;
+    String id = manifest.getHeadTransactionId();
+    for (long seq = manifest.getHeadSeq(); seq > sequence; seq--) {
+      id = readEntry(seq, id).getPreviousTransactionId();
+    }
+    return id.equals(transactionId);
   }
 
   private static LogEntry.Kind entryKind(
@@ -858,10 +607,5 @@ final class ManifestStore {
   static String writerIdentity() {
     String host = System.getenv().getOrDefault("HOSTNAME", "localhost");
     return host + ":" + ProcessHandle.current().pid();
-  }
-
-  @FunctionalInterface
-  interface IoConsumer<T> {
-    void accept(T value) throws IOException;
   }
 }

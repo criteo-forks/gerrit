@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package dev.walgerrit;
 
 import java.net.URI;
@@ -21,7 +20,7 @@ import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import org.eclipse.jgit.lib.Config;
 
-/** Immutable WalGerrit configuration read from {@code gerrit.config}. */
+/** Immutable WalGerrit configuration read from the {@code [walgerrit]} section of gerrit.config. */
 record WalGitConfiguration(
     BackendType backend,
     Path storagePath,
@@ -38,9 +37,7 @@ record WalGitConfiguration(
     boolean indexTailerEnabled,
     Duration indexPollInterval,
     Duration manifestRevalidateInterval,
-    int logSegmentEntries,
-    Duration logRetention,
-    long logRetainEntries,
+    long indexReplayLimit,
     boolean indexRebuildOnStaleCursor,
     boolean compactionEnabled,
     int compactMinPacks,
@@ -58,14 +55,8 @@ record WalGitConfiguration(
    */
   static final Duration DEFAULT_MANIFEST_REVALIDATE_INTERVAL = Duration.ofSeconds(1);
 
-  /** Consecutive single-entry log segments merged into one segment by a fold. */
-  static final int DEFAULT_LOG_SEGMENT_ENTRIES = 256;
-
-  /** Minimum age of a log segment before retention may drop it below the manifest's floor. */
-  static final Duration DEFAULT_LOG_RETENTION = Duration.ofDays(30);
-
-  /** Minimum number of newer entries the manifest keeps referencing when a segment is dropped. */
-  static final long DEFAULT_LOG_RETAIN_ENTRIES = 10_000;
+  /** Entries a node replays into its indexes at most before rebuilding them from scratch instead. */
+  static final long DEFAULT_INDEX_REPLAY_LIMIT = 10_000;
 
   /** Pooled HTTP connections to S3 per node; a write is several requests and reads run in parallel. */
   static final int DEFAULT_S3_MAX_CONNECTIONS = 64;
@@ -100,13 +91,12 @@ record WalGitConfiguration(
    */
   static final Duration DEFAULT_RECLAIM_GRACE = Duration.ofHours(24);
 
-  /** How often a node scans every repository for reclaimable files. */
+  /** How often a node sweeps every repository to reclaim files and queue overdue compactions. */
   static final Duration DEFAULT_RECLAIM_INTERVAL = Duration.ofHours(6);
 
   private static final String SECTION = "walgerrit";
-  private static final String BACKEND_KEY = "backend";
-  private static final String STORAGE_PATH_KEY = "storagePath";
 
+  /** The local backend below the site's data directory, with every other setting at its default. */
   WalGitConfiguration(BackendType backend, Path storagePath) {
     this(
         backend,
@@ -124,9 +114,7 @@ record WalGitConfiguration(
         true,
         Duration.ofSeconds(5),
         DEFAULT_MANIFEST_REVALIDATE_INTERVAL,
-        DEFAULT_LOG_SEGMENT_ENTRIES,
-        DEFAULT_LOG_RETENTION,
-        DEFAULT_LOG_RETAIN_ENTRIES,
+        DEFAULT_INDEX_REPLAY_LIMIT,
         true,
         true,
         DEFAULT_COMPACT_MIN_PACKS,
@@ -141,163 +129,82 @@ record WalGitConfiguration(
   }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
-    String configuredBackend =
-        Optional.ofNullable(config.getString(SECTION, null, BACKEND_KEY)).orElse("local");
-    String configuredStoragePath = config.getString(SECTION, null, STORAGE_PATH_KEY);
-    Path storagePath =
-        configuredStoragePath == null
-            ? sitePath.resolve("data/walgerrit")
-            : sitePath.resolve(configuredStoragePath).normalize();
-    String configuredIndexCursorPath = config.getString(SECTION, null, "indexCursorPath");
-    Path indexCursorPath =
-        configuredIndexCursorPath == null
-            ? sitePath.resolve("data/walgerrit-index-events")
-            : sitePath.resolve(configuredIndexCursorPath).normalize();
-    BackendType backend = BackendType.parse(configuredBackend);
+    Path storagePath = path(config, sitePath, "storagePath", "data/walgerrit");
     String endpoint = config.getString(SECTION, null, "s3Endpoint");
     WalGitConfiguration configuration =
         new WalGitConfiguration(
-            backend,
-            storagePath.toAbsolutePath().normalize(),
+            BackendType.parse(Optional.ofNullable(config.getString(SECTION, null, "backend")).orElse("local")),
+            storagePath,
             config.getString(SECTION, null, "s3Bucket"),
-            Optional.ofNullable(config.getString(SECTION, null, "s3Region"))
-                .orElse("us-east-1"),
+            Optional.ofNullable(config.getString(SECTION, null, "s3Region")).orElse("us-east-1"),
             endpoint == null || endpoint.isBlank() ? null : URI.create(endpoint),
             Optional.ofNullable(config.getString(SECTION, null, "s3Prefix")).orElse(""),
             config.getBoolean(SECTION, null, "s3PathStyle", false),
             config.getInt(SECTION, null, "s3MaxConnections", DEFAULT_S3_MAX_CONNECTIONS),
-            Duration.ofMillis(
-                config.getTimeUnit(
-                    SECTION,
-                    null,
-                    "s3ConnectTimeout",
-                    DEFAULT_S3_CONNECT_TIMEOUT.toMillis(),
-                    TimeUnit.MILLISECONDS)),
-            Duration.ofMillis(
-                config.getTimeUnit(
-                    SECTION,
-                    null,
-                    "s3SocketTimeout",
-                    DEFAULT_S3_SOCKET_TIMEOUT.toMillis(),
-                    TimeUnit.MILLISECONDS)),
+            duration(config, "s3ConnectTimeout", DEFAULT_S3_CONNECT_TIMEOUT),
+            duration(config, "s3SocketTimeout", DEFAULT_S3_SOCKET_TIMEOUT),
             config.getInt(SECTION, null, "s3MaxAttempts", DEFAULT_S3_MAX_ATTEMPTS),
-            indexCursorPath.toAbsolutePath().normalize(),
+            path(config, sitePath, "indexCursorPath", "data/walgerrit-index-events"),
             config.getBoolean(SECTION, null, "indexTailerEnabled", true),
-            Duration.ofMillis(
-                config.getTimeUnit(
-                    SECTION,
-                    null,
-                    "indexPollInterval",
-                    TimeUnit.SECONDS.toMillis(5),
-                    TimeUnit.MILLISECONDS)),
-            Duration.ofMillis(
-                config.getTimeUnit(
-                    SECTION,
-                    null,
-                    "manifestRevalidateInterval",
-                    DEFAULT_MANIFEST_REVALIDATE_INTERVAL.toMillis(),
-                    TimeUnit.MILLISECONDS)),
-            config.getInt(SECTION, null, "logSegmentEntries", DEFAULT_LOG_SEGMENT_ENTRIES),
-            Duration.ofMillis(
-                config.getTimeUnit(
-                    SECTION,
-                    null,
-                    "logRetention",
-                    DEFAULT_LOG_RETENTION.toMillis(),
-                    TimeUnit.MILLISECONDS)),
-            config.getLong(SECTION, null, "logRetainEntries", DEFAULT_LOG_RETAIN_ENTRIES),
+            duration(config, "indexPollInterval", Duration.ofSeconds(5)),
+            duration(config, "manifestRevalidateInterval", DEFAULT_MANIFEST_REVALIDATE_INTERVAL),
+            config.getLong(SECTION, null, "indexReplayLimit", DEFAULT_INDEX_REPLAY_LIMIT),
             config.getBoolean(SECTION, null, "indexRebuildOnStaleCursor", true),
             config.getBoolean(SECTION, null, "compactionEnabled", true),
             config.getInt(SECTION, null, "compactMinPacks", DEFAULT_COMPACT_MIN_PACKS),
-            config.getInt(
-                SECTION, null, "compactGeometricFactor", DEFAULT_COMPACT_GEOMETRIC_FACTOR),
+            config.getInt(SECTION, null, "compactGeometricFactor", DEFAULT_COMPACT_GEOMETRIC_FACTOR),
             config.getLong(SECTION, null, "compactMaxPackSize", DEFAULT_COMPACT_MAX_PACK_SIZE),
             config.getInt(SECTION, null, "compactMinReftables", DEFAULT_COMPACT_MIN_REFTABLES),
-            Duration.ofMillis(
-                config.getTimeUnit(
-                    SECTION,
-                    null,
-                    "compactionLeaseDuration",
-                    DEFAULT_COMPACTION_LEASE.toMillis(),
-                    TimeUnit.MILLISECONDS)),
+            duration(config, "compactionLeaseDuration", DEFAULT_COMPACTION_LEASE),
             config.getBoolean(SECTION, null, "reclaimEnabled", true),
-            Duration.ofMillis(
-                config.getTimeUnit(
-                    SECTION,
-                    null,
-                    "reclaimGrace",
-                    DEFAULT_RECLAIM_GRACE.toMillis(),
-                    TimeUnit.MILLISECONDS)),
-            Duration.ofMillis(
-                config.getTimeUnit(
-                    SECTION,
-                    null,
-                    "reclaimInterval",
-                    DEFAULT_RECLAIM_INTERVAL.toMillis(),
-                    TimeUnit.MILLISECONDS)),
+            duration(config, "reclaimGrace", DEFAULT_RECLAIM_GRACE),
+            duration(config, "reclaimInterval", DEFAULT_RECLAIM_INTERVAL),
             config.getLong(SECTION, null, "cacheSizeLimit", 0));
     configuration.validate();
     return configuration;
   }
 
+  private static Path path(Config config, Path sitePath, String key, String defaultValue) {
+    return sitePath
+        .resolve(Optional.ofNullable(config.getString(SECTION, null, key)).orElse(defaultValue))
+        .toAbsolutePath()
+        .normalize();
+  }
+
+  private static Duration duration(Config config, String key, Duration defaultValue) {
+    return Duration.ofMillis(
+        config.getTimeUnit(SECTION, null, key, defaultValue.toMillis(), TimeUnit.MILLISECONDS));
+  }
+
   private void validate() {
-    if (backend == BackendType.S3 && (s3Bucket == null || s3Bucket.isBlank())) {
-      throw new IllegalArgumentException("walgerrit.s3Bucket is required for the s3 backend");
-    }
-    if (s3Prefix.startsWith("/") || s3Prefix.contains("..") || s3Prefix.indexOf('\\') >= 0) {
-      throw new IllegalArgumentException("Invalid walgerrit.s3Prefix: " + s3Prefix);
-    }
-    if (s3MaxConnections < 1) {
-      throw new IllegalArgumentException("walgerrit.s3MaxConnections must be at least 1");
-    }
-    if (s3ConnectTimeout.isZero() || s3ConnectTimeout.isNegative()) {
-      throw new IllegalArgumentException("walgerrit.s3ConnectTimeout must be positive");
-    }
-    if (s3SocketTimeout.isZero() || s3SocketTimeout.isNegative()) {
-      throw new IllegalArgumentException("walgerrit.s3SocketTimeout must be positive");
-    }
-    if (s3MaxAttempts < 1) {
-      throw new IllegalArgumentException("walgerrit.s3MaxAttempts must be at least 1");
-    }
-    if (indexPollInterval.isZero() || indexPollInterval.isNegative()) {
-      throw new IllegalArgumentException("walgerrit.indexPollInterval must be positive");
-    }
-    if (manifestRevalidateInterval.isNegative()) {
-      throw new IllegalArgumentException(
-          "walgerrit.manifestRevalidateInterval must be zero or positive");
-    }
-    if (logSegmentEntries < 2) {
-      throw new IllegalArgumentException("walgerrit.logSegmentEntries must be at least 2");
-    }
-    if (logRetention.isNegative()) {
-      throw new IllegalArgumentException("walgerrit.logRetention must be zero or positive");
-    }
-    if (logRetainEntries < 1) {
-      throw new IllegalArgumentException("walgerrit.logRetainEntries must be at least 1");
-    }
-    if (compactMinPacks < 2) {
-      throw new IllegalArgumentException("walgerrit.compactMinPacks must be at least 2");
-    }
-    if (compactGeometricFactor < 2) {
-      throw new IllegalArgumentException("walgerrit.compactGeometricFactor must be at least 2");
-    }
-    if (compactMaxPackSize < 1) {
-      throw new IllegalArgumentException("walgerrit.compactMaxPackSize must be positive");
-    }
-    if (compactMinReftables < 2) {
-      throw new IllegalArgumentException("walgerrit.compactMinReftables must be at least 2");
-    }
-    if (compactionLeaseDuration.isZero() || compactionLeaseDuration.isNegative()) {
-      throw new IllegalArgumentException("walgerrit.compactionLeaseDuration must be positive");
-    }
-    if (reclaimGrace.isNegative()) {
-      throw new IllegalArgumentException("walgerrit.reclaimGrace must be zero or positive");
-    }
-    if (reclaimInterval.isZero() || reclaimInterval.isNegative()) {
-      throw new IllegalArgumentException("walgerrit.reclaimInterval must be positive");
-    }
-    if (cacheSizeLimit < 0) {
-      throw new IllegalArgumentException("walgerrit.cacheSizeLimit must be zero or positive");
+    require(backend != BackendType.S3 || (s3Bucket != null && !s3Bucket.isBlank()),
+        "s3Bucket is required for the s3 backend");
+    require(!s3Prefix.startsWith("/") && !s3Prefix.contains("..") && s3Prefix.indexOf('\\') < 0,
+        "s3Prefix is invalid: " + s3Prefix);
+    require(s3MaxConnections >= 1, "s3MaxConnections must be at least 1");
+    require(isPositive(s3ConnectTimeout), "s3ConnectTimeout must be positive");
+    require(isPositive(s3SocketTimeout), "s3SocketTimeout must be positive");
+    require(s3MaxAttempts >= 1, "s3MaxAttempts must be at least 1");
+    require(isPositive(indexPollInterval), "indexPollInterval must be positive");
+    require(!manifestRevalidateInterval.isNegative(), "manifestRevalidateInterval must be zero or positive");
+    require(indexReplayLimit >= 1, "indexReplayLimit must be at least 1");
+    require(compactMinPacks >= 2, "compactMinPacks must be at least 2");
+    require(compactGeometricFactor >= 2, "compactGeometricFactor must be at least 2");
+    require(compactMaxPackSize >= 1, "compactMaxPackSize must be positive");
+    require(compactMinReftables >= 2, "compactMinReftables must be at least 2");
+    require(isPositive(compactionLeaseDuration), "compactionLeaseDuration must be positive");
+    require(!reclaimGrace.isNegative(), "reclaimGrace must be zero or positive");
+    require(isPositive(reclaimInterval), "reclaimInterval must be positive");
+    require(cacheSizeLimit >= 0, "cacheSizeLimit must be zero or positive");
+  }
+
+  private static boolean isPositive(Duration duration) {
+    return !duration.isZero() && !duration.isNegative();
+  }
+
+  private static void require(boolean condition, String message) {
+    if (!condition) {
+      throw new IllegalArgumentException("walgerrit." + message);
     }
   }
 }

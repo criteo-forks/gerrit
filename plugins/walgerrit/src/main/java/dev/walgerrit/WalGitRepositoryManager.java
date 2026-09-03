@@ -15,6 +15,8 @@
 package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
+import com.google.gerrit.extensions.events.LifecycleListener;
+import com.google.gerrit.server.config.GerritRuntime;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.config.SitePath;
 import com.google.gerrit.server.git.GitRepositoryManager;
@@ -30,28 +32,51 @@ import org.eclipse.jgit.internal.storage.dfs.DfsBlockCacheConfig;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Repository;
 
-/** Gerrit's repository-manager entry point for WalGit-backed storage. */
+/**
+ * Gerrit's repository-manager entry point for WalGit-backed storage. As the daemon's lifecycle
+ * listener it also runs this node's compactor; batch programs never compact.
+ */
 @Singleton
-public final class WalGitRepositoryManager implements GitRepositoryManager {
+public final class WalGitRepositoryManager implements GitRepositoryManager, LifecycleListener {
   private final WalGitConfiguration configuration;
   private final StorageLayout storage;
   private final Compactor compactor;
+  private final GerritRuntime runtime;
 
   @Inject
-  WalGitRepositoryManager(@GerritServerConfig Config serverConfig, @SitePath Path sitePath) {
-    this(WalGitConfiguration.from(serverConfig, sitePath));
+  WalGitRepositoryManager(
+      @GerritServerConfig Config serverConfig, @SitePath Path sitePath, GerritRuntime runtime) {
+    this(WalGitConfiguration.from(serverConfig, sitePath), null, runtime);
     configureBlockCache(serverConfig);
   }
 
   WalGitRepositoryManager(WalGitConfiguration configuration) {
-    this(configuration, storageFor(configuration));
+    this(configuration, null, null);
   }
 
   WalGitRepositoryManager(WalGitConfiguration configuration, StorageLayout storage) {
+    this(configuration, storage, null);
+  }
+
+  private WalGitRepositoryManager(
+      WalGitConfiguration configuration, StorageLayout storage, GerritRuntime runtime) {
     this.configuration = configuration;
-    this.storage = storage;
+    this.storage = storage == null ? storageFor(configuration) : storage;
+    this.runtime = runtime;
     this.compactor = new Compactor(this);
-    storage.onPublication(compactor::consider);
+    this.storage.onPublication(compactor::consider);
+  }
+
+  @Override
+  public void start() {
+    if (runtime == GerritRuntime.DAEMON) {
+      compactor.start();
+    }
+  }
+
+  @Override
+  public void stop() {
+    compactor.stop();
   }
 
   /**

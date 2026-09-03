@@ -285,11 +285,6 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
     }
   }
 
-  @Override
-  public List<String> list(String prefix) throws IOException {
-    return listWithVersions(prefix).stream().map(ObjectSummary::key).toList();
-  }
-
   /** ListObjectsV2 returns each object's ETag, so a listing is also a version check. */
   @Override
   public List<ObjectSummary> listWithVersions(String prefix) throws IOException {

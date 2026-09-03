@@ -22,6 +22,6 @@ abstract class AbstractWalGitModule extends LifecycleModule {
   @Override
   protected final void configure() {
     bind(GitRepositoryManager.class).to(WalGitRepositoryManager.class).in(Scopes.SINGLETON);
-    listener().to(CompactionService.class);
+    listener().to(WalGitRepositoryManager.class);
   }
 }

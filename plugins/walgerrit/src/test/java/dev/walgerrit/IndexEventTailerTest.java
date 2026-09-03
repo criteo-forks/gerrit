@@ -76,7 +76,7 @@ class IndexEventTailerTest {
     ManifestStore store = manager.storage().manifestStore(project);
     IndexCursor cursor = new IndexCursorStore(store.indexCursorPath()).read();
     assertEquals(store.read().getHeadSeq(), cursor.getSequence());
-    assertEquals(ManifestStore.lastTransactionId(store.read()), cursor.getTransactionId());
+    assertEquals(store.read().getHeadTransactionId(), cursor.getTransactionId());
   }
 
   @Test
@@ -280,7 +280,8 @@ class IndexEventTailerTest {
             GerritRuntime.BATCH,
             "lucene",
             durableLuceneConfig(),
-            readiness);
+            readiness,
+            null);
 
     batch.start();
     batch.stop();
@@ -326,13 +327,14 @@ class IndexEventTailerTest {
         GerritRuntime.DAEMON,
         "lucene",
         durableLuceneConfig(),
-        readiness);
+        readiness,
+        null);
   }
 
   @Test
-  void cursorBelowTheFloorRebuildsAllIndexesAndReseedsCursors() throws Exception {
+  void cursorTooFarBehindRebuildsAllIndexesAndReseedsCursors() throws Exception {
     Path shared = storagePath.resolve("floor-shared");
-    WalGitRepositoryManager nodeA = foldingManager(shared, "node-a");
+    WalGitRepositoryManager nodeA = limitedManager(shared, "node-a");
     Project.NameKey project = Project.nameKey("platform/floor");
     nodeA.createRepository(project).close();
     IndexEventTailer tailerA = tailer(nodeA, new RecordingApplier());
@@ -341,10 +343,10 @@ class IndexEventTailerTest {
       tailerA.catchUp(project);
     }
     ManifestStore storeA = nodeA.storage().manifestStore(project);
-    Manifest folded = storeA.read();
-    assertTrue(ManifestStore.floor(folded) > 1, "aggressive retention moved the floor");
+    Manifest head = storeA.read();
+    assertTrue(head.getHeadSeq() > 3, "more entries than a fresh node may replay");
 
-    WalGitRepositoryManager nodeB = foldingManager(shared, "node-b");
+    WalGitRepositoryManager nodeB = limitedManager(shared, "node-b");
     RecordingApplier applierB = new RecordingApplier();
     FakeRebuilder rebuilder = new FakeRebuilder();
     IndexEventReadiness readiness = readiness("floor-node-b");
@@ -354,12 +356,12 @@ class IndexEventTailerTest {
             rebuilder);
     tailerB.start();
     try {
-      assertEquals(1, rebuilder.rebuilds.get(), "a fresh node below the floor rebuilds once");
+      assertEquals(1, rebuilder.rebuilds.get(), "a fresh node too far behind rebuilds once");
       assertTrue(applierB.transactions.isEmpty(), "history was rebuilt, not replayed");
       IndexCursor cursor =
           new IndexCursorStore(nodeB.storage().manifestStore(project).indexCursorPath()).read();
-      assertEquals(folded.getHeadSeq(), cursor.getSequence());
-      assertEquals(ManifestStore.lastTransactionId(folded), cursor.getTransactionId());
+      assertEquals(head.getHeadSeq(), cursor.getSequence());
+      assertEquals(head.getHeadTransactionId(), cursor.getTransactionId());
       assertTrue(readiness.isReady());
 
       ObjectId later = publishRef(nodeA, project, Constants.R_HEADS + "after-rebuild");
@@ -374,7 +376,7 @@ class IndexEventTailerTest {
   @Test
   void writesLandingDuringTheRebuildAreReplayedFromTheSeed() throws Exception {
     Path shared = storagePath.resolve("during-shared");
-    WalGitRepositoryManager nodeA = foldingManager(shared, "node-a");
+    WalGitRepositoryManager nodeA = limitedManager(shared, "node-a");
     Project.NameKey project = Project.nameKey("platform/during");
     nodeA.createRepository(project).close();
     IndexEventTailer tailerA = tailer(nodeA, new RecordingApplier());
@@ -383,7 +385,7 @@ class IndexEventTailerTest {
       tailerA.catchUp(project);
     }
 
-    WalGitRepositoryManager nodeB = foldingManager(shared, "node-b");
+    WalGitRepositoryManager nodeB = limitedManager(shared, "node-b");
     RecordingApplier applierB = new RecordingApplier();
     ObjectId[] concurrent = new ObjectId[1];
     FakeRebuilder rebuilder = new FakeRebuilder();
@@ -437,13 +439,13 @@ class IndexEventTailerTest {
     restarted.runOnce();
     assertEquals(1, rebuilder.rebuilds.get(), "a cursor naming an unknown transaction rebuilds");
     assertEquals(
-        ManifestStore.lastTransactionId(store.read()), cursorStore.read().getTransactionId());
+        store.read().getHeadTransactionId(), cursorStore.read().getTransactionId());
   }
 
   @Test
   void rebuildDisabledOrUnavailableFailsClosedWithGuidance() throws Exception {
     Path shared = storagePath.resolve("closed-shared");
-    WalGitRepositoryManager nodeA = foldingManager(shared, "node-a");
+    WalGitRepositoryManager nodeA = limitedManager(shared, "node-a");
     Project.NameKey project = Project.nameKey("platform/closed");
     nodeA.createRepository(project).close();
     IndexEventTailer tailerA = tailer(nodeA, new RecordingApplier());
@@ -455,13 +457,13 @@ class IndexEventTailerTest {
     IndexEventReadiness readiness = readiness("closed-node-b");
     IndexEventTailer noRebuilder =
         new IndexEventTailer(
-            foldingManager(shared, "node-b"), new RecordingApplier(), GerritRuntime.DAEMON,
-            "lucene", durableLuceneConfig(), readiness);
+            limitedManager(shared, "node-b"), new RecordingApplier(), GerritRuntime.DAEMON,
+            "lucene", durableLuceneConfig(), readiness, null);
     IllegalStateException failure = assertThrows(IllegalStateException.class, noRebuilder::start);
     assertTrue(failure.getCause().getMessage().contains("offline reindex"));
     assertFalse(readiness.isReady());
 
-    Config config = foldingConfig(shared, "node-c");
+    Config config = replayLimitConfig(shared, "node-c");
     config.setBoolean("walgerrit", null, "indexRebuildOnStaleCursor", false);
     WalGitRepositoryManager nodeC =
         new WalGitRepositoryManager(
@@ -472,48 +474,6 @@ class IndexEventTailerTest {
             readiness("closed-node-c"), new FakeRebuilder());
     failure = assertThrows(IllegalStateException.class, disabled::start);
     assertTrue(failure.getCause().getMessage().contains("disabled"));
-  }
-
-  @Test
-  void replayContinuesFromACursorInsideAFoldedSegment() throws Exception {
-    Path shared = storagePath.resolve("mid-shared");
-    Config config = foldingConfig(shared, "node-a");
-    config.setString("walgerrit", null, "logRetainEntries", "1000000");
-    WalGitRepositoryManager nodeA =
-        new WalGitRepositoryManager(
-            WalGitConfiguration.from(config, shared.resolveSibling("node-a-site")));
-    Config configB = foldingConfig(shared, "node-b");
-    configB.setString("walgerrit", null, "logRetainEntries", "1000000");
-    WalGitRepositoryManager nodeB =
-        new WalGitRepositoryManager(
-            WalGitConfiguration.from(configB, shared.resolveSibling("node-b-site")));
-    Project.NameKey project = Project.nameKey("platform/mid");
-    nodeA.createRepository(project).close();
-
-    RecordingApplier applierB = new RecordingApplier();
-    IndexEventTailer tailerB = tailer(nodeB, applierB);
-    tailerB.catchUp(project);
-    ObjectId first = publishRef(nodeA, project, Constants.R_HEADS + "first");
-    tailerB.catchUp(project);
-    assertTrue(applierB.sawUpdate(Constants.R_HEADS + "first", first));
-
-    IndexEventTailer tailerA = tailer(nodeA, new RecordingApplier());
-    ObjectId second = publishRef(nodeA, project, Constants.R_HEADS + "second");
-    ObjectId third = publishRef(nodeA, project, Constants.R_HEADS + "third");
-    tailerA.catchUp(project);
-    Manifest folded = nodeA.storage().manifestStore(project).read();
-    assertTrue(
-        folded.getLogSegmentsList().stream().anyMatch(s -> s.getFirstSeq() != s.getLastSeq()),
-        "node A's sweep folded single entries into a segment");
-
-    tailerB.catchUp(project);
-    assertTrue(applierB.sawUpdate(Constants.R_HEADS + "second", second));
-    assertTrue(applierB.sawUpdate(Constants.R_HEADS + "third", third));
-    assertEquals(
-        folded.getHeadSeq(),
-        new IndexCursorStore(nodeB.storage().manifestStore(project).indexCursorPath())
-            .read()
-            .getSequence());
   }
 
   private static ObjectId publishRef(
@@ -527,8 +487,8 @@ class IndexEventTailerTest {
     }
   }
 
-  /** Two-entry segments, immediate retention: the floor moves after a handful of writes. */
-  private static Config foldingConfig(Path sharedStore, String node) {
+  /** A replay limit of three entries: a fresh node rebuilds once a repository has more. */
+  private static Config replayLimitConfig(Path sharedStore, String node) {
     Config config = new Config();
     config.setString("walgerrit", null, "storagePath", sharedStore.toString());
     config.setString(
@@ -538,16 +498,14 @@ class IndexEventTailerTest {
         sharedStore.resolveSibling(node + "-cursors").toString());
     config.setString("walgerrit", null, "indexPollInterval", "1 hour");
     config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
-    config.setString("walgerrit", null, "logSegmentEntries", "2");
-    config.setString("walgerrit", null, "logRetention", "0");
-    config.setString("walgerrit", null, "logRetainEntries", "1");
+    config.setString("walgerrit", null, "indexReplayLimit", "3");
     return config;
   }
 
-  private static WalGitRepositoryManager foldingManager(Path sharedStore, String node) {
+  private static WalGitRepositoryManager limitedManager(Path sharedStore, String node) {
     return new WalGitRepositoryManager(
         WalGitConfiguration.from(
-            foldingConfig(sharedStore, node), sharedStore.resolveSibling(node + "-site")));
+            replayLimitConfig(sharedStore, node), sharedStore.resolveSibling(node + "-site")));
   }
 
   private static final class FakeRebuilder implements IndexRebuilder {

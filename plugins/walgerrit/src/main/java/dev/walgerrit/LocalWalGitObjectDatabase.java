@@ -59,10 +59,8 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   private final ManifestStore manifestStore;
   private final long revalidateIntervalNanos;
-  private final ThreadLocal<Long> refTransactionRevision = new ThreadLocal<>();
-  private final ThreadLocal<Boolean> refTransactionCommitted = new ThreadLocal<>();
-  private final ThreadLocal<Boolean> refTransactionConflicted = new ThreadLocal<>();
-  private final ThreadLocal<RefTransaction> refTransaction = new ThreadLocal<>();
+  /** The ref transaction the current thread is running through this handle, if any. */
+  private final ThreadLocal<RefTransactionState> refTransaction = new ThreadLocal<>();
   private volatile Set<ObjectId> shallowCommits = Collections.emptySet();
   private volatile long observedManifestRevision = -1;
   private volatile long lastRevalidationNanos;
@@ -143,14 +141,15 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
                     description.hasFileExt(PackExt.REFTABLE)
                         && (description.getPackSource() == PackSource.INSERT
                             || description.getPackSource() == PackSource.RECEIVE));
-    Long expectedRefRevision = refTransactionRevision.get();
-    if (logicalRefUpdate && expectedRefRevision == null) {
+    RefTransactionState state = refTransaction.get();
+    if (logicalRefUpdate && state == null) {
       throw new IOException("Reftable publication is outside a ref transaction");
     }
-    RefTransaction logicalTransaction = refTransaction.get();
-    if (logicalRefUpdate && logicalTransaction == null) {
+    if (logicalRefUpdate && state.transaction == null) {
       throw new IOException("Reftable publication has no recorded ref transaction");
     }
+    Long expectedRefRevision = state == null ? null : state.expectedRefRevision;
+    RefTransaction logicalTransaction = state == null ? null : state.transaction;
     // A reftable compaction advances the ref revision, which would make a ref transaction in
     // flight on this node lose its CAS and re-run. Publishing it under the node's write lock
     // instead lets local transactions finish first and start their successors from the compacted
@@ -173,7 +172,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     } catch (ManifestConflictException conflict) {
       // Another node changed refs since this transaction began. Nothing was committed; the
       // batch update re-runs its checks against the newer manifest and tries again.
-      refTransactionConflicted.set(true);
+      state.conflicted = true;
       throw conflict;
     } finally {
       if (reftableCompaction) {
@@ -182,7 +181,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     }
     afterOwnPublication(updated, compaction);
     if (logicalRefUpdate) {
-      refTransactionCommitted.set(true);
+      state.committed = true;
     }
   }
 
@@ -255,9 +254,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
    */
   void beginRefTransaction() throws IOException {
     revalidateNow();
-    refTransactionRevision.set(manifestStore.current().getRefRevision());
-    refTransactionCommitted.set(false);
-    refTransactionConflicted.set(false);
+    refTransaction.set(new RefTransactionState(manifestStore.current().getRefRevision()));
   }
 
   /** This node's write lock for the repository, shared by every handle on it. */
@@ -278,7 +275,11 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
       }
       transaction.addUpdates(update);
     }
-    refTransaction.set(transaction.build());
+    RefTransactionState state = refTransaction.get();
+    if (state == null) {
+      throw new IllegalStateException("Ref transaction recorded outside beginRefTransaction");
+    }
+    state.transaction = transaction.build();
   }
 
   /**
@@ -312,19 +313,29 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   }
 
   void endRefTransaction() {
-    refTransactionRevision.remove();
-    refTransactionCommitted.remove();
-    refTransactionConflicted.remove();
     refTransaction.remove();
   }
 
   boolean refTransactionCommitted() {
-    return Boolean.TRUE.equals(refTransactionCommitted.get());
+    RefTransactionState state = refTransaction.get();
+    return state != null && state.committed;
   }
 
   /** Whether the current ref transaction lost the manifest CAS to another node's ref change. */
   boolean refTransactionConflicted() {
-    return Boolean.TRUE.equals(refTransactionConflicted.get());
+    RefTransactionState state = refTransaction.get();
+    return state != null && state.conflicted;
+  }
+
+  private static final class RefTransactionState {
+    final long expectedRefRevision;
+    RefTransaction transaction;
+    boolean committed;
+    boolean conflicted;
+
+    RefTransactionState(long expectedRefRevision) {
+      this.expectedRefRevision = expectedRefRevision;
+    }
   }
 
   private boolean adoptObservedManifest() throws IOException {

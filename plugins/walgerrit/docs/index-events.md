@@ -115,9 +115,7 @@ after that sweep.
   indexTailerEnabled = true
   indexPollInterval = 5 sec
   indexCursorPath = data/walgerrit-index-events
-  logSegmentEntries = 256
-  logRetention = 30 days
-  logRetainEntries = 10000
+  indexReplayLimit = 10000
   indexRebuildOnStaleCursor = true
 ```
 
@@ -146,26 +144,23 @@ conditional check. WalGerrit does not need it while a sweep costs a handful of r
 sub-interval convergence is ever required, a peer wake-up can be added on the publication path
 without changing this contract.
 
-## Folding and the retention floor
+## Replay
 
-After replaying a repository, the sweep folds its log: runs of `walgerrit.logSegmentEntries`
-single-entry segments become one segment, and segments older than `walgerrit.logRetention` drop
-below the manifest's floor once `walgerrit.logRetainEntries` newer entries remain. The defaults are
-256 entries per segment, 30 days and 10,000 entries. Folding never deletes an object; see
-[storage format](storage-format.md#folding).
-
-A cursor is validated against the entry it names: at the head or a segment boundary from the
-manifest alone, inside a segment while that segment is read for replay, so validation never costs
-an extra read.
+The log is a chain: each entry names the transaction id of the one before it, and the manifest
+names the head. Catching up reads the entries between the head and the cursor by walking that
+chain, one small object per entry, with every key known in advance, and validates the cursor by
+the transaction id the walk arrives at; see [storage format](storage-format.md#the-log-chain). The
+common case is one or two entries per sweep. A node more than `walgerrit.indexReplayLimit` entries
+behind, 10,000 by default, rebuilds instead, which is cheaper than that many reads.
 
 ## Rebuilding instead of replaying
 
-A cursor below the floor, ahead of the head, or naming a transaction the manifest no longer does
-cannot be advanced by replay. A brand-new node with an empty volume is the common case: every
-repository whose log has ever been folded is below its floor. Rather than replaying a long history
-one entry at a time, the node rebuilds all four indexes from current repository state, the way the
-offline `reindex` program does, emptying each index first so documents for deleted changes cannot
-survive:
+A cursor too far behind the head, ahead of it, or naming a transaction the chain does not cannot
+or should not be advanced by replay. A brand-new node with an empty volume is the common case:
+every repository with more entries than the replay limit is too far behind. Rather than replaying a
+long history one entry at a time, the node rebuilds all four indexes from current repository state,
+the way the offline `reindex` program does, emptying each index first so documents for deleted
+changes cannot survive:
 
 1. Record every repository's current head sequence and transaction id.
 2. Mark each index not ready, empty it, refill it with Gerrit's site indexer, mark it ready.
@@ -174,19 +169,19 @@ survive:
 
 At startup this runs before Gerrit opens its listeners, so the node serves nothing while an index
 is empty; a background sweep that detects the condition revokes readiness for the duration. The
-rebuild takes as long as an offline reindex of the site. With the default retention only a node that
-was down or broken for a month, or one with a fresh volume, ever takes this path; a node down for an
-hour replays its tail in seconds.
+rebuild takes as long as an offline reindex of the site. With the default limit only a node that
+missed ten thousand publications of one repository, or one with a fresh volume, ever takes this
+path; a node down for an hour replays its tail in seconds.
 
 `walgerrit.indexRebuildOnStaleCursor = false` disables the automatic rebuild; the daemon then refuses
 to become ready and names the repositories and the cursor directory in its error, and the remedy is
 the offline `reindex` followed by removing the cursors. If a rebuild is interrupted, Gerrit refuses
 to start until the offline `reindex` has run, because the index was marked not ready. To force a
-rebuild deliberately, stop the node and remove its cursor directory: on a folded repository the
-empty cursor is below the floor.
+rebuild deliberately, stop the node, set `walgerrit.indexReplayLimit` below the repositories' head
+sequences or remove its cursor directory on a busy site, and start it again.
 
 ## Rollout and recovery boundary
 
-Manifest format version 2 is not readable by earlier WalGerrit builds and does not read their data;
+Manifest format version 3 is not readable by earlier WalGerrit builds and does not read their data;
 no deployment holds data in the earlier layout. A `REF_UPDATE` entry without its logical
 transaction payload is a corruption and stops replay for that repository.

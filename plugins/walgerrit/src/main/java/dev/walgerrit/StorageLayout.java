@@ -104,7 +104,6 @@ final class StorageLayout {
         indexCursorRepositoriesPath.resolve(relative + ".cursor"),
         name.get(),
         Clock.systemUTC(),
-        ignored -> {},
         manifest -> publicationListener.accept(name, manifest),
         manifestCache,
         repositoryLocks,

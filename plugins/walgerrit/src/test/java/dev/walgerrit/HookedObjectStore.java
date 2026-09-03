@@ -34,14 +34,30 @@ final class HookedObjectStore implements ObjectStore {
   private final ObjectStore delegate;
   private final BiPredicate<Manifest, Manifest> matches;
   private final Runnable beforeFirstMatchingCas;
+  private final IoRunnable afterFirstMatchingCas;
 
   HookedObjectStore(
       ObjectStore delegate,
       BiPredicate<Manifest, Manifest> matches,
       Runnable beforeFirstMatchingCas) {
+    this(delegate, matches, beforeFirstMatchingCas, () -> {});
+  }
+
+  /** {@code afterFirstMatchingCas} runs after that CAS landed and may throw to lose its response. */
+  HookedObjectStore(
+      ObjectStore delegate,
+      BiPredicate<Manifest, Manifest> matches,
+      Runnable beforeFirstMatchingCas,
+      IoRunnable afterFirstMatchingCas) {
     this.delegate = delegate;
     this.matches = matches;
     this.beforeFirstMatchingCas = beforeFirstMatchingCas;
+    this.afterFirstMatchingCas = afterFirstMatchingCas;
+  }
+
+  @FunctionalInterface
+  interface IoRunnable {
+    void run() throws IOException;
   }
 
   /** A CAS that publishes a compaction: it adds a pack whose source is COMPACT. */
@@ -96,6 +112,9 @@ final class HookedObjectStore implements ObjectStore {
       if (matches.test(current, proposed) && matchedCasAttempts.getAndIncrement() == 0) {
         firstMatchingProposal = proposed;
         beforeFirstMatchingCas.run();
+        StoredObject stored = delegate.compareAndSwap(key, expectedVersion, bytes);
+        afterFirstMatchingCas.run();
+        return stored;
       }
     }
     return delegate.compareAndSwap(key, expectedVersion, bytes);
@@ -117,10 +136,6 @@ final class HookedObjectStore implements ObjectStore {
     delegate.delete(key);
   }
 
-  @Override
-  public List<String> list(String prefix) throws IOException {
-    return delegate.list(prefix);
-  }
 
   @Override
   public List<ObjectSummary> listWithVersions(String prefix) throws IOException {

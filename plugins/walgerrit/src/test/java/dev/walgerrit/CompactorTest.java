@@ -22,7 +22,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.gerrit.entities.Project;
 import dev.walgerrit.Compactor.Outcome;
 import dev.walgerrit.proto.StorageProto.LogEntry;
-import dev.walgerrit.proto.StorageProto.LogSegment;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import java.io.IOException;
@@ -280,7 +279,7 @@ class CompactorTest {
   }
 
   @Test
-  void aCompactionThatLosesToAnotherNodeDiscardsItsOutput() throws Exception {
+  void aCompactionThatLosesToAnotherNodeReplansAndLeavesItsOutputToTheReclaimer() throws Exception {
     FileObjectStore shared = new FileObjectStore(root.resolve("store"));
     WalGitRepositoryManager nodeB = node("node-b", shared, ignored -> {});
     try (Repository repository = nodeB.createRepository(PROJECT)) {
@@ -288,7 +287,6 @@ class CompactorTest {
         publish(repository, head("b" + i), "commit " + i);
       }
     }
-    Set<String> storeBefore = new HashSet<>(shared.list(WAL));
     Set<String> outputOfB = new HashSet<>();
     // Right before node A publishes its compaction, node B compacts two of the same inputs.
     HookedObjectStore hooked =
@@ -333,15 +331,13 @@ class CompactorTest {
     }
     assertEquals(1, lostOutputOfA.size());
     Set<String> live = ManifestStore.liveFileNames(after);
-    Set<String> storeAfter = new HashSet<>(shared.list(WAL));
-    for (String key : storeAfter) {
-      String file = key.substring(WAL.length());
-      String name = file.substring(0, file.lastIndexOf('.'));
-      assertFalse(lostOutputOfA.contains(name), "node A deleted its lost output: " + file);
-      assertTrue(
-          live.contains(file) || storeBefore.contains(key) || outputOfB.contains(name),
-          "a file added during the race is live or was node B's output, since superseded: " + file);
-    }
+    String lostPack = lostOutputOfA.iterator().next() + ".pack";
+    assertTrue(shared.list(WAL).contains(WAL + lostPack), "the lost output stays for now");
+    assertFalse(live.contains(lostPack), "but nothing references it");
+    SteppingClock later = new SteppingClock(Instant.now().plus(Duration.ofDays(2)));
+    new Reclaimer(nodeA, later, Duration.ofDays(1), 0).reclaim(PROJECT);
+    assertFalse(
+        shared.list(WAL).contains(WAL + lostPack), "reclamation removes it after the grace period");
     assertEquals(refs, allRefs(nodeA));
     try (Repository repository = nodeA.openRepository(PROJECT)) {
       for (ObjectId id : refs.values()) {
@@ -618,11 +614,10 @@ class CompactorTest {
   }
 
   private static LogEntry lastEntry(FileObjectStore store, Manifest manifest) throws IOException {
-    var segment = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
-    LogSegment parsed =
-        LogSegment.parseFrom(
-            store.get("repos/platform/compact.git/" + segment.getKey()).orElseThrow().bytes());
-    return parsed.getEntries(parsed.getEntriesCount() - 1);
+    String key =
+        "repos/platform/compact.git/"
+            + ManifestStore.logKey(manifest.getHeadSeq(), manifest.getHeadTransactionId());
+    return LogEntry.parseFrom(store.get(key).orElseThrow().bytes());
   }
 
   private static void ageCachedFiles(Path directory, Duration by) throws IOException {

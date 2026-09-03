@@ -22,7 +22,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
 import dev.walgerrit.proto.StorageProto.LogEntry;
-import dev.walgerrit.proto.StorageProto.LogSegment;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -77,9 +76,11 @@ class LocalWalGitTransactionTest {
 
     Manifest manifest = manifest(project);
     assertEquals(sequenceBefore + 1, manifest.getHeadSeq());
-    var lastLog = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
     LogEntry entry =
-        LogSegment.parseFrom(Files.readAllBytes(repositoryPath(project).resolve(lastLog.getKey()))).getEntries(0);
+        LogEntry.parseFrom(
+            Files.readAllBytes(
+                repositoryPath(project)
+                    .resolve(ManifestStore.logKey(manifest.getHeadSeq(), manifest.getHeadTransactionId()))));
     assertEquals(LogEntry.Kind.REF_UPDATE, entry.getKind());
     assertEquals(1, entry.getAdditionsCount());
     assertTrue(entry.hasRefTransaction());
@@ -321,9 +322,11 @@ class LocalWalGitTransactionTest {
     assertTrue(
         Files.isRegularFile(repositoryPath.resolve("wal").resolve(compacted.getName() + ".pack")));
 
-    var lastLog = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
     LogEntry entry =
-        LogSegment.parseFrom(Files.readAllBytes(repositoryPath.resolve(lastLog.getKey()))).getEntries(0);
+        LogEntry.parseFrom(
+            Files.readAllBytes(
+                repositoryPath.resolve(
+                    ManifestStore.logKey(manifest.getHeadSeq(), manifest.getHeadTransactionId()))));
     assertEquals(LogEntry.Kind.COMPACT, entry.getKind());
     assertEquals(compactedInputs, Set.copyOf(entry.getSupersedesList()));
     assertEquals(compacted.getName(), entry.getAdditions(0).getName());

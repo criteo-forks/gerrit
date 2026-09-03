@@ -57,8 +57,8 @@ compaction thread, one compaction per repository at a time. The compactor then:
 4. repeats from step 2, up to four passes, until the policy is satisfied;
 5. evicts superseded files from its own cache and releases the lease.
 
-A compaction that loses its inputs to another node's compaction deletes its own output, which
-nothing references, and re-plans on the fresh manifest. Concurrent writes are merged into the
+A compaction that loses its inputs to another node's compaction re-plans on the fresh manifest; its
+output, which nothing references, is removed by reclamation like any other leftover. Concurrent writes are merged into the
 compaction's manifest update, so a push or a ref update never waits for a compaction and never
 fails because of one: a ref transaction whose CAS is lost to a reftable compaction re-runs itself
 against the new stack, as [consistency.md](consistency.md#ref-transactions) describes.

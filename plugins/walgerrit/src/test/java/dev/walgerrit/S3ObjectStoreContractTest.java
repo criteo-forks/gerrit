@@ -118,19 +118,9 @@ class S3ObjectStoreContractTest {
     String prefix = "manifest/" + UUID.randomUUID() + "/repo.git/";
     ObjectStore scoped = new PrefixedObjectStore(store, prefix);
     ManifestStore first =
-        new ManifestStore(
-            scoped,
-            temporaryDirectory.resolve("node-1/repo.git"),
-            "repo",
-            Clock.systemUTC(),
-            ignored -> {});
+        new ManifestStore(scoped, temporaryDirectory.resolve("node-1/repo.git"), "repo");
     ManifestStore second =
-        new ManifestStore(
-            scoped,
-            temporaryDirectory.resolve("node-2/repo.git"),
-            "repo",
-            Clock.systemUTC(),
-            ignored -> {});
+        new ManifestStore(scoped, temporaryDirectory.resolve("node-2/repo.git"), "repo");
     assertTrue(first.create());
 
     try (var executor = Executors.newFixedThreadPool(2)) {

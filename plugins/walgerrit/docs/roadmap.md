@@ -40,8 +40,9 @@
   prefix per sweep; read only manifests whose version changed.
 - [ ] Optional peer wake-ups if cross-node index convergence must be faster than the sweep
   interval.
-- [x] Fold the log into sealed segments with a retention floor so the manifest stays bounded, and
-  rebuild a node's indexes from repository state when its cursors cannot be replayed.
+- [x] Chain log entries through their predecessors' transaction ids so the manifest names only the
+  head and never grows with history, and rebuild a node's indexes from repository state when its
+  cursor cannot be replayed or is further behind than `walgerrit.indexReplayLimit`.
 
 ## Milestone 4: migration and operations
 

@@ -117,26 +117,11 @@ start_daemon "$site/logs/walgerrit-readiness-smoke.log"
 curl -fsS "$listen_url" >/dev/null
 stop_daemon
 
-# Fold the logs aggressively so the manifests acquire a retention floor, then simulate a replaced
-# node: with its cursors gone and the floor above zero, the daemon must rebuild every index from
-# repository state before it becomes ready, and it must still answer afterwards.
-git config --file "$site/etc/gerrit.config" walgerrit.logSegmentEntries 2
-git config --file "$site/etc/gerrit.config" walgerrit.logRetention 0
-git config --file "$site/etc/gerrit.config" walgerrit.logRetainEntries 1
+# Simulate a replaced node: with its cursors gone and a replay limit below the repositories' head
+# sequences, the daemon must rebuild every index from repository state before it becomes ready, and
+# it must still answer afterwards.
+git config --file "$site/etc/gerrit.config" walgerrit.indexReplayLimit 1
 git config --file "$site/etc/gerrit.config" walgerrit.indexPollInterval "1 sec"
-fold_log="$site/logs/walgerrit-fold-smoke.log"
-start_daemon "$fold_log"
-for _ in $(seq 1 120); do
-  if grep -q "folded the log of All-Users" "$fold_log" \
-      && grep -q "folded the log of All-Projects" "$fold_log"; then
-    break
-  fi
-  sleep 0.5
-done
-grep -q "folded the log of All-Users" "$fold_log"
-grep -q "folded the log of All-Projects" "$fold_log"
-stop_daemon
-
 rm -rf "$site/data/walgerrit-index-events"
 rebuild_log="$site/logs/walgerrit-rebuild-smoke.log"
 start_daemon "$rebuild_log"
@@ -179,5 +164,5 @@ curl -fsS "${listen_url}accounts/?q=is:active&n=1" >/dev/null
 stop_daemon
 run_gerrit reindex -d "$site"
 
-echo "WalGerrit fork initialized, reindexed, caught up, folded its logs, rebuilt indexes for a" \
-  "replaced node, compacted and reclaimed its repositories, and published readiness successfully."
+echo "WalGerrit fork initialized, reindexed, caught up, rebuilt indexes for a replaced node," \
+  "compacted and reclaimed its repositories, and published readiness successfully."

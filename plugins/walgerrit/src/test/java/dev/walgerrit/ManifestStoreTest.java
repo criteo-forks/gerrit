@@ -20,7 +20,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.walgerrit.proto.StorageProto.LogEntry;
-import dev.walgerrit.proto.StorageProto.LogSegment;
 import dev.walgerrit.proto.StorageProto.PackFile;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import java.nio.file.Path;
@@ -72,7 +71,7 @@ class ManifestStoreTest {
         () -> stale.publish(0, List.of(reftable("refs-2")), List.of(), true));
     assertEquals(2, first.read().getRevision());
     assertEquals(1, first.read().getRefRevision());
-    assertEquals(2, first.read().getLogSegmentsCount());
+    assertEquals(2, first.read().getHeadSeq());
   }
 
   @Test
@@ -106,7 +105,7 @@ class ManifestStoreTest {
       assertEquals(1, conflicts);
     }
     assertEquals(1, first.read().getRefRevision());
-    assertEquals(1, first.read().getLogSegmentsCount());
+    assertEquals(1, first.read().getHeadSeq());
   }
 
   @Test
@@ -160,11 +159,7 @@ class ManifestStoreTest {
     assertTrue(
         manifest.getPacksList().stream()
             .anyMatch(pack -> pack.getName().equals("compacted")));
-    var lastLog = manifest.getLogSegments(manifest.getLogSegmentsCount() - 1);
-    LogEntry entry =
-        LogSegment.parseFrom(
-            java.nio.file.Files.readAllBytes(
-                temporaryDirectory.resolve("repo.git").resolve(lastLog.getKey()))).getEntries(0);
+    LogEntry entry = headEntry(manifest);
     assertEquals(LogEntry.Kind.COMPACT, entry.getKind());
     assertEquals(List.of("old-1", "old-2"), entry.getSupersedesList());
   }
@@ -193,26 +188,62 @@ class ManifestStoreTest {
 
   @Test
   void lostSuccessResponseIsVerifiedAsCommitted() throws Exception {
-    AtomicBoolean loseResponse = new AtomicBoolean();
-    ManifestStore store =
-        new ManifestStore(
-            temporaryDirectory.resolve("ambiguous.git"),
-            "ambiguous",
-            Clock.systemUTC(),
-            ignored -> {
-              if (loseResponse.getAndSet(false)) {
-                throw new java.io.IOException("simulated lost success response");
-              }
+    Path directory = temporaryDirectory.resolve("ambiguous.git");
+    HookedObjectStore lossy =
+        new HookedObjectStore(
+            new FileObjectStore(directory),
+            (current, proposed) -> proposed.getRefRevision() > current.getRefRevision(),
+            () -> {},
+            () -> {
+              throw new java.io.IOException("simulated lost success response");
             });
+    ManifestStore store = new ManifestStore(lossy, directory, "ambiguous");
     assertTrue(store.create());
-
-    loseResponse.set(true);
-    var committed =
-        store.publish(0, List.of(reftable("refs")), List.of(), true);
-
+    var committed = store.publish(0, List.of(reftable("refs")), List.of(), true);
     assertEquals(1, committed.getRevision());
     assertEquals(1, committed.getRefRevision());
-    assertEquals(1, store.read().getLogSegmentsCount());
+    assertEquals(1, store.read().getHeadSeq());
+  }
+
+  @Test
+  void replayWalksTheChainBackFromTheHead() throws Exception {
+    ManifestStore store = store();
+    assertTrue(store.create());
+    for (int i = 1; i <= 4; i++) {
+      store.publish(i - 1, List.of(reftable("refs-" + i)), List.of(), true);
+    }
+    var manifest = store.read();
+    List<LogEntry> all = store.readLogEntriesAfter(0, "", manifest, 10);
+    assertEquals(List.of(1L, 2L, 3L, 4L), all.stream().map(LogEntry::getSeq).toList());
+    assertEquals("", all.get(0).getPreviousTransactionId());
+    assertEquals(all.get(2).getTransactionId(), all.get(3).getPreviousTransactionId());
+    assertEquals(all.get(3).getTransactionId(), manifest.getHeadTransactionId());
+
+    List<LogEntry> tail = store.readLogEntriesAfter(2, all.get(1).getTransactionId(), manifest, 10);
+    assertEquals(List.of(3L, 4L), tail.stream().map(LogEntry::getSeq).toList());
+    assertTrue(store.readLogEntriesAfter(4, manifest.getHeadTransactionId(), manifest, 10).isEmpty());
+    assertEquals(4, store.readLogEntriesAfter(0, "", manifest, 4).size(), "at the limit still replays");
+
+    assertThrows(
+        IndexRebuildRequiredException.class,
+        () -> store.readLogEntriesAfter(2, "not-what-happened", manifest, 10),
+        "history diverged");
+    assertThrows(
+        IndexRebuildRequiredException.class,
+        () -> store.readLogEntriesAfter(5, "", manifest, 10),
+        "ahead of the head");
+    assertThrows(
+        IndexRebuildRequiredException.class,
+        () -> store.readLogEntriesAfter(0, "", manifest, 3),
+        "further behind than the replay limit");
+  }
+
+  private LogEntry headEntry(dev.walgerrit.proto.StorageProto.Manifest manifest) throws Exception {
+    return LogEntry.parseFrom(
+        java.nio.file.Files.readAllBytes(
+            temporaryDirectory
+                .resolve("repo.git")
+                .resolve(ManifestStore.logKey(manifest.getHeadSeq(), manifest.getHeadTransactionId()))));
   }
 
   private static PackRef objectPack(String name) {

@@ -176,7 +176,24 @@ final class FileObjectStore implements ObjectStore {
   }
 
   @Override
-  public List<String> list(String prefix) throws IOException {
+  public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
+    List<ObjectSummary> summaries = new ArrayList<>();
+    for (String key : walk(prefix)) {
+      try {
+        Path path = resolve(key);
+        summaries.add(
+            new ObjectSummary(
+                key,
+                version(Files.readAllBytes(path)),
+                Files.getLastModifiedTime(path).toMillis()));
+      } catch (NoSuchFileException vanished) {
+        // A staging or temporary file that was renamed or removed after the walk saw it.
+      }
+    }
+    return List.copyOf(summaries);
+  }
+
+  private List<String> walk(String prefix) throws IOException {
     Path start = listingRoot(prefix);
     if (!Files.isDirectory(start)) {
       return List.of();
@@ -230,24 +247,6 @@ final class FileObjectStore implements ObjectStore {
       throw new IOException("Listing prefix escapes storage root: " + prefix);
     }
     return start;
-  }
-
-  @Override
-  public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
-    List<ObjectSummary> summaries = new ArrayList<>();
-    for (String key : list(prefix)) {
-      try {
-        Path path = resolve(key);
-        summaries.add(
-            new ObjectSummary(
-                key,
-                version(Files.readAllBytes(path)),
-                Files.getLastModifiedTime(path).toMillis()));
-      } catch (NoSuchFileException vanished) {
-        // A staging or temporary file that was renamed or removed after the walk saw it.
-      }
-    }
-    return List.copyOf(summaries);
   }
 
   private Path resolve(String key) throws IOException {

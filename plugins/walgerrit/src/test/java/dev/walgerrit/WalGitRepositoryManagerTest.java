@@ -24,7 +24,6 @@ import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.git.RepositoryExistsException;
 import dev.walgerrit.proto.StorageProto.LogEntry;
-import dev.walgerrit.proto.StorageProto.LogSegment;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import java.nio.file.Files;
@@ -83,7 +82,6 @@ class WalGitRepositoryManagerTest {
     Manifest manifest = Manifest.parseFrom(Files.readAllBytes(manifestPath));
     assertEquals(3, manifest.getHeadSeq());
     assertEquals(3, manifest.getRevision());
-    assertEquals(3, manifest.getLogSegmentsCount());
     assertTrue(manifest.getPacksCount() >= 2);
     for (PackRef pack : manifest.getPacksList()) {
       for (var file : pack.getFilesList()) {
@@ -94,12 +92,16 @@ class WalGitRepositoryManagerTest {
         assertTrue(Files.isRegularFile(immutable));
       }
     }
-    for (var log : manifest.getLogSegmentsList()) {
-      Path logFile = repositoryPath.resolve(log.getKey());
+    // The log is a chain from the head: every key is known without a listing.
+    String id = manifest.getHeadTransactionId();
+    for (long seq = manifest.getHeadSeq(); seq >= 1; seq--) {
+      Path logFile = repositoryPath.resolve(ManifestStore.logKey(seq, id));
       assertTrue(Files.isRegularFile(logFile));
-      LogEntry entry = LogSegment.parseFrom(Files.readAllBytes(logFile)).getEntries(0);
-      assertEquals(log.getFirstSeq(), entry.getSeq());
+      LogEntry entry = LogEntry.parseFrom(Files.readAllBytes(logFile));
+      assertEquals(seq, entry.getSeq());
+      id = entry.getPreviousTransactionId();
     }
+    assertEquals("", id, "the chain ends at the first entry");
   }
 
   @Test

@@ -31,7 +31,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsPackCompactor;
-import org.eclipse.jgit.internal.storage.dfs.DfsPackDescription;
 import org.eclipse.jgit.internal.storage.dfs.DfsPackFile;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftable;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableDatabase;
@@ -50,8 +49,8 @@ import org.slf4j.LoggerFactory;
  * same work, re-reads the manifest, and repeats passes until the policy is satisfied. JGit's
  * {@code DfsPackCompactor} is the repacking engine; WalGerrit supplies the inputs it selected and
  * publishes the outputs through the manifest CAS, which refuses the result if any input was
- * superseded meanwhile. A compaction that loses that race deletes its own unreferenced output.
- * Everything else that is left behind is the reclaimer's job, which also runs on this thread.
+ * superseded meanwhile. A compaction that loses that race re-plans on the fresh manifest; its
+ * unreferenced output, like every other leftover, is the reclaimer's, which runs on this thread too.
  */
 final class Compactor {
   private static final Logger logger = LoggerFactory.getLogger(Compactor.class);
@@ -233,7 +232,10 @@ final class Compactor {
     try {
       compactor.compact(NullProgressMonitor.INSTANCE);
     } catch (StaleCompactionInputException lost) {
-      discardOutputs(repository, compactor.getNewPacks(), lost);
+      logger.info(
+          "WalGerrit compaction of {} lost to a concurrent compaction and re-plans: {}",
+          repository.getDescription().getRepositoryName(),
+          lost.getMessage());
       return false;
     }
     long outputBytes =
@@ -266,7 +268,10 @@ final class Compactor {
     try {
       compactor.compact(NullProgressMonitor.INSTANCE);
     } catch (StaleCompactionInputException lost) {
-      discardOutputs(repository, compactor.getNewPacks(), lost);
+      logger.info(
+          "WalGerrit reftable compaction of {} lost to a concurrent publication and re-plans: {}",
+          repository.getDescription().getRepositoryName(),
+          lost.getMessage());
       return false;
     }
     logger.info(
@@ -275,38 +280,6 @@ final class Compactor {
         repository.getDescription().getRepositoryName(),
         (System.nanoTime() - started) / 1_000_000);
     return true;
-  }
-
-  /**
-   * The CAS refused the result because another compaction replaced an input first. The uploaded
-   * output is referenced by nothing, so it is deleted here rather than left for the reclaimer.
-   */
-  private static void discardOutputs(
-      LocalWalGitRepository repository,
-      List<DfsPackDescription> outputs,
-      StaleCompactionInputException lost) {
-    ManifestStore store = repository.manifestStore();
-    for (DfsPackDescription output : outputs) {
-      for (PackExt extension : PackExt.values()) {
-        if (!output.hasFileExt(extension)) {
-          continue;
-        }
-        String fileName = output.getFileName(extension);
-        try {
-          store.deleteWalObject(fileName);
-          store.deleteLocalFile(fileName);
-        } catch (IOException exception) {
-          logger.warn(
-              "WalGerrit could not remove the unreferenced compaction output {}; the reclaimer will",
-              fileName,
-              exception);
-        }
-      }
-    }
-    logger.info(
-        "WalGerrit compaction of {} lost to a concurrent compaction and discarded its output: {}",
-        repository.getDescription().getRepositoryName(),
-        lost.getMessage());
   }
 
   /** Visible for tests: one sweep over every repository, as the executor runs it. */

@@ -213,10 +213,6 @@ class ConcurrentWritersTest {
       delegate.download(key, target);
     }
 
-    @Override
-    public List<String> list(String prefix) throws IOException {
-      return delegate.list(prefix);
-    }
 
     @Override
     public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
