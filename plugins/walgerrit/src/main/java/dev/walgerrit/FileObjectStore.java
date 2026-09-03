@@ -130,7 +130,7 @@ final class FileObjectStore implements ObjectStore {
           Files.createDirectories(target.getParent());
           Path temporary = temporarySibling(target);
           try {
-            Files.copy(source, temporary);
+            copyWritable(source, temporary);
             forceFile(temporary);
             moveAtomic(temporary, target, false);
             forceDirectory(target.getParent());
@@ -156,7 +156,7 @@ final class FileObjectStore implements ObjectStore {
     Files.createDirectories(target.getParent());
     Path temporary = temporarySibling(target);
     try {
-      Files.copy(source, temporary);
+      copyWritable(source, temporary);
       forceFile(temporary);
       moveAtomic(temporary, target, false);
       forceDirectory(target.getParent());
@@ -309,6 +309,17 @@ final class FileObjectStore implements ObjectStore {
       }
     } catch (AtomicMoveNotSupportedException exception) {
       throw new IOException("Filesystem does not support atomic publication: " + target, exception);
+    }
+  }
+
+  /**
+   * Copies a file and makes the copy writable. A copy inherits the source's mode, and JGit writes
+   * pack files read-only, so an imported pack would otherwise be impossible to fsync or replace.
+   */
+  private static void copyWritable(Path source, Path temporary) throws IOException {
+    Files.copy(source, temporary);
+    if (!temporary.toFile().setWritable(true, true)) {
+      throw new IOException("Cannot make the copy writable: " + temporary);
     }
   }
 

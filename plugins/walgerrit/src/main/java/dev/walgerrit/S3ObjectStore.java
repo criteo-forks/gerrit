@@ -40,7 +40,13 @@ import software.amazon.awssdk.http.apache5.Apache5HttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
+import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
@@ -57,9 +63,15 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
   private static final String SHA256_METADATA = "walgerrit-sha256";
   private static final int NOT_MODIFIED = 304;
   private static final int NOT_FOUND = 404;
+  /** Files above this size go through a multipart upload; a single PUT is capped at 5 GiB by S3. */
+  static final long DEFAULT_MULTIPART_THRESHOLD = 64L << 20;
+  /** Part size for multipart uploads: 10,000 parts of this allow objects up to 640 GiB. */
+  static final long PART_SIZE = 64L << 20;
+  private static final int CONCURRENT_PARTS = 4;
 
   private final S3Client client;
   private final String bucket;
+  private volatile long multipartThreshold = DEFAULT_MULTIPART_THRESHOLD;
 
   S3ObjectStore(String bucket, String region, java.net.URI endpoint, boolean pathStyleAccess) {
     this(
@@ -214,10 +226,19 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
     }
   }
 
+  /** Lets tests exercise the multipart path with small files. */
+  void setMultipartThresholdForTesting(long threshold) {
+    multipartThreshold = threshold;
+  }
+
   @Override
   public void uploadIfAbsent(String key, Path source) throws IOException {
     long size = Files.size(source);
     String checksum = digest(source);
+    if (size > multipartThreshold) {
+      uploadMultipartIfAbsent(key, source, size, checksum);
+      return;
+    }
     try {
       client.putObject(
           PutObjectRequest.builder()
@@ -242,6 +263,166 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
         return;
       }
       throw io("immutable put", key, exception);
+    }
+  }
+
+  /**
+   * Multipart upload with the same create-if-absent semantics as a single PUT: parts are uploaded
+   * a few at a time over the pooled connections, and the completion carries {@code If-None-Match},
+   * so a concurrent writer of the same immutable key loses at the end and verifies content instead.
+   * Any failure aborts the upload so no parts linger; a lifecycle rule should still expire
+   * incomplete uploads that a killed process leaves behind.
+   */
+  private void uploadMultipartIfAbsent(String key, Path source, long size, String checksum)
+      throws IOException {
+    String uploadId;
+    try {
+      uploadId =
+          client
+              .createMultipartUpload(
+                  CreateMultipartUploadRequest.builder()
+                      .bucket(bucket)
+                      .key(key)
+                      .metadata(Map.of(SHA256_METADATA, checksum))
+                      .build())
+              .uploadId();
+    } catch (RuntimeException exception) {
+      throw io("create multipart upload", key, exception);
+    }
+    try {
+      List<CompletedPart> parts = uploadParts(key, uploadId, source, size);
+      client.completeMultipartUpload(
+          CompleteMultipartUploadRequest.builder()
+              .bucket(bucket)
+              .key(key)
+              .uploadId(uploadId)
+              .ifNoneMatch("*")
+              .multipartUpload(CompletedMultipartUpload.builder().parts(parts).build())
+              .build());
+    } catch (S3Exception exception) {
+      abortQuietly(key, uploadId);
+      if (isPreconditionFailure(exception)) {
+        verifyExistingImmutable(key, size, checksum);
+        return;
+      }
+      if (matchesExistingImmutable(key, size, checksum)) {
+        return;
+      }
+      throw io("multipart upload", key, exception);
+    } catch (IOException | RuntimeException exception) {
+      abortQuietly(key, uploadId);
+      if (matchesExistingImmutable(key, size, checksum)) {
+        return;
+      }
+      throw io("multipart upload", key, exception);
+    }
+  }
+
+  private List<CompletedPart> uploadParts(String key, String uploadId, Path source, long size)
+      throws IOException {
+    int partCount = (int) ((size + PART_SIZE - 1) / PART_SIZE);
+    java.util.concurrent.ExecutorService pool =
+        java.util.concurrent.Executors.newFixedThreadPool(Math.min(CONCURRENT_PARTS, partCount));
+    try {
+      List<java.util.concurrent.Future<CompletedPart>> futures = new ArrayList<>();
+      for (int part = 1; part <= partCount; part++) {
+        final int partNumber = part;
+        final long offset = (long) (part - 1) * PART_SIZE;
+        final long length = Math.min(PART_SIZE, size - offset);
+        futures.add(
+            pool.submit(
+                () -> {
+                  String eTag =
+                      client
+                          .uploadPart(
+                              UploadPartRequest.builder()
+                                  .bucket(bucket)
+                                  .key(key)
+                                  .uploadId(uploadId)
+                                  .partNumber(partNumber)
+                                  .contentLength(length)
+                                  .build(),
+                              RequestBody.fromContentProvider(
+                                  () -> regionStream(source, offset, length),
+                                  length,
+                                  "application/octet-stream"))
+                          .eTag();
+                  return CompletedPart.builder().partNumber(partNumber).eTag(eTag).build();
+                }));
+      }
+      List<CompletedPart> parts = new ArrayList<>();
+      for (java.util.concurrent.Future<CompletedPart> future : futures) {
+        parts.add(future.get());
+      }
+      return parts;
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while uploading " + key, interrupted);
+    } catch (java.util.concurrent.ExecutionException failure) {
+      Throwable cause = failure.getCause();
+      if (cause instanceof S3Exception s3) {
+        throw s3;
+      }
+      throw new IOException("Uploading a part of " + key + " failed", cause);
+    } finally {
+      pool.shutdownNow();
+    }
+  }
+
+  /** A fresh stream over one region of the file; the SDK re-reads it when it retries a part. */
+  private static java.io.InputStream regionStream(Path source, long offset, long length) {
+    try {
+      return new RegionInputStream(FileChannel.open(source, StandardOpenOption.READ), offset, length);
+    } catch (IOException exception) {
+      throw new java.io.UncheckedIOException(exception);
+    }
+  }
+
+  private static final class RegionInputStream extends java.io.InputStream {
+    private final FileChannel channel;
+    private long position;
+    private long remaining;
+
+    RegionInputStream(FileChannel channel, long offset, long length) {
+      this.channel = channel;
+      this.position = offset;
+      this.remaining = length;
+    }
+
+    @Override
+    public int read() throws IOException {
+      byte[] one = new byte[1];
+      int read = read(one, 0, 1);
+      return read < 0 ? -1 : one[0] & 0xff;
+    }
+
+    @Override
+    public int read(byte[] buffer, int off, int len) throws IOException {
+      if (remaining <= 0) {
+        return -1;
+      }
+      int wanted = (int) Math.min(len, remaining);
+      int read = channel.read(java.nio.ByteBuffer.wrap(buffer, off, wanted), position);
+      if (read < 0) {
+        return -1;
+      }
+      position += read;
+      remaining -= read;
+      return read;
+    }
+
+    @Override
+    public void close() throws IOException {
+      channel.close();
+    }
+  }
+
+  private void abortQuietly(String key, String uploadId) {
+    try {
+      client.abortMultipartUpload(
+          AbortMultipartUploadRequest.builder().bucket(bucket).key(key).uploadId(uploadId).build());
+    } catch (RuntimeException ignored) {
+      // Best effort; the bucket's lifecycle rule for incomplete uploads is the backstop.
     }
   }
 

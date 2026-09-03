@@ -200,4 +200,27 @@ class S3ObjectStoreContractTest {
         .addFiles(PackFile.newBuilder().setExtension("ref"))
         .build();
   }
+
+  @Test
+  void largeFilesGoThroughMultipartUploadWithTheSameSemantics() throws Exception {
+    String prefix = "contract/" + UUID.randomUUID() + "/";
+    ObjectStore scoped = new PrefixedObjectStore(store, prefix);
+    store.setMultipartThresholdForTesting(1L << 20);
+    try {
+      byte[] content = new byte[(int) (S3ObjectStore.PART_SIZE * 2 + 12345)];
+      new java.util.Random(7).nextBytes(content);
+      Path source = temporaryDirectory.resolve("large.pack");
+      Files.write(source, content);
+
+      scoped.uploadIfAbsent("wal/large.pack", source);
+      scoped.uploadIfAbsent("wal/large.pack", source);
+
+      Path downloaded = temporaryDirectory.resolve("large.downloaded");
+      scoped.download("wal/large.pack", downloaded);
+      assertArrayEquals(content, Files.readAllBytes(downloaded));
+      assertTrue(scoped.list("wal/").contains("wal/large.pack"));
+    } finally {
+      store.setMultipartThresholdForTesting(S3ObjectStore.DEFAULT_MULTIPART_THRESHOLD);
+    }
+  }
 }
