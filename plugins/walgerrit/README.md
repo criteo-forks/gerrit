@@ -117,8 +117,15 @@ and retries throttling, server errors and connection failures with the SDK's sta
 Credentials come from the standard AWS SDK provider chain (environment, workload identity, shared
 AWS profile, container credentials, or instance role); they are not stored in `gerrit.config`.
 
-This milestone is intended for a new Gerrit site. Importing existing repositories is deliberately
-not implicit and remains a later milestone.
+Existing repositories are brought in with the `walgerrit-import` program, which uploads a tree of
+bare repositories as they are, one manifest per repository, and verifies every ref afterwards:
+
+```bash
+java -jar gerrit.war walgerrit-import -d "$site" --source /backup/git --threads 8
+```
+
+See [Importing repositories](docs/import.md) for the preparation it expects, repacking and
+`git fsck` on a scratch copy and the source server's `gerrit.serverId`, and for how a run resumes.
 
 Build the fork WAR from the repository root, then run the fresh-site integration test:
 

@@ -440,7 +440,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     throw new IOException("Unknown pack extension: " + value);
   }
 
-  private static String readPackChecksum(Path pack) throws IOException {
+  static String readPackChecksum(Path pack) throws IOException {
     try (FileChannel channel = FileChannel.open(pack, StandardOpenOption.READ)) {
       if (channel.size() < SHA1_BYTES) {
         throw new IOException("Pack is too short to contain a checksum: " + pack);

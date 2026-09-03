@@ -469,6 +469,14 @@ final class ManifestStore {
     return evicted;
   }
 
+  /**
+   * Publishes a file that lives outside this node's cache, such as a pack imported from another
+   * repository, without copying it into the cache; readers materialize it on demand.
+   */
+  void publishExternalFile(String fileName, Path source) throws IOException {
+    objectStore.uploadIfAbsent(WAL_DIRECTORY + "/" + fileName, source);
+  }
+
   void discardStagingFile(String fileName) {
     try {
       Files.deleteIfExists(stagingPath.resolve(fileName));

@@ -164,5 +164,26 @@ curl -fsS "${listen_url}accounts/?q=is:active&n=1" >/dev/null
 stop_daemon
 run_gerrit reindex -d "$site"
 
-echo "WalGerrit fork initialized, reindexed, caught up, rebuilt indexes for a replaced node," \
-  "compacted and reclaimed its repositories, and published readiness successfully."
+# Import: a repacked bare repository from a basePath-like tree becomes a WalGerrit project through
+# the walgerrit-import program, and the daemon then serves it.
+import_source="$site/home/import-source"
+mkdir -p "$import_source/imported"
+git init -q --bare "$import_source/imported/tools.git"
+import_work=$(mktemp -d "${TMPDIR:-/tmp}/walgerrit-import-work.XXXXXX")
+git -C "$import_work" init -q
+git -C "$import_work" -c user.name=Smoke -c user.email=smoke@example.test commit -q --allow-empty -m "imported commit"
+git -C "$import_work" push -q "$import_source/imported/tools.git" HEAD:refs/heads/main
+git -C "$import_source/imported/tools.git" symbolic-ref HEAD refs/heads/main
+git -C "$import_source/imported/tools.git" repack -a -d -q
+rm -rf "$import_work"
+run_gerrit walgerrit-import -d "$site" --source "$import_source" --threads 1 --verify-closure
+test -f "$site/data/walgerrit/manifests/imported/tools.git/manifest.pb"
+import_log="$site/logs/walgerrit-import-smoke.log"
+start_daemon "$import_log"
+curl -fsS "${listen_url}projects/imported%2Ftools" | grep -q '"imported/tools"'
+curl -fsS "${listen_url}projects/imported%2Ftools/branches/main" | grep -q '"refs/heads/main"'
+stop_daemon
+
+echo "WalGerrit fork initialized, reindexed, caught up, folded its logs, rebuilt indexes for a" \
+  "replaced node, compacted and reclaimed its repositories, imported a repository, and published" \
+  "readiness successfully."

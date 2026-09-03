@@ -46,7 +46,8 @@
 
 ## Milestone 4: migration and operations
 
-- Import all repositories with full object-closure verification.
+- [x] Import a tree of bare repositories as they are, one manifest each, with ref verification and
+      an optional object-closure walk (`walgerrit-import`, see [import.md](import.md)).
 - Add snapshots and integrity checks.
 - [x] Publish `DfsPackCompactor` output as one exact add-and-supersede manifest transaction while
   retaining old files.
