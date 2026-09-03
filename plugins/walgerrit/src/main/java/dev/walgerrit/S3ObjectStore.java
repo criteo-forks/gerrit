@@ -35,7 +35,8 @@ import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.core.sync.ResponseTransformer;
-import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.http.apache5.Apache5HttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
@@ -60,16 +61,51 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
   private final S3Client client;
   private final String bucket;
 
+  S3ObjectStore(String bucket, String region, java.net.URI endpoint, boolean pathStyleAccess) {
+    this(
+        bucket,
+        region,
+        endpoint,
+        pathStyleAccess,
+        WalGitConfiguration.DEFAULT_S3_MAX_CONNECTIONS,
+        WalGitConfiguration.DEFAULT_S3_CONNECT_TIMEOUT,
+        WalGitConfiguration.DEFAULT_S3_SOCKET_TIMEOUT,
+        WalGitConfiguration.DEFAULT_S3_MAX_ATTEMPTS);
+  }
+
+  /**
+   * One pooled HTTP client per store. Every write is several requests and reads fan out, so
+   * connections are reused rather than opened per request; the connect and socket timeouts bound
+   * stalls without capping how long a healthy multi-gigabyte transfer may take, and the SDK's
+   * standard strategy retries throttling, 5xx and connection failures up to {@code maxAttempts}.
+   * A retried write that had already landed answers 412 to its own precondition; callers verify
+   * such outcomes against the store instead of trusting the status alone.
+   */
   S3ObjectStore(
       String bucket,
       String region,
       java.net.URI endpoint,
-      boolean pathStyleAccess) {
+      boolean pathStyleAccess,
+      int maxConnections,
+      java.time.Duration connectTimeout,
+      java.time.Duration socketTimeout,
+      int maxAttempts) {
     var builder =
         S3Client.builder()
             .region(Region.of(region))
             .credentialsProvider(DefaultCredentialsProvider.create())
-            .httpClient(UrlConnectionHttpClient.builder().build())
+            .httpClient(
+                Apache5HttpClient.builder()
+                    .maxConnections(maxConnections)
+                    .connectionTimeout(connectTimeout)
+                    .socketTimeout(socketTimeout)
+                    .connectionAcquisitionTimeout(socketTimeout)
+                    .tcpKeepAlive(true)
+                    .build())
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryStrategy(retry -> retry.maxAttempts(maxAttempts))
+                    .build())
             .serviceConfiguration(
                 S3Configuration.builder().pathStyleAccessEnabled(pathStyleAccess).build());
     if (endpoint != null) {

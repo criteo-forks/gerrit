@@ -35,7 +35,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
-import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.http.apache5.Apache5HttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
@@ -62,7 +62,7 @@ class S3ObjectStoreContractTest {
         S3Client.builder()
             .region(Region.US_EAST_1)
             .credentialsProvider(DefaultCredentialsProvider.create())
-            .httpClient(UrlConnectionHttpClient.builder().build())
+            .httpClient(Apache5HttpClient.builder().build())
             .endpointOverride(URI.create(endpoint))
             .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
             .build();

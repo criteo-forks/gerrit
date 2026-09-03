@@ -97,7 +97,11 @@ are older than `walgerrit.reclaimGrace` (default `24h`). The defaults suit produ
 `compactionLeaseDuration`, `reclaimEnabled`, `cacheSizeLimit` and JGit's `core.dfs.blockLimit` tune
 it. See [Compaction and reclamation](docs/compaction.md).
 
-For S3-compatible storage, use a node-local cache as `storagePath` and configure the shared bucket:
+For S3-compatible storage, use a node-local cache as `storagePath` and configure the shared bucket.
+The client pools connections (`walgerrit.s3MaxConnections`, default 64), fails a connect after
+`walgerrit.s3ConnectTimeout` (2 s) and a stalled transfer after `walgerrit.s3SocketTimeout` (30 s),
+and retries throttling, server errors and connection failures with the SDK's standard backoff up to
+`walgerrit.s3MaxAttempts` (4) times; a retried write that had already landed is recognised as such:
 
 ```ini
 [walgerrit]

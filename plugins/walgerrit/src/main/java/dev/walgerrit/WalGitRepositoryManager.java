@@ -162,7 +162,11 @@ public final class WalGitRepositoryManager implements GitRepositoryManager {
                   configuration.s3Bucket(),
                   configuration.s3Region(),
                   configuration.s3Endpoint(),
-                  configuration.s3PathStyle()),
+                  configuration.s3PathStyle(),
+                  configuration.s3MaxConnections(),
+                  configuration.s3ConnectTimeout(),
+                  configuration.s3SocketTimeout(),
+                  configuration.s3MaxAttempts()),
               configuration.storagePath(),
               configuration.indexCursorPath(),
               configuration.s3Prefix());

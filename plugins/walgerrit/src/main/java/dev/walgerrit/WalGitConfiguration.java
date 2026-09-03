@@ -30,6 +30,10 @@ record WalGitConfiguration(
     URI s3Endpoint,
     String s3Prefix,
     boolean s3PathStyle,
+    int s3MaxConnections,
+    Duration s3ConnectTimeout,
+    Duration s3SocketTimeout,
+    int s3MaxAttempts,
     Path indexCursorPath,
     boolean indexTailerEnabled,
     Duration indexPollInterval,
@@ -62,6 +66,18 @@ record WalGitConfiguration(
 
   /** Minimum number of newer entries the manifest keeps referencing when a segment is dropped. */
   static final long DEFAULT_LOG_RETAIN_ENTRIES = 10_000;
+
+  /** Pooled HTTP connections to S3 per node; a write is several requests and reads run in parallel. */
+  static final int DEFAULT_S3_MAX_CONNECTIONS = 64;
+
+  /** TCP connect timeout to S3. */
+  static final Duration DEFAULT_S3_CONNECT_TIMEOUT = Duration.ofSeconds(2);
+
+  /** Longest stall on an established connection before the attempt fails; bounds hung transfers. */
+  static final Duration DEFAULT_S3_SOCKET_TIMEOUT = Duration.ofSeconds(30);
+
+  /** Attempts per S3 call, with the SDK's standard backoff; throttling and 5xx are retried. */
+  static final int DEFAULT_S3_MAX_ATTEMPTS = 4;
 
   /** Smallest run of undersized packs worth rolling up into one; below it nothing is compacted. */
   static final int DEFAULT_COMPACT_MIN_PACKS = 8;
@@ -100,6 +116,10 @@ record WalGitConfiguration(
         null,
         "",
         false,
+        DEFAULT_S3_MAX_CONNECTIONS,
+        DEFAULT_S3_CONNECT_TIMEOUT,
+        DEFAULT_S3_SOCKET_TIMEOUT,
+        DEFAULT_S3_MAX_ATTEMPTS,
         storagePath.resolve("index-events"),
         true,
         Duration.ofSeconds(5),
@@ -145,6 +165,22 @@ record WalGitConfiguration(
             endpoint == null || endpoint.isBlank() ? null : URI.create(endpoint),
             Optional.ofNullable(config.getString(SECTION, null, "s3Prefix")).orElse(""),
             config.getBoolean(SECTION, null, "s3PathStyle", false),
+            config.getInt(SECTION, null, "s3MaxConnections", DEFAULT_S3_MAX_CONNECTIONS),
+            Duration.ofMillis(
+                config.getTimeUnit(
+                    SECTION,
+                    null,
+                    "s3ConnectTimeout",
+                    DEFAULT_S3_CONNECT_TIMEOUT.toMillis(),
+                    TimeUnit.MILLISECONDS)),
+            Duration.ofMillis(
+                config.getTimeUnit(
+                    SECTION,
+                    null,
+                    "s3SocketTimeout",
+                    DEFAULT_S3_SOCKET_TIMEOUT.toMillis(),
+                    TimeUnit.MILLISECONDS)),
+            config.getInt(SECTION, null, "s3MaxAttempts", DEFAULT_S3_MAX_ATTEMPTS),
             indexCursorPath.toAbsolutePath().normalize(),
             config.getBoolean(SECTION, null, "indexTailerEnabled", true),
             Duration.ofMillis(
@@ -210,6 +246,18 @@ record WalGitConfiguration(
     }
     if (s3Prefix.startsWith("/") || s3Prefix.contains("..") || s3Prefix.indexOf('\\') >= 0) {
       throw new IllegalArgumentException("Invalid walgerrit.s3Prefix: " + s3Prefix);
+    }
+    if (s3MaxConnections < 1) {
+      throw new IllegalArgumentException("walgerrit.s3MaxConnections must be at least 1");
+    }
+    if (s3ConnectTimeout.isZero() || s3ConnectTimeout.isNegative()) {
+      throw new IllegalArgumentException("walgerrit.s3ConnectTimeout must be positive");
+    }
+    if (s3SocketTimeout.isZero() || s3SocketTimeout.isNegative()) {
+      throw new IllegalArgumentException("walgerrit.s3SocketTimeout must be positive");
+    }
+    if (s3MaxAttempts < 1) {
+      throw new IllegalArgumentException("walgerrit.s3MaxAttempts must be at least 1");
     }
     if (indexPollInterval.isZero() || indexPollInterval.isNegative()) {
       throw new IllegalArgumentException("walgerrit.indexPollInterval must be positive");

@@ -175,4 +175,44 @@ class WalGitConfigurationTest {
 
     assertTrue(exception.getMessage().contains("Unsupported walgerrit.backend 'unknown'"));
   }
+
+  @Test
+  void s3ClientSettingsHaveProductionDefaultsAndAreConfigurable() {
+    Config config = new Config();
+    config.setString("walgerrit", null, "backend", "s3");
+    config.setString("walgerrit", null, "s3Bucket", "gerrit-git");
+    WalGitConfiguration defaults = WalGitConfiguration.from(config, sitePath);
+    assertEquals(64, defaults.s3MaxConnections());
+    assertEquals(Duration.ofSeconds(2), defaults.s3ConnectTimeout());
+    assertEquals(Duration.ofSeconds(30), defaults.s3SocketTimeout());
+    assertEquals(4, defaults.s3MaxAttempts());
+
+    config.setInt("walgerrit", null, "s3MaxConnections", 8);
+    config.setString("walgerrit", null, "s3ConnectTimeout", "500 ms");
+    config.setString("walgerrit", null, "s3SocketTimeout", "2 min");
+    config.setInt("walgerrit", null, "s3MaxAttempts", 1);
+    WalGitConfiguration tuned = WalGitConfiguration.from(config, sitePath);
+    assertEquals(8, tuned.s3MaxConnections());
+    assertEquals(Duration.ofMillis(500), tuned.s3ConnectTimeout());
+    assertEquals(Duration.ofMinutes(2), tuned.s3SocketTimeout());
+    assertEquals(1, tuned.s3MaxAttempts());
+  }
+
+  @Test
+  void s3ClientSettingsMustBePositive() {
+    for (String[] invalid :
+        new String[][] {
+          {"s3MaxConnections", "0"},
+          {"s3ConnectTimeout", "0"},
+          {"s3SocketTimeout", "-1 sec"},
+          {"s3MaxAttempts", "0"}
+        }) {
+      Config config = new Config();
+      config.setString("walgerrit", null, invalid[0], invalid[1]);
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> WalGitConfiguration.from(config, sitePath),
+          invalid[0]);
+    }
+  }
 }

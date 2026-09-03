@@ -595,8 +595,15 @@ final class ManifestStore {
         afterPublish.accept(updated);
         return updated;
       } catch (ObjectStoreConflictException conflict) {
-        // An object-only publication may merge a concurrent ref/object append.
-        // A ref publication retries only while ref_revision remains unchanged.
+        // Usually another writer got there first, and the loop merges an object-only publication
+        // or lets a ref publication fail on the ref revision. But the HTTP client retries a
+        // request whose response was lost, and a retried CAS that had already landed is refused
+        // by its own precondition, so check for this attempt before treating it as lost.
+        if (transactionLanded(refresh(), sequence, transactionId)) {
+          Manifest landed = current();
+          afterPublish.accept(landed);
+          return landed;
+        }
       } catch (IOException ambiguous) {
         try {
           Manifest fresh = refresh();
