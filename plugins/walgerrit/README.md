@@ -79,7 +79,10 @@ read, and so what lets a request that starts on any node see every write acknowl
 Set to `false`, an open reuses the node's view when it was validated less than
 `manifestRevalidateInterval` ago, one round trip less per open at the price of that guarantee;
 meant for offline programs such as `reindex`, which open a repository several times per change,
-and for single-node sites, whose own writes keep the view current.
+and for single-node sites, whose own writes keep the view current. On a daemon the index-event
+tailer's sweep confirms every manifest's version against a listing each `indexPollInterval`, which
+counts as a validation, so with the setting off a node's view is at most one poll interval plus one
+revalidation interval behind another node's write.
 
 Daemon startup synchronously catches every node-local index cursor up to a freshly read manifest
 before Gerrit's SSH and HTTP listeners start. After an offline `reindex`, `walgerrit-mark-indexed`

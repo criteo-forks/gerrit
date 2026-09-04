@@ -214,9 +214,24 @@ final class ManifestStore {
   VersionedManifest currentOrRefresh(String version) throws IOException {
     VersionedManifest known = cache.get(cacheKey);
     if (known != null && known.version().equals(version)) {
+      cache.markValidated(cacheKey, clock.millis());
       return known;
     }
     return refreshVersionedManifest();
+  }
+
+  /**
+   * Records that a listing just reported {@code version} for this manifest. When that is the
+   * version this node holds, the node's view is as fresh as the listing, and an open with {@code
+   * walgerrit.manifestRevalidateOnOpen} off may reuse it for another revalidation interval. The
+   * index-event tailer calls this for every repository on every sweep, so the node's staleness is
+   * bounded by its poll interval rather than by that setting alone.
+   */
+  void noteListedVersion(String version) {
+    VersionedManifest known = cache.get(cacheKey);
+    if (known != null && known.version().equals(version)) {
+      cache.markValidated(cacheKey, clock.millis());
+    }
   }
 
   /** The key of the log entry with this sequence and transaction id. */

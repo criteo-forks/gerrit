@@ -208,6 +208,22 @@ class ManifestReadCountTest {
       assertEquals(tip, fresh.exactRef(Constants.R_HEADS + "main").getObjectId());
     }
 
+    // The tailer's sweep confirms versions by listing and refreshes what changed, so a node with
+    // revalidation on open off still adopts another node's write on its next sweep.
+    ObjectId later;
+    try (Repository repository = writer.openRepository(project)) {
+      later = insertChain(repository, 1);
+      RefUpdate update = repository.updateRef(Constants.R_HEADS + "later");
+      update.setNewObjectId(later);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+    }
+    new IndexEventTailer(batch, (ignoredProject, transaction) -> {}, GerritRuntime.DAEMON).runOnce();
+    store.reset();
+    try (Repository swept = batch.openRepository(project)) {
+      assertEquals(0, store.manifestReads(), "the sweep already validated the manifest");
+      assertEquals(later, swept.exactRef(Constants.R_HEADS + "later").getObjectId());
+    }
+
     WalGitRepositoryManager always = manager(store, "0", false, "always");
     store.reset();
     always.openRepository(project).close();

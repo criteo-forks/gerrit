@@ -211,6 +211,8 @@ final class IndexEventTailer implements LifecycleListener {
     for (Map.Entry<Project.NameKey, String> head : heads.entrySet()) {
       Project.NameKey project = head.getKey();
       if (head.getValue().equals(caughtUpVersions.get(project))) {
+        // Nothing to replay, but the listing just confirmed the node's view of this manifest.
+        repositories.storage().manifestStore(project).noteListedVersion(head.getValue());
         continue;
       }
       try {
