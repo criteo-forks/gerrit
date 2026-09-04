@@ -176,6 +176,7 @@ git -C "$import_work" push -q "$import_source/imported/tools.git" HEAD:refs/head
 git -C "$import_source/imported/tools.git" symbolic-ref HEAD refs/heads/main
 rm -rf "$import_work"
 run_gerrit walgerrit-import -d "$site" --source "$import_source" --stage "$site/home/import-stage" \
+  --prune-dangling-refs \
   --threads 1 --verify-closure
 test ! -e "$site/home/import-stage/imported/tools.git"
 test -f "$site/data/walgerrit/manifests/imported/tools.git/manifest.pb"

@@ -8,7 +8,7 @@ produced: a few large packs and one table, so the compactor has nothing to do af
 
 ```bash
 java -jar gerrit.war walgerrit-import -d "$site" --source /backup/git --stage /scratch \
-    [--threads N] [--project NAME]... [--verify-closure]
+    [--prune-dangling-refs] [--threads N] [--project NAME]... [--verify-closure]
 ```
 
 The site is the WalGerrit site that will serve the data: its `gerrit.config` names the bucket or
@@ -35,6 +35,17 @@ into that directory, runs `git repack -a -d`, `git prune --expire=now` and `git 
 mount of the backup, and the scratch space needed is the largest repository times `--threads`, not
 the whole site. `git` must be on the PATH. Bitmaps and reverse indexes written by the repack are
 imported alongside the packs and speed up clones.
+
+Staging expects what a backup of a serving Gerrit looks like. git's derived indexes, the
+commit-graph and the multi-pack-index, are not copied: the importer does not ship them, and they
+are routinely stale in a backup because JGit prunes commits and deletes packs without updating them,
+which `git fsck` would report as corruption. A `HEAD` that names `refs/meta/config`, as Gerrit sets
+up `All-Projects` and `All-Users`, is kept although `git fsck` objects to it. A ref that points at
+an object the backup lacks, which a backup taken while the server writes can hold (`refs/multi-site/
+version` and freshly written change refs are the usual cases), fails the repository with the list
+of such refs; with `--prune-dangling-refs` they are deleted from the copy instead, and listed in the
+output as `pruned N dangling refs from PROJECT: ...`, so the operator can fetch them from the
+primary afterwards. The source is never changed either way.
 
 **Pre-repacked.** Without `--stage`, run `git repack -a -d` and `git fsck --connectivity-only` in
 every repository of a scratch copy yourself, then import the copy. The importer refuses a

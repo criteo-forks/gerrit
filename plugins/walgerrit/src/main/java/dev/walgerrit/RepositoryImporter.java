@@ -39,7 +39,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
+import org.eclipse.jgit.errors.MissingObjectException;
 import org.eclipse.jgit.internal.storage.file.FileRepository;
 import org.eclipse.jgit.internal.storage.file.ObjectDirectory;
 import org.eclipse.jgit.internal.storage.file.Pack;
@@ -54,6 +56,7 @@ import org.eclipse.jgit.lib.RefDatabase;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.ObjectWalk;
 import org.eclipse.jgit.revwalk.RevObject;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 
 /**
@@ -66,7 +69,10 @@ import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
  * makes under that directory and removes afterwards. Staging needs scratch space for the largest
  * repository times the number of parallel imports rather than for the whole site, and lets the
  * source be a read-only mount. Without staging, a repository that still has loose objects is
- * refused with that instruction. Its refs, including
+ * refused with that instruction. Staging leaves git's derived indexes, the commit-graph and the
+ * multi-pack-index, behind, since a backup of a serving repository routinely holds stale ones, and
+ * refuses a repository whose refs point at objects the backup lacks unless {@code
+ * --prune-dangling-refs} says to drop those refs from the copy. Its refs, including
  * {@code HEAD} and every {@code refs/changes}, {@code refs/meta}, {@code refs/users} and {@code
  * refs/groups} ref Gerrit needs, become one reftable, and one manifest publication makes the whole
  * repository visible at once. Reflogs are not carried over.
@@ -81,13 +87,16 @@ import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 public final class RepositoryImporter {
   private static final String USAGE =
       """
-      Usage: walgerrit-import -d SITE --source DIR [--stage DIR] [--project NAME]... [--threads N]
-                              [--verify-closure]
+      Usage: walgerrit-import -d SITE --source DIR [--stage DIR] [--prune-dangling-refs]
+                              [--project NAME]... [--threads N] [--verify-closure]
 
         --source DIR       directory of bare repositories laid out like gerrit.basePath
         --stage DIR        copy each repository here, repack, prune and fsck it with git, import
                            the copy and delete it; needs room for the largest repository times
                            --threads, and git on the PATH (default: import the source as it is)
+        --prune-dangling-refs
+                           with --stage, delete refs that point at objects the source lacks from
+                           the copy, and list them, instead of failing the repository
         --project NAME     import only this project (repeatable; default: every repository)
         --threads N        repositories imported in parallel (default 4)
         --verify-closure   after publishing, walk every reachable object through WalGerrit
@@ -115,17 +124,28 @@ public final class RepositoryImporter {
   private final PrintStream out;
   private final boolean verifyClosure;
   private final Path stage;
+  private final boolean pruneDanglingRefs;
 
   RepositoryImporter(WalGitRepositoryManager repositories, PrintStream out, boolean verifyClosure) {
-    this(repositories, out, verifyClosure, null);
+    this(repositories, out, verifyClosure, null, false);
   }
 
   RepositoryImporter(
       WalGitRepositoryManager repositories, PrintStream out, boolean verifyClosure, Path stage) {
+    this(repositories, out, verifyClosure, stage, false);
+  }
+
+  RepositoryImporter(
+      WalGitRepositoryManager repositories,
+      PrintStream out,
+      boolean verifyClosure,
+      Path stage,
+      boolean pruneDanglingRefs) {
     this.repositories = repositories;
     this.out = out;
     this.verifyClosure = verifyClosure;
     this.stage = stage;
+    this.pruneDanglingRefs = pruneDanglingRefs;
   }
 
   /** Command-line entry point used by Gerrit's {@code walgerrit-import} program. */
@@ -135,10 +155,12 @@ public final class RepositoryImporter {
     Set<String> only = new HashSet<>();
     int threads = 4;
     boolean verifyClosure = false;
+    boolean pruneDanglingRefs = false;
     for (int i = 0; i < args.length; i++) {
       switch (args[i]) {
         case "--source" -> source = Path.of(requireValue(args, ++i));
         case "--stage" -> stage = Path.of(requireValue(args, ++i));
+        case "--prune-dangling-refs" -> pruneDanglingRefs = true;
         case "--project" -> only.add(requireValue(args, ++i));
         case "--threads" -> threads = Integer.parseInt(requireValue(args, ++i));
         case "--verify-closure" -> verifyClosure = true;
@@ -158,7 +180,7 @@ public final class RepositoryImporter {
               + manager.getClass().getName());
     }
     Report report =
-        new RepositoryImporter(walGit, System.out, verifyClosure, stage)
+        new RepositoryImporter(walGit, System.out, verifyClosure, stage, pruneDanglingRefs)
             .importAll(source, only, threads);
     System.out.printf(
         Locale.ROOT,
@@ -265,7 +287,7 @@ public final class RepositoryImporter {
     }
     Path copy = stage.resolve(projectName + Constants.DOT_GIT_EXT);
     try {
-      stageCopy(bareDirectory, copy);
+      stageCopy(projectName, bareDirectory, copy);
       return publishFrom(project, copy, store);
     } finally {
       deleteRecursively(copy);
@@ -346,11 +368,21 @@ public final class RepositoryImporter {
         new FileRepositoryBuilder().setGitDir(bareDirectory.toFile()).setMustExist(true).build();
   }
 
+  /** The exit status {@code git fsck} uses when its only complaint is where {@code HEAD} points. */
+  private static final int FSCK_HEAD_LINK_ERROR = 8;
+
   /**
    * Copies the parts of a bare repository that carry state, then repacks, prunes and checks the
    * copy with git so that it holds exactly the reachable objects, in packs, verified.
+   *
+   * <p>git's derived indexes, the commit-graph and the multi-pack-index, are not copied: the
+   * importer does not ship them, and in a backup of a serving repository they are routinely stale,
+   * because JGit deletes packs and prunes commits without updating them, which {@code git fsck}
+   * would then report as corruption. Refs that point at objects the source lacks, which a backup
+   * taken while the server writes can hold, fail the repository unless {@code
+   * --prune-dangling-refs} was given, in which case they are deleted from the copy and listed.
    */
-  private void stageCopy(Path bareDirectory, Path copy) throws IOException {
+  private void stageCopy(String projectName, Path bareDirectory, Path copy) throws IOException {
     deleteRecursively(copy);
     Files.createDirectories(copy);
     for (String entry : List.of(Constants.HEAD, Constants.CONFIG, Constants.PACKED_REFS)) {
@@ -360,21 +392,94 @@ public final class RepositoryImporter {
         copy.resolve(entry).toFile().setWritable(true, true);
       }
     }
-    for (String directory : List.of(Constants.OBJECTS, Constants.R_REFS.replace("/", ""))) {
-      Path from = bareDirectory.resolve(directory);
-      if (Files.isDirectory(from)) {
-        copyTree(from, copy.resolve(directory));
+    copyTree(
+        bareDirectory.resolve(Constants.OBJECTS),
+        copy.resolve(Constants.OBJECTS),
+        RepositoryImporter::isDerivedIndex);
+    String refs = Constants.R_REFS.replace("/", "");
+    copyTree(bareDirectory.resolve(refs), copy.resolve(refs), relative -> false);
+
+    List<String> dangling = danglingRefs(copy);
+    if (!dangling.isEmpty()) {
+      if (!pruneDanglingRefs) {
+        throw new IOException(
+            projectName
+                + " has "
+                + dangling.size()
+                + " refs pointing at objects the source lacks; rerun with --prune-dangling-refs to"
+                + " drop them from the copy: "
+                + String.join(" ", dangling));
       }
+      StringBuilder deletions = new StringBuilder();
+      for (String ref : dangling) {
+        deletions.append("delete ").append(ref).append('\n');
+      }
+      git(copy, deletions.toString(), "update-ref", "--stdin");
+      out.printf(
+          Locale.ROOT,
+          "pruned %d dangling refs from %s: %s%n",
+          dangling.size(),
+          projectName,
+          String.join(" ", dangling));
     }
-    git(copy, "repack", "-a", "-d", "-q");
-    git(copy, "prune", "--expire=now");
-    git(copy, "fsck", "--connectivity-only", "--no-progress");
+
+    git(copy, null, "repack", "-a", "-d", "-q");
+    git(copy, null, "prune", "--expire=now");
+    GitResult fsck = runGit(copy, null, "fsck", "--connectivity-only", "--no-progress", "--no-dangling");
+    // git fsck insists that a symbolic HEAD name a branch and reports nothing else with this
+    // status; Gerrit deliberately points All-Projects' and All-Users' HEAD at refs/meta/config.
+    if (fsck.status() != 0
+        && !(fsck.status() == FSCK_HEAD_LINK_ERROR && headOutsideBranches(copy))) {
+      throw fsck.failure(copy);
+    }
   }
 
-  private static void copyTree(Path from, Path to) throws IOException {
+  /** git's commit-graph and multi-pack-index files, given a path relative to {@code objects/}. */
+  static boolean isDerivedIndex(Path relativeToObjects) {
+    String path = relativeToObjects.toString().replace(File.separatorChar, '/');
+    return path.startsWith("info/commit-graph") || path.startsWith("pack/multi-pack-index");
+  }
+
+  /** Refs of the copy whose object, or whose annotated tag's target, the copy does not hold. */
+  private static List<String> danglingRefs(Path copy) throws IOException {
+    List<String> dangling = new ArrayList<>();
+    try (FileRepository repository = open(copy);
+        RevWalk walk = new RevWalk(repository)) {
+      for (Ref ref : repository.getRefDatabase().getRefsByPrefix(RefDatabase.ALL)) {
+        if (ref.isSymbolic() || ref.getObjectId() == null || Constants.HEAD.equals(ref.getName())) {
+          continue;
+        }
+        try {
+          walk.peel(walk.parseAny(ref.getObjectId()));
+        } catch (MissingObjectException missing) {
+          dangling.add(ref.getName());
+        }
+      }
+    }
+    return dangling;
+  }
+
+  /** Whether the copy's HEAD is a symbolic ref to something other than a branch. */
+  private static boolean headOutsideBranches(Path copy) throws IOException {
+    Path head = copy.resolve(Constants.HEAD);
+    if (!Files.isRegularFile(head)) {
+      return false;
+    }
+    String content = Files.readString(head, StandardCharsets.UTF_8).strip();
+    return content.startsWith("ref: ") && !content.startsWith("ref: " + Constants.R_HEADS);
+  }
+
+  private static void copyTree(Path from, Path to, Predicate<Path> skip) throws IOException {
+    if (!Files.isDirectory(from)) {
+      return;
+    }
     try (Stream<Path> paths = Files.walk(from)) {
       for (Path path : (Iterable<Path>) paths::iterator) {
-        Path target = to.resolve(from.relativize(path).toString());
+        Path relative = from.relativize(path);
+        if (skip.test(relative)) {
+          continue;
+        }
+        Path target = to.resolve(relative.toString());
         if (Files.isDirectory(path)) {
           Files.createDirectories(target);
         } else if (Files.isRegularFile(path)) {
@@ -385,14 +490,37 @@ public final class RepositoryImporter {
     }
   }
 
-  private void git(Path repository, String... arguments) throws IOException {
+  private record GitResult(List<String> arguments, int status, String output) {
+    IOException failure(Path repository) {
+      return new IOException(
+          "git " + String.join(" ", arguments) + " failed in " + repository + " (" + status + "):\n"
+              + output.strip());
+    }
+  }
+
+  private static void git(Path repository, String input, String... arguments) throws IOException {
+    GitResult result = runGit(repository, input, arguments);
+    if (result.status() != 0) {
+      throw result.failure(repository);
+    }
+  }
+
+  /** Runs git in {@code repository}, feeding it {@code input} if there is any, and collects its output. */
+  private static GitResult runGit(Path repository, String input, String... arguments)
+      throws IOException {
     List<String> command = new ArrayList<>(List.of("git", "-C", repository.toString()));
     command.addAll(List.of(arguments));
-    Process process =
-        new ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .redirectInput(ProcessBuilder.Redirect.from(new File("/dev/null")))
-            .start();
+    ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
+    if (input == null) {
+      builder.redirectInput(ProcessBuilder.Redirect.from(new File("/dev/null")));
+    }
+    builder.environment().put("LC_ALL", "C");
+    Process process = builder.start();
+    if (input != null) {
+      try (OutputStream stdin = process.getOutputStream()) {
+        stdin.write(input.getBytes(StandardCharsets.UTF_8));
+      }
+    }
     String output;
     try (var stream = process.getInputStream()) {
       output = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
@@ -405,11 +533,7 @@ public final class RepositoryImporter {
       Thread.currentThread().interrupt();
       throw new IOException("Interrupted while running git " + arguments[0], interrupted);
     }
-    if (status != 0) {
-      throw new IOException(
-          "git " + String.join(" ", arguments) + " failed in " + repository + " (" + status + "):\n"
-              + output.strip());
-    }
+    return new GitResult(List.of(arguments), status, output);
   }
 
   private static void deleteRecursively(Path directory) throws IOException {

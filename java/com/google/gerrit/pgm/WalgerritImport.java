@@ -52,6 +52,13 @@ public class WalgerritImport extends SiteProgram {
   private String stage;
 
   @Option(
+      name = "--prune-dangling-refs",
+      usage =
+          "with --stage, delete refs that point at objects the source lacks from the copy, and list"
+              + " them, instead of failing the repository")
+  private boolean pruneDanglingRefs;
+
+  @Option(
       name = "--project",
       metaVar = "NAME",
       usage = "import only this project; repeatable (default: every repository found)")
@@ -82,6 +89,9 @@ public class WalgerritImport extends SiteProgram {
       if (stage != null) {
         importerArgs.add("--stage");
         importerArgs.add(stage);
+      }
+      if (pruneDanglingRefs) {
+        importerArgs.add("--prune-dangling-refs");
       }
       for (String project : projects) {
         importerArgs.add("--project");

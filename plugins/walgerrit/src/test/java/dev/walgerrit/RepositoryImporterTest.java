@@ -15,6 +15,7 @@ package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -22,10 +23,13 @@ import com.google.gerrit.entities.Project;
 import dev.walgerrit.RepositoryImporter.Outcome;
 import dev.walgerrit.RepositoryImporter.Report;
 import dev.walgerrit.proto.StorageProto.Manifest;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -183,6 +187,110 @@ class RepositoryImporterTest {
     assertEquals(1, manifest.getPacksList().stream().filter(CompactionPolicy::isObjectPack).count(), "git repack -a produced one pack");
   }
 
+  @Test
+  void stagingKeepsAHeadOutsideRefsHeadsAndLeavesStaleGitIndexesBehind() throws Exception {
+    org.junit.jupiter.api.Assumptions.assumeTrue(gitAvailable(), "git is not on the PATH");
+    Path source = root.resolve("basePath");
+    Path bareDirectory = source.resolve("All-Projects.git");
+    ObjectId config;
+    ObjectId main;
+    try (Repository bare = createBare(bareDirectory)) {
+      config = commitAndRef(bare, "refs/meta/config", "project config");
+      commitAndRef(bare, Constants.R_HEADS + "doomed", "soon unreachable");
+      // As Gerrit sets up All-Projects and All-Users; git fsck calls this HEAD strange.
+      assertEquals(
+          RefUpdate.Result.FORCED, bare.updateRef(Constants.HEAD).link("refs/meta/config"));
+      // Derived indexes the way a served repository accumulates them: git writes a commit-graph
+      // and a multi-pack-index, then JGit's gc prunes a commit and deletes a pack they describe
+      // without updating either, so git fsck would report both as corrupt.
+      repack(bare);
+      git(bareDirectory, "commit-graph", "write", "--reachable");
+      git(bareDirectory, "multi-pack-index", "write");
+      RefUpdate delete = bare.updateRef(Constants.R_HEADS + "doomed");
+      delete.setForceUpdate(true);
+      assertEquals(RefUpdate.Result.FORCED, delete.delete());
+      main = commitAndRef(bare, Constants.R_HEADS + "main", "later");
+      repack(bare);
+    }
+    assertTrue(Files.isRegularFile(bareDirectory.resolve("objects/info/commit-graph")));
+    assertTrue(Files.isRegularFile(bareDirectory.resolve("objects/pack/multi-pack-index")));
+    WalGitRepositoryManager manager = manager("node-a");
+    RepositoryImporter importer =
+        new RepositoryImporter(manager, new PrintStream(System.out), true, root.resolve("stage"));
+
+    Report report = importer.importAll(source, Set.of(), 1);
+
+    assertTrue(report.ok(), report.failures().toString());
+    try (Repository imported = manager.openRepository(Project.nameKey("All-Projects"))) {
+      Ref head = imported.exactRef(Constants.HEAD);
+      assertTrue(head.isSymbolic(), "HEAD stays symbolic");
+      assertEquals("refs/meta/config", head.getTarget().getName());
+      assertEquals(config, imported.exactRef("refs/meta/config").getObjectId());
+      assertEquals(main, imported.exactRef(Constants.R_HEADS + "main").getObjectId());
+      assertNull(imported.exactRef(Constants.R_HEADS + "doomed"));
+    }
+  }
+
+  @Test
+  void stagingFailsOnDanglingRefsUnlessAskedToPruneThem() throws Exception {
+    org.junit.jupiter.api.Assumptions.assumeTrue(gitAvailable(), "git is not on the PATH");
+    Path source = root.resolve("basePath");
+    Path bareDirectory = source.resolve("torn.git");
+    ObjectId main;
+    try (Repository bare = createBare(bareDirectory)) {
+      main = commitAndRef(bare, Constants.R_HEADS + "main", "kept");
+    }
+    // What a backup taken while the server writes can hold: refs whose objects were not copied.
+    String missing = "0123456789abcdef0123456789abcdef01234567\n";
+    Files.createDirectories(bareDirectory.resolve("refs/multi-site"));
+    Files.writeString(bareDirectory.resolve("refs/multi-site/version"), missing);
+    Files.createDirectories(bareDirectory.resolve("refs/changes/01/1"));
+    Files.writeString(bareDirectory.resolve("refs/changes/01/1/meta"), missing);
+    ByteArrayOutputStream log = new ByteArrayOutputStream();
+    WalGitRepositoryManager manager = manager("node-a");
+    Path stage = root.resolve("stage");
+
+    Report refused =
+        new RepositoryImporter(manager, new PrintStream(log), true, stage, false)
+            .importAll(source, Set.of(), 1);
+
+    assertEquals(List.of("torn"), refused.failures());
+    String refusal = log.toString(StandardCharsets.UTF_8);
+    assertTrue(refusal.contains("FAILED  torn"), refusal);
+    assertTrue(refusal.contains("refs/multi-site/version"), refusal);
+    assertTrue(refusal.contains("refs/changes/01/1/meta"), refusal);
+    assertTrue(refusal.contains("--prune-dangling-refs"), refusal);
+
+    log.reset();
+    Report pruned =
+        new RepositoryImporter(manager, new PrintStream(log), true, stage, true)
+            .importAll(source, Set.of(), 1);
+
+    assertTrue(pruned.ok(), pruned.failures().toString());
+    assertEquals(1, pruned.imported());
+    String pruning = log.toString(StandardCharsets.UTF_8);
+    assertTrue(
+        pruning.contains(
+            "pruned 2 dangling refs from torn: refs/changes/01/1/meta refs/multi-site/version"),
+        pruning);
+    try (Repository imported = manager.openRepository(Project.nameKey("torn"))) {
+      assertEquals(main, imported.exactRef(Constants.R_HEADS + "main").getObjectId());
+      assertNull(imported.exactRef("refs/multi-site/version"));
+      assertNull(imported.exactRef("refs/changes/01/1/meta"));
+    }
+    assertTrue(
+        Files.isRegularFile(bareDirectory.resolve("refs/multi-site/version")),
+        "the source keeps its dangling refs");
+  }
+
+  private static void git(Path repository, String... arguments) throws Exception {
+    java.util.List<String> command = new java.util.ArrayList<>(List.of("git", "-C", repository.toString()));
+    command.addAll(List.of(arguments));
+    Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+    String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    assertEquals(0, process.waitFor(), output);
+  }
+
   private static boolean gitAvailable() {
     try {
       return new ProcessBuilder("git", "--version").redirectErrorStream(true).start().waitFor() == 0;
@@ -234,7 +342,10 @@ class RepositoryImporterTest {
     assertEquals(
         0,
         RepositoryImporter.run(
-            manager, new String[] {"--source", source.toString(), "--threads", "1"}));
+            manager,
+            new String[] {
+              "--source", source.toString(), "--threads", "1", "--prune-dangling-refs"
+            }));
     assertEquals(Set.of(Project.nameKey("cli")), manager.list());
     assertThrows(
         IllegalArgumentException.class,
