@@ -59,10 +59,14 @@ import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 /**
  * Imports a tree of bare repositories, as {@code gerrit.basePath} lays them out, into WalGerrit.
  *
- * <p>Nothing is repacked or rewritten here. Each repository's existing pack files are uploaded as
- * they are, so the operator repacks once beforehand ({@code git repack -a -d}, then {@code git fsck
- * --connectivity-only}) on a scratch copy of the backup, never on a serving repository, and a
- * repository that still has loose objects is refused with that instruction. Its refs, including
+ * <p>Nothing in the source is rewritten. Each repository's existing pack files are uploaded as they
+ * are, so it must hold no loose objects: either the operator repacks a scratch copy of the backup
+ * beforehand ({@code git repack -a -d}, then {@code git fsck --connectivity-only}), or the importer
+ * is given {@code --stage DIR} and does exactly that itself, one repository at a time, on a copy it
+ * makes under that directory and removes afterwards. Staging needs scratch space for the largest
+ * repository times the number of parallel imports rather than for the whole site, and lets the
+ * source be a read-only mount. Without staging, a repository that still has loose objects is
+ * refused with that instruction. Its refs, including
  * {@code HEAD} and every {@code refs/changes}, {@code refs/meta}, {@code refs/users} and {@code
  * refs/groups} ref Gerrit needs, become one reftable, and one manifest publication makes the whole
  * repository visible at once. Reflogs are not carried over.
@@ -77,16 +81,20 @@ import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 public final class RepositoryImporter {
   private static final String USAGE =
       """
-      Usage: walgerrit-import -d SITE --source DIR [--project NAME]... [--threads N] [--verify-closure]
+      Usage: walgerrit-import -d SITE --source DIR [--stage DIR] [--project NAME]... [--threads N]
+                              [--verify-closure]
 
         --source DIR       directory of bare repositories laid out like gerrit.basePath
+        --stage DIR        copy each repository here, repack, prune and fsck it with git, import
+                           the copy and delete it; needs room for the largest repository times
+                           --threads, and git on the PATH (default: import the source as it is)
         --project NAME     import only this project (repeatable; default: every repository)
         --threads N        repositories imported in parallel (default 4)
         --verify-closure   after publishing, walk every reachable object through WalGerrit
         --help             this text
 
-      Repositories must be repacked first (git repack -a -d) so that they hold no loose objects.
-      Set gerrit.serverId to the source server's id before importing NoteDb data.
+      Without --stage, repositories must be repacked first (git repack -a -d) so that they hold no
+      loose objects. Set gerrit.serverId to the source server's id before importing NoteDb data.
       """;
 
   /** What happened to one repository. */
@@ -106,22 +114,31 @@ public final class RepositoryImporter {
   private final WalGitRepositoryManager repositories;
   private final PrintStream out;
   private final boolean verifyClosure;
+  private final Path stage;
 
   RepositoryImporter(WalGitRepositoryManager repositories, PrintStream out, boolean verifyClosure) {
+    this(repositories, out, verifyClosure, null);
+  }
+
+  RepositoryImporter(
+      WalGitRepositoryManager repositories, PrintStream out, boolean verifyClosure, Path stage) {
     this.repositories = repositories;
     this.out = out;
     this.verifyClosure = verifyClosure;
+    this.stage = stage;
   }
 
   /** Command-line entry point used by Gerrit's {@code walgerrit-import} program. */
   public static int run(GitRepositoryManager manager, String[] args) throws Exception {
     Path source = null;
+    Path stage = null;
     Set<String> only = new HashSet<>();
     int threads = 4;
     boolean verifyClosure = false;
     for (int i = 0; i < args.length; i++) {
       switch (args[i]) {
         case "--source" -> source = Path.of(requireValue(args, ++i));
+        case "--stage" -> stage = Path.of(requireValue(args, ++i));
         case "--project" -> only.add(requireValue(args, ++i));
         case "--threads" -> threads = Integer.parseInt(requireValue(args, ++i));
         case "--verify-closure" -> verifyClosure = true;
@@ -141,7 +158,8 @@ public final class RepositoryImporter {
               + manager.getClass().getName());
     }
     Report report =
-        new RepositoryImporter(walGit, System.out, verifyClosure).importAll(source, only, threads);
+        new RepositoryImporter(walGit, System.out, verifyClosure, stage)
+            .importAll(source, only, threads);
     System.out.printf(
         Locale.ROOT,
         "Imported %d repositories, %d were already imported, %d failed%n",
@@ -229,21 +247,36 @@ public final class RepositoryImporter {
   /** Imports one repository; see the class comment for what is checked and what is skipped. */
   public Outcome importOne(String projectName, Path bareDirectory) throws IOException {
     Project.NameKey project = Project.nameKey(projectName);
-    try (FileRepository source =
-        (FileRepository)
-            new FileRepositoryBuilder().setGitDir(bareDirectory.toFile()).setMustExist(true).build()) {
-      Map<String, Ref> refs = sourceRefs(source);
-      ManifestStore store = repositories.storage().manifestStore(project);
-      boolean created = store.create();
-      if (!created) {
-        Manifest existing = store.refresh();
-        if (existing.getPacksCount() > 0 || existing.getRevision() > 0) {
-          verify(project, refs);
-          out.printf(Locale.ROOT, "skipped %s: already imported and verified%n", projectName);
-          return Outcome.ALREADY_IMPORTED;
+    ManifestStore store = repositories.storage().manifestStore(project);
+    boolean created = store.create();
+    if (!created) {
+      Manifest existing = store.refresh();
+      if (existing.getPacksCount() > 0 || existing.getRevision() > 0) {
+        try (Repository original = open(bareDirectory)) {
+          verify(project, sourceRefs(original));
         }
-        // Created by an earlier run that died before publishing; publish now.
+        out.printf(Locale.ROOT, "skipped %s: already imported and verified%n", projectName);
+        return Outcome.ALREADY_IMPORTED;
       }
+      // Created by an earlier run that died before publishing; publish now.
+    }
+    if (stage == null) {
+      return publishFrom(project, bareDirectory, store);
+    }
+    Path copy = stage.resolve(projectName + Constants.DOT_GIT_EXT);
+    try {
+      stageCopy(bareDirectory, copy);
+      return publishFrom(project, copy, store);
+    } finally {
+      deleteRecursively(copy);
+    }
+  }
+
+  private Outcome publishFrom(Project.NameKey project, Path bareDirectory, ManifestStore store)
+      throws IOException {
+    String projectName = project.get();
+    try (FileRepository source = open(bareDirectory)) {
+      Map<String, Ref> refs = sourceRefs(source);
       refuseLooseObjects(source, projectName);
 
       List<PackRef> additions = new ArrayList<>();
@@ -308,6 +341,88 @@ public final class RepositoryImporter {
   }
 
   /** Every ref, peeled: the reftable writer records a tag's target alongside the tag itself. */
+  private static FileRepository open(Path bareDirectory) throws IOException {
+    return (FileRepository)
+        new FileRepositoryBuilder().setGitDir(bareDirectory.toFile()).setMustExist(true).build();
+  }
+
+  /**
+   * Copies the parts of a bare repository that carry state, then repacks, prunes and checks the
+   * copy with git so that it holds exactly the reachable objects, in packs, verified.
+   */
+  private void stageCopy(Path bareDirectory, Path copy) throws IOException {
+    deleteRecursively(copy);
+    Files.createDirectories(copy);
+    for (String entry : List.of(Constants.HEAD, Constants.CONFIG, Constants.PACKED_REFS)) {
+      Path file = bareDirectory.resolve(entry);
+      if (Files.isRegularFile(file)) {
+        Files.copy(file, copy.resolve(entry));
+        copy.resolve(entry).toFile().setWritable(true, true);
+      }
+    }
+    for (String directory : List.of(Constants.OBJECTS, Constants.R_REFS.replace("/", ""))) {
+      Path from = bareDirectory.resolve(directory);
+      if (Files.isDirectory(from)) {
+        copyTree(from, copy.resolve(directory));
+      }
+    }
+    git(copy, "repack", "-a", "-d", "-q");
+    git(copy, "prune", "--expire=now");
+    git(copy, "fsck", "--connectivity-only", "--no-progress");
+  }
+
+  private static void copyTree(Path from, Path to) throws IOException {
+    try (Stream<Path> paths = Files.walk(from)) {
+      for (Path path : (Iterable<Path>) paths::iterator) {
+        Path target = to.resolve(from.relativize(path).toString());
+        if (Files.isDirectory(path)) {
+          Files.createDirectories(target);
+        } else if (Files.isRegularFile(path)) {
+          Files.copy(path, target);
+          target.toFile().setWritable(true, true);
+        }
+      }
+    }
+  }
+
+  private void git(Path repository, String... arguments) throws IOException {
+    List<String> command = new ArrayList<>(List.of("git", "-C", repository.toString()));
+    command.addAll(List.of(arguments));
+    Process process =
+        new ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .redirectInput(ProcessBuilder.Redirect.from(new File("/dev/null")))
+            .start();
+    String output;
+    try (var stream = process.getInputStream()) {
+      output = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+    }
+    int status;
+    try {
+      status = process.waitFor();
+    } catch (InterruptedException interrupted) {
+      process.destroyForcibly();
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while running git " + arguments[0], interrupted);
+    }
+    if (status != 0) {
+      throw new IOException(
+          "git " + String.join(" ", arguments) + " failed in " + repository + " (" + status + "):\n"
+              + output.strip());
+    }
+  }
+
+  private static void deleteRecursively(Path directory) throws IOException {
+    if (!Files.exists(directory)) {
+      return;
+    }
+    try (Stream<Path> paths = Files.walk(directory)) {
+      for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) {
+        Files.deleteIfExists(path);
+      }
+    }
+  }
+
   private static Map<String, Ref> sourceRefs(Repository source) throws IOException {
     Map<String, Ref> refs = new TreeMap<>();
     RefDatabase database = source.getRefDatabase();

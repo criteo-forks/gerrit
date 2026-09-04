@@ -7,8 +7,8 @@ repository with one manifest transaction. The result is exactly what a compactio
 produced: a few large packs and one table, so the compactor has nothing to do afterwards.
 
 ```bash
-java -jar gerrit.war walgerrit-import -d "$site" --source /scratch/git [--threads N] \
-    [--project NAME]... [--verify-closure]
+java -jar gerrit.war walgerrit-import -d "$site" --source /backup/git --stage /scratch \
+    [--threads N] [--project NAME]... [--verify-closure]
 ```
 
 The site is the WalGerrit site that will serve the data: its `gerrit.config` names the bucket or
@@ -16,15 +16,32 @@ local store, installs `dev.walgerrit.WalGitModule`, and carries the WalGerrit li
 Nothing is written anywhere but the configured store, and the daemon need not be stopped; the
 imported repositories are invisible until a site is pointed at their prefix.
 
+## Survey first
+
+`scripts/survey-repositories.sh BASE_PATH` reads the tree without writing to it and prints the
+numbers the import depends on: repository count and total size, the largest repositories and the
+largest single pack, which repositories still hold loose objects, ref counts, and the NoteDb schema
+version in All-Projects. The largest repository sizes the staging space; the largest pack says
+whether the 5 GiB single-upload limit, above which parts are used, is exercised on day one.
+
 ## Prepare the source
 
-Work on a copy of the backup, never on a serving repository or on the backup itself.
+The source is never written to. Repositories must hold no loose objects when they are uploaded, and
+there are two ways to get there.
 
-1. **Repack.** Run `git repack -a -d` in every repository so that all objects live in packs. The
-   importer refuses a repository that still has loose objects and says so. Bitmaps and reverse
-   indexes written by the repack are imported alongside the packs and speed up clones.
-2. **Check integrity.** Run `git fsck --connectivity-only` in every repository. The importer verifies
-   refs, not the source's object graph; this is what verifies it, with the standard tool.
+**Staged, the default for a real site.** With `--stage DIR` the importer copies each repository
+into that directory, runs `git repack -a -d`, `git prune --expire=now` and `git fsck
+--connectivity-only` on the copy, imports the copy and deletes it. The source can be a read-only
+mount of the backup, and the scratch space needed is the largest repository times `--threads`, not
+the whole site. `git` must be on the PATH. Bitmaps and reverse indexes written by the repack are
+imported alongside the packs and speed up clones.
+
+**Pre-repacked.** Without `--stage`, run `git repack -a -d` and `git fsck --connectivity-only` in
+every repository of a scratch copy yourself, then import the copy. The importer refuses a
+repository that still has loose objects and says so.
+
+Either way:
+
 3. **Set the server id.** NoteDb stores every identity as `accountId@serverId`, and Gerrit resolves
    it to an account only when the id matches its own `gerrit.serverId`. Before starting a daemon on
    imported data, set the WalGerrit site's `gerrit.serverId` to the source server's; a fresh
@@ -38,6 +55,8 @@ deleted from the copy first, they are regenerated on demand.
 
 For every repository, in `--threads` repositories at a time (default 4):
 
+- with `--stage`, the repository is copied, repacked, pruned and checked first, and the copy is
+  removed afterwards even if the import fails;
 - every pack, index, bitmap and reverse index is uploaded under its original name, so a rerun
   recognises an already uploaded file by name and content and skips it; files above 64 MiB use a
   multipart upload;
@@ -65,7 +84,8 @@ review, submit and restart.
 
 ## Sizing
 
-The import moves every byte of the source over the network once; plan for that bandwidth. A node
+The import moves every byte of the source over the network once; plan for that bandwidth. Staging
+adds one local copy and one repack per repository, in `--threads` repositories at a time. A node
 that later serves the data materializes packs into its local cache on first use, so with an object
 store backend the runtime volume should hold the working set, and with a full reindex that is
 everything.

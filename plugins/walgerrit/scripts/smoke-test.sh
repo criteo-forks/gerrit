@@ -164,8 +164,8 @@ curl -fsS "${listen_url}accounts/?q=is:active&n=1" >/dev/null
 stop_daemon
 run_gerrit reindex -d "$site"
 
-# Import: a repacked bare repository from a basePath-like tree becomes a WalGerrit project through
-# the walgerrit-import program, and the daemon then serves it.
+# Import: a bare repository from a basePath-like tree, loose objects and all, becomes a WalGerrit
+# project through the walgerrit-import program's staged mode, and the daemon then serves it.
 import_source="$site/home/import-source"
 mkdir -p "$import_source/imported"
 git init -q --bare "$import_source/imported/tools.git"
@@ -174,9 +174,10 @@ git -C "$import_work" init -q
 git -C "$import_work" -c user.name=Smoke -c user.email=smoke@example.test commit -q --allow-empty -m "imported commit"
 git -C "$import_work" push -q "$import_source/imported/tools.git" HEAD:refs/heads/main
 git -C "$import_source/imported/tools.git" symbolic-ref HEAD refs/heads/main
-git -C "$import_source/imported/tools.git" repack -a -d -q
 rm -rf "$import_work"
-run_gerrit walgerrit-import -d "$site" --source "$import_source" --threads 1 --verify-closure
+run_gerrit walgerrit-import -d "$site" --source "$import_source" --stage "$site/home/import-stage" \
+  --threads 1 --verify-closure
+test ! -e "$site/home/import-stage/imported/tools.git"
 test -f "$site/data/walgerrit/manifests/imported/tools.git/manifest.pb"
 import_log="$site/logs/walgerrit-import-smoke.log"
 start_daemon "$import_log"

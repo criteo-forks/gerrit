@@ -121,11 +121,13 @@ Existing repositories are brought in with the `walgerrit-import` program, which 
 bare repositories as they are, one manifest per repository, and verifies every ref afterwards:
 
 ```bash
-java -jar gerrit.war walgerrit-import -d "$site" --source /backup/git --threads 8
+java -jar gerrit.war walgerrit-import -d "$site" --source /backup/git --stage /scratch --threads 8
 ```
 
-See [Importing repositories](docs/import.md) for the preparation it expects, repacking and
-`git fsck` on a scratch copy and the source server's `gerrit.serverId`, and for how a run resumes.
+With `--stage` each repository is copied, repacked and checked with git before it is uploaded, so
+the source may be a read-only mount and scratch space is needed for a few repositories at a time,
+not the whole site. See [Importing repositories](docs/import.md) for the survey script, the source
+server's `gerrit.serverId`, and how a run resumes.
 
 Build the fork WAR from the repository root, then run the fresh-site integration test:
 

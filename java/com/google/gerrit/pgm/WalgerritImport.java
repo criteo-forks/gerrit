@@ -44,6 +44,14 @@ public class WalgerritImport extends SiteProgram {
   private String source;
 
   @Option(
+      name = "--stage",
+      metaVar = "DIR",
+      usage =
+          "copy each repository here, repack, prune and fsck it with git, import the copy and"
+              + " delete it (default: import the source as it is)")
+  private String stage;
+
+  @Option(
       name = "--project",
       metaVar = "NAME",
       usage = "import only this project; repeatable (default: every repository found)")
@@ -69,7 +77,12 @@ public class WalgerritImport extends SiteProgram {
       GitRepositoryManager repositories = dbInjector.getInstance(GitRepositoryManager.class);
       Class<?> importer = Class.forName(IMPORTER, true, Thread.currentThread().getContextClassLoader());
       Method entry = importer.getMethod("run", GitRepositoryManager.class, String[].class);
-      List<String> importerArgs = new ArrayList<>(List.of("--source", source, "--threads", Integer.toString(threads)));
+      List<String> importerArgs =
+          new ArrayList<>(List.of("--source", source, "--threads", Integer.toString(threads)));
+      if (stage != null) {
+        importerArgs.add("--stage");
+        importerArgs.add(stage);
+      }
       for (String project : projects) {
         importerArgs.add("--project");
         importerArgs.add(project);

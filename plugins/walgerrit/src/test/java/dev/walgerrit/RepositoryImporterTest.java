@@ -149,6 +149,63 @@ class RepositoryImporterTest {
   }
 
   @Test
+  void stagingRepacksACopyAndLeavesTheSourceUntouched() throws Exception {
+    org.junit.jupiter.api.Assumptions.assumeTrue(gitAvailable(), "git is not on the PATH");
+    Path source = root.resolve("basePath");
+    Map<String, ObjectId> expected = new TreeMap<>();
+    try (Repository bare = createBare(source.resolve("staged.git"))) {
+      expected.put(Constants.R_HEADS + "main", commitAndRef(bare, Constants.R_HEADS + "main", "loose"));
+      expected.put("refs/changes/02/2/1", commitAndRef(bare, "refs/changes/02/2/1", "also loose"));
+      // Not repacked: loose objects and loose refs, as a backup of a serving repository has.
+    }
+    Path looseDirectory = source.resolve("staged.git/objects");
+    long looseBefore = countLooseObjects(looseDirectory);
+    assertTrue(looseBefore > 0);
+    Path stage = root.resolve("stage");
+    WalGitRepositoryManager manager = manager("node-a");
+    RepositoryImporter importer =
+        new RepositoryImporter(manager, new PrintStream(System.out), true, stage);
+
+    Report report = importer.importAll(source, Set.of(), 1);
+
+    assertTrue(report.ok(), report.failures().toString());
+    assertEquals(1, report.imported());
+    assertEquals(looseBefore, countLooseObjects(looseDirectory), "the source is not rewritten");
+    assertTrue(
+        !Files.exists(stage.resolve("staged.git")), "the staged copy is removed after the import");
+    try (Repository imported = manager.openRepository(Project.nameKey("staged"))) {
+      for (Map.Entry<String, ObjectId> ref : expected.entrySet()) {
+        assertEquals(ref.getValue(), imported.exactRef(ref.getKey()).getObjectId(), ref.getKey());
+        assertEquals(Constants.OBJ_COMMIT, imported.open(ref.getValue()).getType());
+      }
+    }
+    Manifest manifest = manager.storage().manifestStore(Project.nameKey("staged")).refresh();
+    assertEquals(1, manifest.getPacksList().stream().filter(CompactionPolicy::isObjectPack).count(), "git repack -a produced one pack");
+  }
+
+  private static boolean gitAvailable() {
+    try {
+      return new ProcessBuilder("git", "--version").redirectErrorStream(true).start().waitFor() == 0;
+    } catch (IOException | InterruptedException exception) {
+      return false;
+    }
+  }
+
+  private static long countLooseObjects(Path objects) throws IOException {
+    long count = 0;
+    try (java.util.stream.Stream<Path> fanout = Files.list(objects)) {
+      for (Path directory : (Iterable<Path>) fanout::iterator) {
+        if (directory.getFileName().toString().length() == 2 && Files.isDirectory(directory)) {
+          try (java.util.stream.Stream<Path> loose = Files.list(directory)) {
+            count += loose.count();
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  @Test
   void importsOnlyTheRequestedProjectsAndFailsOnUnknownOnes() throws Exception {
     Path source = root.resolve("basePath");
     for (String name : new String[] {"a", "b"}) {
