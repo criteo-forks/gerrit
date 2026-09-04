@@ -75,9 +75,10 @@ public final class IndexCursorSeeder {
     NavigableMap<Project.NameKey, String> heads = repositories.storage().listManifestVersions();
     for (Map.Entry<Project.NameKey, String> head : heads.entrySet()) {
       ManifestStore manifestStore = repositories.storage().manifestStore(head.getKey());
-      Manifest manifest = manifestStore.currentOrRefresh(head.getValue()).manifest();
+      ManifestCache.VersionedManifest versioned = manifestStore.currentOrRefresh(head.getValue());
+      Manifest manifest = versioned.manifest();
       new IndexCursorStore(manifestStore.indexCursorPath())
-          .write(manifest.getHeadSeq(), manifest.getHeadTransactionId());
+          .write(manifest.getHeadSeq(), manifest.getHeadTransactionId(), versioned.version());
     }
     out.printf(
         Locale.ROOT,

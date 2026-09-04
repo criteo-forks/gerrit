@@ -250,13 +250,23 @@ final class IndexEventTailer implements LifecycleListener {
    */
   int catchUp(Project.NameKey project, String listedVersion) throws IOException {
     ManifestStore manifestStore = repositories.storage().manifestStore(project);
+    IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
+    IndexCursor cursor = cursorStore.read();
+    if (listedVersion != null
+        && !cursor.getManifestVersion().isEmpty()
+        && cursor.getManifestVersion().equals(listedVersion)) {
+      // The cursor reached the head of exactly the manifest the listing reports: nothing was
+      // published since, so there is nothing to read or replay. This is what lets a restarted
+      // node's first sweep cost one listing rather than one read per repository.
+      manifestStore.noteListedVersion(listedVersion);
+      caughtUpVersions.put(project, listedVersion);
+      return 0;
+    }
     VersionedManifest versioned =
         listedVersion == null
             ? manifestStore.refreshVersionedManifest()
             : manifestStore.currentOrRefresh(listedVersion);
     Manifest manifest = versioned.manifest();
-    IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
-    IndexCursor cursor = cursorStore.read();
 
     List<LogEntry> entries =
         manifestStore.readLogEntriesAfter(
@@ -287,6 +297,11 @@ final class IndexEventTailer implements LifecycleListener {
           cursor.getSequence(),
           manifest.getHeadSeq(),
           applied);
+    }
+    if (!entries.isEmpty() || !versioned.version().equals(cursor.getManifestVersion())) {
+      // At the head now; remember which manifest version that is.
+      cursorStore.write(
+          manifest.getHeadSeq(), manifest.getHeadTransactionId(), versioned.version());
     }
     // Record the version of the manifest that was actually replayed, never a newer one another
     // handle may have cached meanwhile: the next listing must not skip entries this node has not
@@ -330,12 +345,13 @@ final class IndexEventTailer implements LifecycleListener {
     for (Map.Entry<Project.NameKey, String> head :
         repositories.storage().listManifestVersions().entrySet()) {
       ManifestStore manifestStore = repositories.storage().manifestStore(head.getKey());
-      Manifest manifest = manifestStore.currentOrRefresh(head.getValue()).manifest();
+      VersionedManifest versioned = manifestStore.currentOrRefresh(head.getValue());
       seeds.put(
           head.getKey(),
           IndexCursor.newBuilder()
-              .setSequence(manifest.getHeadSeq())
-              .setTransactionId(manifest.getHeadTransactionId())
+              .setSequence(versioned.manifest().getHeadSeq())
+              .setTransactionId(versioned.manifest().getHeadTransactionId())
+              .setManifestVersion(versioned.version())
               .build());
     }
 
@@ -344,7 +360,10 @@ final class IndexEventTailer implements LifecycleListener {
 
     for (Map.Entry<Project.NameKey, IndexCursor> seed : seeds.entrySet()) {
       new IndexCursorStore(repositories.storage().manifestStore(seed.getKey()).indexCursorPath())
-          .write(seed.getValue().getSequence(), seed.getValue().getTransactionId());
+          .write(
+              seed.getValue().getSequence(),
+              seed.getValue().getTransactionId(),
+              seed.getValue().getManifestVersion());
     }
     caughtUpVersions.clear();
     logger.info(

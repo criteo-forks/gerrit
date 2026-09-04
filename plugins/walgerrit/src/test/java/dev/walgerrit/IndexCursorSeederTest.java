@@ -78,6 +78,10 @@ class IndexCursorSeederTest {
         new IndexCursorStore(fresh.storage().manifestStore(project).indexCursorPath()).read();
     assertEquals(head.getHeadSeq(), cursor.getSequence());
     assertEquals(head.getHeadTransactionId(), cursor.getTransactionId());
+    assertEquals(
+        fresh.storage().listManifestVersions().get(project),
+        cursor.getManifestVersion(),
+        "the cursor names the manifest version it is at, so a sweep can skip the read");
     assertEquals(0, tailer.catchUp(project), "nothing to replay at the seeded head");
 
     try (Repository repository = writer.openRepository(project)) {

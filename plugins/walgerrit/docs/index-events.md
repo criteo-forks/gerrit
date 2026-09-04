@@ -136,8 +136,11 @@ per repository that did.
 
 This is the only mechanism by which a node learns about other nodes' writes, so
 `indexPollInterval` is the cross-node search convergence latency. S3 lists are strongly consistent,
-so a manifest published anywhere appears in the next listing. A node that restarts forgets what it
-had caught up to and reads every manifest once during its startup sweep, exactly as before.
+so a manifest published anywhere appears in the next listing. Each cursor also records the version
+of the manifest whose head it reached, so a restarted node's first sweep reads only the manifests
+whose listed version differs from what its cursors name: one listing for a quiet site, rather than
+one conditional read per repository (which took about eight minutes for 4,400 repositories from a
+cluster 100 ms away from its bucket).
 
 Cursor's design adds gossip between replicas as a latency optimization on top of the same kind of
 conditional check. WalGerrit does not need it while a sweep costs a handful of requests; if

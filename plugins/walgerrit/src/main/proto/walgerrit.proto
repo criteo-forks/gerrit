@@ -97,6 +97,11 @@ message IndexCursor {
   uint64 sequence = 1;
   // transaction_id of the entry at sequence; empty at sequence 0.
   string transaction_id = 2;
+  // Object-store version (the ETag) of the manifest whose head this cursor
+  // reached, when the cursor is at that head; empty when unknown. A listing
+  // that reports the same version means nothing was published since, so a
+  // restarted node need not read the manifest to know it is caught up.
+  string manifest_version = 3;
 }
 
 // Stored at leases/<repo>.git/compaction. Holding it only avoids duplicate

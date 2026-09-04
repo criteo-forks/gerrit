@@ -44,11 +44,20 @@ final class IndexCursorStore {
   }
 
   void write(long sequence, String transactionId) throws IOException {
+    write(sequence, transactionId, "");
+  }
+
+  /**
+   * Writes the cursor; {@code manifestVersion} names the manifest whose head {@code sequence} is,
+   * or is empty while replay is still short of the head.
+   */
+  void write(long sequence, String transactionId, String manifestVersion) throws IOException {
     Files.createDirectories(path.getParent());
     byte[] bytes =
         IndexCursor.newBuilder()
             .setSequence(sequence)
             .setTransactionId(transactionId == null ? "" : transactionId)
+            .setManifestVersion(manifestVersion == null ? "" : manifestVersion)
             .build()
             .toByteArray();
     Path temporary =

@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
+import dev.walgerrit.proto.StorageProto.IndexCursor;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -229,6 +230,44 @@ class ManifestReadCountTest {
     always.openRepository(project).close();
     always.openRepository(project).close();
     assertEquals(2, store.manifestReads(), "an interval of 0 keeps every open revalidating");
+  }
+
+  @Test
+  void aRestartedNodeSweepsWithoutReadingManifestsItsCursorsAlreadyName() throws Exception {
+    CountingObjectStore store = new CountingObjectStore(new FileObjectStore(root.resolve("bucket")));
+    WalGitRepositoryManager node = manager(store, "0");
+    Project.NameKey project = Project.nameKey("platform/budget");
+    node.createRepository(project).close();
+    try (Repository repository = node.openRepository(project)) {
+      ObjectId tip = insertChain(repository, 1);
+      RefUpdate update = repository.updateRef(Constants.R_HEADS + "main");
+      update.setNewObjectId(tip);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+    }
+    IndexEventApplier nothing = (ignoredProject, transaction) -> {};
+    new IndexEventTailer(node, nothing, GerritRuntime.DAEMON).runOnce();
+    IndexCursor cursor =
+        new IndexCursorStore(node.storage().manifestStore(project).indexCursorPath()).read();
+    assertEquals(node.storage().listManifestVersions().get(project), cursor.getManifestVersion());
+
+    store.reset();
+    // A new tailer is what a restarted daemon has: no memory of what it caught up to.
+    new IndexEventTailer(node, nothing, GerritRuntime.DAEMON).runOnce();
+    assertEquals(0, store.manifestReads(), "the listing alone proves the cursor is at the head");
+
+    try (Repository repository = node.openRepository(project)) {
+      ObjectId tip = insertChain(repository, 1);
+      RefUpdate update = repository.updateRef(Constants.R_HEADS + "next");
+      update.setNewObjectId(tip);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+    }
+    store.reset();
+    AtomicLong replayed = new AtomicLong();
+    new IndexEventTailer(
+            node, (ignoredProject, transaction) -> replayed.incrementAndGet(), GerritRuntime.DAEMON)
+        .runOnce();
+    assertEquals(1, replayed.get(), "the changed repository is replayed");
+    assertEquals(0, store.manifestReads(), "from the manifest this node itself published");
   }
 
   private WalGitRepositoryManager manager(ObjectStore store, String revalidateInterval) {
