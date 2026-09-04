@@ -112,3 +112,13 @@ message CompactionLease {
   string owner = 1;
   int64 expires_at_epoch_millis = 2;
 }
+
+// Sidecar <name>.chunks beside a cached pack that is being fetched in
+// chunks: which chunks of the sparse local file hold store bytes. The
+// sidecar's absence is what marks a cached file complete.
+message PartialFile {
+  uint64 size = 1;
+  uint32 chunk_size = 2;
+  // A java.util.BitSet of present chunks, little-endian as BitSet writes it.
+  bytes present = 3;
+}

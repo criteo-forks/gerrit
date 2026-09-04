@@ -46,7 +46,10 @@ final class StorageLayout {
   private final String repositoriesPrefix;
   private final String leasesPrefix;
   private final boolean cacheIsStore;
+  private final long packFetchChunkSize;
   private final ManifestCache manifestCache = new ManifestCache();
+  private final java.util.concurrent.ConcurrentHashMap<Path, ChunkedFile> chunkedFiles =
+      new java.util.concurrent.ConcurrentHashMap<>();
   private final RepositoryLocks repositoryLocks = new RepositoryLocks();
   private volatile BiConsumer<Project.NameKey, Manifest> publicationListener = (name, manifest) -> {};
 
@@ -55,7 +58,21 @@ final class StorageLayout {
   }
 
   StorageLayout(ObjectStore objectStore, Path cacheRoot, Path indexCursorRoot, String prefix) {
+    this(objectStore, cacheRoot, indexCursorRoot, prefix, 0);
+  }
+
+  /**
+   * @param packFetchChunkSize chunk size for fetching large packs on demand as they are read, or 0
+   *     to fetch every pack whole
+   */
+  StorageLayout(
+      ObjectStore objectStore,
+      Path cacheRoot,
+      Path indexCursorRoot,
+      String prefix,
+      long packFetchChunkSize) {
     this.objectStore = objectStore;
+    this.packFetchChunkSize = packFetchChunkSize;
     cacheRepositoriesPath =
         cacheRoot.resolve(REPOSITORIES_DIRECTORY).toAbsolutePath().normalize();
     indexCursorRepositoriesPath =
@@ -107,6 +124,8 @@ final class StorageLayout {
         manifest -> publicationListener.accept(name, manifest),
         manifestCache,
         repositoryLocks,
+        chunkedFiles,
+        packFetchChunkSize,
         manifestPrefix,
         cacheIsStore);
   }

@@ -175,6 +175,19 @@ reference counting) and the six `RefUpdateContext` cases in `git:DirectPushRefUp
 `git:HttpSubmitOnPushIT` and `git:SshSubmitOnPushIT` (the `RefUpdateContextCollector`). Everything
 else in the suite passes on WalGerrit.
 
+## Reading packs on a cold node
+
+A pack is fetched from the store the first time a node reads it. Packs no larger than
+`walgerrit.packFetchChunkSize` (default `8m`), and every index, bitmap and reftable, are downloaded
+whole. A larger pack is fetched in chunks of that size as JGit reads it, into a sparse local file
+with its final name plus a `.chunks` sidecar naming the chunks present; the sidecar disappears with
+the last chunk, and a file without one is complete by contract. A cold node opening a change in a
+multi-gigabyte repository therefore pays for the index and the few chunks the change touches, not
+for the pack, and a clone's sequential read turns JGit's read-ahead into one request per run of
+chunks. Anything that needs a whole pack, such as compaction, completes it first.
+`walgerrit.rangedPackReads = false` fetches every pack whole, as the local backend (whose cache is
+the store) always does.
+
 ## Storage model
 
 For every repository, WalGerrit writes:

@@ -61,6 +61,11 @@ final class PrefixedObjectStore implements ObjectStore {
   }
 
   @Override
+  public byte[] getRange(String key, long offset, int length) throws IOException {
+    return delegate.getRange(full(key), offset, length);
+  }
+
+  @Override
   public void delete(String key) throws IOException {
     delegate.delete(full(key));
   }

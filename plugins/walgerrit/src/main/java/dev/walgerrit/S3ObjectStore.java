@@ -426,6 +426,37 @@ final class S3ObjectStore implements ObjectStore, AutoCloseable {
     }
   }
 
+  /** One ranged GET; the SDK's retries apply to it like to any other read. */
+  @Override
+  public byte[] getRange(String key, long offset, int length) throws IOException {
+    if (offset < 0 || length <= 0) {
+      throw new IOException("Range beyond object: " + key);
+    }
+    try {
+      ResponseBytes<GetObjectResponse> response =
+          client.getObject(
+              GetObjectRequest.builder()
+                  .bucket(bucket)
+                  .key(key)
+                  .range("bytes=" + offset + "-" + (offset + length - 1))
+                  .build(),
+              ResponseTransformer.toBytes());
+      byte[] bytes = response.asByteArray();
+      if (bytes.length != length) {
+        throw new IOException(
+            "S3 range read of " + key + " returned " + bytes.length + " bytes, wanted " + length);
+      }
+      return bytes;
+    } catch (S3Exception exception) {
+      if (exception.statusCode() == NOT_FOUND) {
+        throw new IOException("Object not found: " + key, exception);
+      }
+      throw io("range read", key, exception);
+    } catch (RuntimeException exception) {
+      throw io("range read", key, exception);
+    }
+  }
+
   @Override
   public void download(String key, Path target) throws IOException {
     Files.createDirectories(target.getParent());

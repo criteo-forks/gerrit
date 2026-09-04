@@ -69,6 +69,8 @@ final class ManifestStore {
   private final Path indexCursorPath;
   private final Path stagingPath;
   private final Path walPath;
+  private final java.util.concurrent.ConcurrentMap<Path, ChunkedFile> chunkedFiles;
+  private final long packFetchChunkSize;
   private final String repositoryName;
   private final Clock clock;
   private final Consumer<Manifest> afterPublish;
@@ -93,6 +95,8 @@ final class ManifestStore {
         ignored -> {},
         new ManifestCache(),
         new RepositoryLocks(),
+        new java.util.concurrent.ConcurrentHashMap<>(),
+        0,
         repositoryName,
         objectStore instanceof FileObjectStore files
             && files.root().equals(repositoryPath.toAbsolutePath().normalize()));
@@ -104,6 +108,10 @@ final class ManifestStore {
    *     listable prefix
    * @param afterPublish sees every manifest this store publishes, after the CAS; the compactor
    *     evaluates its policy there
+   * @param chunkedFiles the node-wide registry of packs being fetched in chunks, shared so that
+   *     every handle of a pack reads through one sparse file
+   * @param packFetchChunkSize chunk size for fetching packs larger than one chunk on demand; 0
+   *     fetches every pack whole
    * @param cacheIsStore whether the cache directory is the store itself, so cached files are the
    *     only copies and eviction must leave them alone
    */
@@ -117,8 +125,12 @@ final class ManifestStore {
       Consumer<Manifest> afterPublish,
       ManifestCache cache,
       RepositoryLocks locks,
+      java.util.concurrent.ConcurrentMap<Path, ChunkedFile> chunkedFiles,
+      long packFetchChunkSize,
       String cacheKey,
       boolean cacheIsStore) {
+    this.chunkedFiles = chunkedFiles;
+    this.packFetchChunkSize = packFetchChunkSize;
     this.objectStore = objectStore;
     this.manifestObjects = manifestObjects;
     this.repositoryPath = repositoryPath.toAbsolutePath().normalize();
@@ -414,13 +426,74 @@ final class ManifestStore {
     return stagingPath.resolve(fileName);
   }
 
+  /**
+   * The whole immutable file in the local cache, materialised if need be: a pack being fetched in
+   * chunks is completed first, so callers that need every byte, such as compaction, see one.
+   */
   Path immutableFile(String fileName) throws IOException {
     createCacheDirectories();
     Path target = walPath.resolve(fileName);
-    if (!Files.isRegularFile(target)) {
-      objectStore.download(WAL_DIRECTORY + "/" + fileName, target);
+    if (Files.isRegularFile(target)) {
+      if (Files.exists(ChunkedFile.sidecarFor(target))) {
+        chunked(fileName, Files.size(target)).fetchAll();
+        chunkedFiles.remove(target);
+      }
+      return target;
     }
+    objectStore.download(WAL_DIRECTORY + "/" + fileName, target);
     return target;
+  }
+
+  /** Whether packs above one chunk are fetched on demand as they are read. */
+  boolean fetchesPacksInChunks() {
+    return packFetchChunkSize > 0 && !cacheIsStore;
+  }
+
+  /**
+   * A channel over a pack for JGit. A pack already whole in the cache, or one no larger than a
+   * chunk, or any pack when chunked fetching is off, is the local file; a larger pack not yet
+   * cached is fetched in chunks as JGit reads it, so a cold node pays for the bytes it needs
+   * rather than for the pack. {@code size} is the pack's size as the manifest records it; 0 when
+   * unknown falls back to fetching the whole pack.
+   */
+  org.eclipse.jgit.internal.storage.dfs.ReadableChannel openPackChannel(
+      String fileName, long size) throws IOException {
+    createCacheDirectories();
+    Path target = walPath.resolve(fileName);
+    if (Files.isRegularFile(target) && !Files.exists(ChunkedFile.sidecarFor(target))) {
+      return new FileReadableChannel(target);
+    }
+    if (!fetchesPacksInChunks() || size <= packFetchChunkSize) {
+      return new FileReadableChannel(immutableFile(fileName));
+    }
+    return new RangedReadableChannel(chunked(fileName, size));
+  }
+
+  private ChunkedFile chunked(String fileName, long size) throws IOException {
+    Path target = walPath.resolve(fileName);
+    String key = WAL_DIRECTORY + "/" + fileName;
+    ChunkedFile existing = chunkedFiles.get(target);
+    if (existing != null && !existing.exists()) {
+      // Trimmed from the cache while registered; start over rather than read an unlinked file.
+      chunkedFiles.remove(target, existing);
+    }
+    try {
+      return chunkedFiles.computeIfAbsent(
+          target,
+          path -> {
+            try {
+              return ChunkedFile.open(
+                  path,
+                  size,
+                  (int) packFetchChunkSize,
+                  (offset, length) -> objectStore.getRange(key, offset, length));
+            } catch (IOException exception) {
+              throw new java.io.UncheckedIOException(exception);
+            }
+          });
+    } catch (java.io.UncheckedIOException exception) {
+      throw exception.getCause();
+    }
   }
 
   void publishImmutableFile(String fileName) throws IOException {
@@ -430,11 +503,15 @@ final class ManifestStore {
     objectStore.uploadIfAbsent(key, source);
 
     Path target = walPath.resolve(fileName);
-    if (Files.isRegularFile(target)) {
+    Path sidecar = ChunkedFile.sidecarFor(target);
+    if (Files.isRegularFile(target) && !Files.exists(sidecar)) {
       Files.deleteIfExists(source);
       return;
     }
+    // A pack being fetched in chunks is replaced by the whole file this node just wrote.
+    chunkedFiles.remove(target);
     moveAtomic(source, target);
+    Files.deleteIfExists(sidecar);
     forceDirectory(walPath);
   }
 
@@ -485,15 +562,32 @@ final class ManifestStore {
     try (Stream<Path> files = Files.list(walPath)) {
       for (Path file : (Iterable<Path>) files::iterator) {
         String name = file.getFileName().toString();
-        if (live.contains(name) || !Files.isRegularFile(file)) {
+        if (!Files.isRegularFile(file)) {
+          continue;
+        }
+        if (ChunkedFile.isSidecar(name)) {
+          // Goes with its data file: kept while that is live, removed with it, or alone when the
+          // data is already gone. Never removed before the data, which would make it look whole.
+          if (live.contains(ChunkedFile.dataNameOf(name))
+              || Files.exists(file.resolveSibling(ChunkedFile.dataNameOf(name)))) {
+            continue;
+          }
+          if (Files.deleteIfExists(file)) {
+            evicted++;
+          }
+          continue;
+        }
+        if (live.contains(name)) {
           continue;
         }
         if (Files.getLastModifiedTime(file).toMillis() > youngest) {
           continue;
         }
+        chunkedFiles.remove(file);
         if (Files.deleteIfExists(file)) {
           evicted++;
         }
+        Files.deleteIfExists(ChunkedFile.sidecarFor(file));
       }
     }
     return evicted;

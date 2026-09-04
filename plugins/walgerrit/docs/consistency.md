@@ -58,6 +58,15 @@ request that starts afterwards on any node, and a ref transaction never validate
 older than its own start. Within one request, reads are a consistent snapshot rather than a live
 feed of other nodes' writes.
 
+## Local disk is a cache
+
+Every immutable file a node reads lives in the store; the local copy is a cache the node may lose at
+any time. Whole files are materialised atomically (temporary file, fsync, rename). A pack fetched
+in chunks is a sparse file at its final name plus a `<name>.chunks` sidecar; the data of a chunk is
+written and forced before the sidecar records it, and the sidecar is removed only after the last
+chunk, so a file without a sidecar is complete and a crash can lose no more than the chunk in
+flight. Eviction and trimming treat the pair as one file and never remove the sidecar first.
+
 ## Compaction
 
 Compaction changes how a repository is stored, never what it contains. A compacted pack holds the

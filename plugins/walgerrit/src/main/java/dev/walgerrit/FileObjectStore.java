@@ -142,6 +142,31 @@ final class FileObjectStore implements ObjectStore {
   }
 
   @Override
+  public byte[] getRange(String key, long offset, int length) throws IOException {
+    Path source = resolve(key);
+    if (!Files.isRegularFile(source)) {
+      throw new IOException("Object not found: " + key);
+    }
+    if (offset < 0 || length < 0 || offset + length > Files.size(source)) {
+      throw new IOException("Range beyond object: " + key);
+    }
+    byte[] bytes = new byte[length];
+    try (java.nio.channels.FileChannel channel =
+        java.nio.channels.FileChannel.open(source, java.nio.file.StandardOpenOption.READ)) {
+      java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+      long position = offset;
+      while (buffer.hasRemaining()) {
+        int read = channel.read(buffer, position);
+        if (read < 0) {
+          throw new IOException("Object shorter than its size: " + key);
+        }
+        position += read;
+      }
+    }
+    return bytes;
+  }
+
+  @Override
   public void download(String key, Path target) throws IOException {
     Path source = resolve(key);
     if (source.equals(target.toAbsolutePath().normalize())) {

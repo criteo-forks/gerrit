@@ -82,6 +82,20 @@ interface ObjectStore {
   void download(String key, Path target) throws IOException;
 
   /**
+   * Bytes {@code [offset, offset + length)} of {@code key}. Object stores answer this with one
+   * range read; the fallback reads the whole object. Missing keys and ranges beyond the object
+   * are errors.
+   */
+  default byte[] getRange(String key, long offset, int length) throws IOException {
+    StoredObject object =
+        get(key).orElseThrow(() -> new IOException("Object not found: " + key));
+    if (offset < 0 || length < 0 || offset + length > object.bytes().length) {
+      throw new IOException("Range beyond object: " + key);
+    }
+    return java.util.Arrays.copyOfRange(object.bytes(), (int) offset, (int) (offset + length));
+  }
+
+  /**
    * Removes {@code key}; a missing key is not an error. On a versioned bucket this leaves a delete
    * marker, so the data stays recoverable for the bucket's non-current-version retention.
    */

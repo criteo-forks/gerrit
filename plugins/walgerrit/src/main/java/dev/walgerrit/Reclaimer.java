@@ -162,6 +162,9 @@ final class Reclaimer {
         if (!Files.isRegularFile(path) || !WAL_DIRECTORY.equals(path.getParent().getFileName().toString())) {
           continue;
         }
+        if (ChunkedFile.isSidecar(path.getFileName().toString())) {
+          continue; // goes with its data file, below
+        }
         long size = Files.size(path);
         long modified = Files.getLastModifiedTime(path).toMillis();
         total += size;
@@ -183,6 +186,7 @@ final class Reclaimer {
       if (Files.deleteIfExists(file.path())) {
         freed += file.size();
       }
+      Files.deleteIfExists(ChunkedFile.sidecarFor(file.path()));
     }
     logger.info(
         "WalGerrit trimmed {} bytes from the local cache to stay under {} bytes", freed, cacheSizeLimit);

@@ -49,7 +49,9 @@ record WalGitConfiguration(
     boolean reclaimEnabled,
     Duration reclaimGrace,
     Duration reclaimInterval,
-    long cacheSizeLimit) {
+    long cacheSizeLimit,
+    boolean rangedPackReads,
+    long packFetchChunkSize) {
   /**
    * Longest time an open repository handle serves reads without another conditional manifest
    * read. Every handle also revalidates when it starts a ref transaction, and when it is opened
@@ -60,6 +62,13 @@ record WalGitConfiguration(
 
   /** Entries a node replays into its indexes at most before rebuilding them from scratch instead. */
   static final long DEFAULT_INDEX_REPLAY_LIMIT = 10_000;
+
+  /**
+   * Size of the chunks in which a pack larger than one chunk is fetched from the store as it is
+   * read, when {@code rangedPackReads} is on. Smaller packs, and every index, bitmap and reftable,
+   * are fetched whole.
+   */
+  static final long DEFAULT_PACK_FETCH_CHUNK_SIZE = 8L << 20;
 
   /** Pooled HTTP connections to S3 per node; a write is several requests and reads run in parallel. */
   static final int DEFAULT_S3_MAX_CONNECTIONS = 64;
@@ -129,7 +138,9 @@ record WalGitConfiguration(
         true,
         DEFAULT_RECLAIM_GRACE,
         DEFAULT_RECLAIM_INTERVAL,
-        0);
+        0,
+        true,
+        DEFAULT_PACK_FETCH_CHUNK_SIZE);
   }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
@@ -164,7 +175,9 @@ record WalGitConfiguration(
             config.getBoolean(SECTION, null, "reclaimEnabled", true),
             duration(config, "reclaimGrace", DEFAULT_RECLAIM_GRACE),
             duration(config, "reclaimInterval", DEFAULT_RECLAIM_INTERVAL),
-            config.getLong(SECTION, null, "cacheSizeLimit", 0));
+            config.getLong(SECTION, null, "cacheSizeLimit", 0),
+            config.getBoolean(SECTION, null, "rangedPackReads", true),
+            config.getLong(SECTION, null, "packFetchChunkSize", DEFAULT_PACK_FETCH_CHUNK_SIZE));
     configuration.validate();
     return configuration;
   }
@@ -182,6 +195,9 @@ record WalGitConfiguration(
   }
 
   private void validate() {
+    require(
+        packFetchChunkSize >= (64L << 10) && packFetchChunkSize <= (1L << 30),
+        "packFetchChunkSize must be between 64k and 1g");
     require(backend != BackendType.S3 || (s3Bucket != null && !s3Bucket.isBlank()),
         "s3Bucket is required for the s3 backend");
     require(!s3Prefix.startsWith("/") && !s3Prefix.contains("..") && s3Prefix.indexOf('\\') < 0,

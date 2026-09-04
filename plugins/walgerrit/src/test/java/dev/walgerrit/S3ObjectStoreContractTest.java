@@ -87,6 +87,25 @@ class S3ObjectStoreContractTest {
   }
 
   @Test
+  void rangeReadsReturnExactlyTheRequestedBytes() throws Exception {
+    String prefix = "contract/" + UUID.randomUUID() + "/";
+    ObjectStore scoped = new PrefixedObjectStore(store, prefix);
+    byte[] content = new byte[3 << 20];
+    new java.util.Random(42).nextBytes(content);
+    Path source = temporaryDirectory.resolve("ranged.pack");
+    Files.write(source, content);
+    scoped.uploadIfAbsent("wal/ranged.pack", source);
+
+    assertArrayEquals(
+        java.util.Arrays.copyOfRange(content, 1_000_000, 1_004_096),
+        scoped.getRange("wal/ranged.pack", 1_000_000, 4096));
+    assertArrayEquals(
+        java.util.Arrays.copyOfRange(content, content.length - 7, content.length),
+        scoped.getRange("wal/ranged.pack", content.length - 7, 7));
+    assertThrows(java.io.IOException.class, () -> scoped.getRange("wal/missing.pack", 0, 10));
+  }
+
+  @Test
   void supportsCreateCasAndImmutableFileRoundTrip() throws Exception {
     String prefix = "contract/" + UUID.randomUUID() + "/";
     ObjectStore scoped = new PrefixedObjectStore(store, prefix);

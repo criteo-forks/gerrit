@@ -43,6 +43,8 @@ class WalGitConfigurationTest {
     assertEquals(Duration.ofSeconds(5), configuration.indexPollInterval());
     assertEquals(Duration.ofSeconds(1), configuration.manifestRevalidateInterval());
     assertTrue(configuration.manifestRevalidateOnOpen());
+    assertTrue(configuration.rangedPackReads());
+    assertEquals(8L << 20, configuration.packFetchChunkSize());
     assertEquals(10_000, configuration.indexReplayLimit());
     assertTrue(configuration.indexRebuildOnStaleCursor());
   }

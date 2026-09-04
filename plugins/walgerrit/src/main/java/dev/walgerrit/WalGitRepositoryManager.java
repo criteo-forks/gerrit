@@ -185,7 +185,8 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
               new FileObjectStore(configuration.storagePath()),
               configuration.storagePath(),
               configuration.indexCursorPath(),
-              "");
+              "",
+              configuration.rangedPackReads() ? configuration.packFetchChunkSize() : 0);
       case S3 ->
           new StorageLayout(
               new S3ObjectStore(
@@ -199,7 +200,8 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
                   configuration.s3MaxAttempts()),
               configuration.storagePath(),
               configuration.indexCursorPath(),
-              configuration.s3Prefix());
+              configuration.s3Prefix(),
+              configuration.rangedPackReads() ? configuration.packFetchChunkSize() : 0);
     };
   }
 }

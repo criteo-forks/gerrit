@@ -214,6 +214,11 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   @Override
   protected ReadableChannel openFile(DfsPackDescription description, PackExt extension)
       throws IOException {
+    if (extension == PackExt.PACK) {
+      // Only the pack itself is read piecemeal; indexes, bitmaps and reftables are read whole.
+      return manifestStore.openPackChannel(
+          description.getFileName(extension), description.getFileSize(extension));
+    }
     Path path = manifestStore.immutableFile(description.getFileName(extension));
     if (!Files.isRegularFile(path)) {
       throw new FileNotFoundException(path.toString());
