@@ -72,7 +72,7 @@ jobs:
       - name: Build Gerrit 3.14.2 release WAR
         run: npx --yes @bazel/bazelisk build --config=java21 //:release
 
-      - name: Assemble Gerrit PoC payload
+      - name: Assemble the deployment bundle
         env:
           SOURCE_COMMIT: ${{ github.sha }}
         run: |
@@ -80,17 +80,14 @@ jobs:
           cp bazel-bin/release.war dist/gerrit.war
           cp plugins/walgerrit/target/walgerrit-0.1.0-SNAPSHOT.jar dist/walgerrit.jar
           cp plugins/walgerrit/docs/artifact-bundle.md dist/INSTALL.md
-          cp plugins/walgerrit/packaging/criteo-images.Dockerfile.fragment \
-            dist/criteo-images.Dockerfile.fragment
           printf '%s\n' "$SOURCE_COMMIT" > dist/SOURCE_COMMIT
           printf '%s\n' '3.14.2' > dist/GERRIT_VERSION
           sha256sum dist/gerrit.war dist/walgerrit.jar \
             | sed 's#dist/##' > dist/SHA256SUMS
-          tar -C dist -czf dist/walgerrit-gerritpoc-bundle.tar.gz \
-            gerrit.war walgerrit.jar INSTALL.md criteo-images.Dockerfile.fragment \
-            SOURCE_COMMIT GERRIT_VERSION SHA256SUMS
+          tar -C dist -czf dist/walgerrit-bundle.tar.gz \
+            gerrit.war walgerrit.jar INSTALL.md SOURCE_COMMIT GERRIT_VERSION SHA256SUMS
 
-      - name: Exercise the exact Gerrit PoC payload
+      - name: Exercise the exact bundle
         env:
           GERRIT_WAR: ${{ github.workspace }}/dist/gerrit.war
           WALGERRIT_JAR: ${{ github.workspace }}/dist/walgerrit.jar
@@ -137,8 +134,8 @@ jobs:
             dist/SOURCE_COMMIT \
             dist/GERRIT_VERSION \
             dist/INSTALL.md \
-            dist/walgerrit-gerritpoc-bundle.tar.gz \
+            dist/walgerrit-bundle.tar.gz \
             --verify-tag \
             --prerelease \
-            --title "WalGerrit 3.14.2 PoC ${RELEASE_TAG}" \
-            --notes "Tested Gerrit PoC payload built from ${GITHUB_SHA}. The WAR and WalGerrit library must be consumed together; verify them with SHA256SUMS."
+            --title "WalGerrit 3.14.2 ${RELEASE_TAG}" \
+            --notes "Tested WalGerrit payload built from ${GITHUB_SHA}. The WAR and WalGerrit library must be consumed together; verify them with SHA256SUMS."

@@ -18,11 +18,10 @@ COPY gerrit.war /home/gerrit/gerrit.war
 COPY walgerrit.jar /home/gerrit/gerrit_site/lib/walgerrit.jar
 ```
 
-The `gerritpoc` image mounts the Gerrit site from a PVC, so a library copied there during the
-image build is hidden at runtime. Put `gerrit.war` at `/home/gerrit/gerrit.war`, stage
-`walgerrit.jar` at `/opt/gerrit/lib/walgerrit.jar`, and let the existing entrypoint copy staged
-libraries into the mounted site. If `GERRIT_LIBS` is made explicit, it must include `walgerrit`.
-The included `criteo-images.Dockerfile.fragment` shows the checksum-pinned internal Nexus form.
+An image that mounts the Gerrit site from a volume hides a library copied into the site at build
+time; stage `walgerrit.jar` outside the site and copy it into `lib/` at start-up instead. Pin the
+URLs and SHA-256 sums of both files in the image build rather than downloading a CI artifact, which
+is authenticated and expires.
 
 The site must configure both modules:
 
@@ -35,17 +34,16 @@ The site must configure both modules:
 Configure the `[walgerrit]` S3 backend and zero `commitWithin` values documented in the main
 WalGerrit README before initialization. Credentials come from the standard AWS SDK provider chain.
 
-The current PoC healthcheck, metrics and download-command plugins were built for Gerrit 3.12.2.
-Replace them with Gerrit 3.14-compatible builds, or omit them for the first image. The image build's
+Plugins built for an earlier Gerrit must be rebuilt for 3.14 or omitted. The image build's
 throwaway `init`/`reindex` smoke test must use the final WAR, library and selected plugins. Prefer
 an exec readiness probe for
 `/home/gerrit/gerrit_site/data/walgerrit-index-events/READY`; an HTTP version response only proves
 that Gerrit's web server is running, not that the local Lucene indexes have caught up.
 
-Use a new site volume, S3 prefix, and node-local index cursor for the first deployment. Gerrit
-3.12 sites and plugins must be upgraded separately; do not place this bundle over an existing 3.12
+Use a new site volume, S3 prefix, and node-local index cursor for the first deployment. Sites and
+plugins from an earlier Gerrit must be upgraded separately; do not place this bundle over an existing
 site without a tested backup, migration, reindex, and rollback procedure.
 
-GitHub Actions artifacts are a temporary handoff, not a durable `criteo-images` dependency. Publish
-the verified payload to an approved internal Nexus Maven or Raw repository under an immutable
-version/commit path, then pin its URLs and both checksums in `containers/criteo-images`.
+GitHub Actions artifacts are a temporary handoff. Publish the verified payload to an artifact
+repository under an immutable version or commit path and pin its URLs and both checksums in the
+image build. Site-specific packaging belongs with the operator, not in this repository.
