@@ -86,12 +86,23 @@ repository is retried after its source was fixed.
 
 ## After the import
 
-Run an offline `reindex` against the site before any daemon starts; the import publishes no ref
-transactions, so a node that starts against the new prefix considers itself caught up with
-whatever index it finds. For a large site, run that reindex with a generous heap and a relaxed
-`commitWithin`, then set `commitWithin = 0` back before starting daemons, which is when the
-index-event tailer checks it. Then point the deployment at the prefix, log in, clone, search,
-review, submit and restart.
+Run an offline `reindex` against the site before any daemon starts, then
+
+```bash
+java -jar gerrit.war walgerrit-mark-indexed -d "$site"
+```
+
+which records on that node that its indexes reflect the current head of every repository. Without
+it the daemon treats a repository without a cursor as never indexed; the import publishes no ref
+transaction, so as soon as anything has been written to an imported repository (the schema
+migration `init` runs on All-Projects and All-Users is enough) its log cannot be replayed from the
+start, and the daemon rebuilds every index on startup with one thread per index and its own
+configuration. For a large site, run the reindex with a generous heap, a relaxed `commitWithin`,
+`walgerrit.manifestRevalidateOnOpen = false` and Gerrit's persistent caches on scratch space
+(`cache.directory`); computing every change's diffs fills them by tens of gigabytes, and they are
+never pruned outside the daemon. Set `commitWithin = 0` back before starting daemons, which is
+when the index-event tailer checks it. Then point the deployment at the prefix, log in, clone,
+search, review, submit and restart.
 
 ## Sizing
 

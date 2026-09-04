@@ -82,7 +82,9 @@ meant for offline programs such as `reindex`, which open a repository several ti
 and for single-node sites, whose own writes keep the view current.
 
 Daemon startup synchronously catches every node-local index cursor up to a freshly read manifest
-before Gerrit's SSH and HTTP listeners start. A successful full sweep publishes the gauge
+before Gerrit's SSH and HTTP listeners start. After an offline `reindex`, `walgerrit-mark-indexed`
+seeds those cursors at the current heads so the daemon replays only what is published afterwards
+instead of rebuilding every index (see [Import](docs/import.md#after-the-import)). A successful full sweep publishes the gauge
 `walgerrit/index_events/ready` and creates `<indexCursorPath>/READY`; a later failed sweep or orderly
 shutdown revokes both. A Kubernetes readiness probe should require that marker and a successful
 request to the local Gerrit listener, so a marker left by a hard kill cannot make an early-starting
