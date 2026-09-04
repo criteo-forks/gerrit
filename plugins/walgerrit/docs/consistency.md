@@ -39,7 +39,9 @@ Local disk and JGit memory state are caches; the manifest in the object store is
 handle establishes freshness with one conditional read of the manifest, using the newest version
 this node has observed as the `If-None-Match` token, at these points:
 
-1. when `GitRepositoryManager` opens or creates the repository;
+1. when `GitRepositoryManager` opens or creates the repository (with
+   `walgerrit.manifestRevalidateOnOpen = false`, an open reuses the node's view when it was
+   validated less than `manifestRevalidateInterval` ago; see the README for when that is safe);
 2. when a ref transaction begins, before JGit validates expected old values;
 3. when a caller asks for `scanForRepoChanges`;
 4. at most once per `walgerrit.manifestRevalidateInterval` within a long-lived handle (`0`

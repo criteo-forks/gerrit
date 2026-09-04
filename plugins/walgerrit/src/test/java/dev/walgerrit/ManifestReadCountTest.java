@@ -15,6 +15,7 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
@@ -171,11 +172,61 @@ class ManifestReadCountTest {
     assertEquals(0, store.writes());
   }
 
+  @Test
+  void opensReuseTheNodeViewWhenRevalidateOnOpenIsOff() throws Exception {
+    CountingObjectStore store = new CountingObjectStore(new FileObjectStore(root.resolve("bucket")));
+    WalGitRepositoryManager writer = manager(store, "1 h", true, "writer");
+    WalGitRepositoryManager batch = manager(store, "1 h", false, "batch");
+    Project.NameKey project = Project.nameKey("platform/budget");
+    writer.createRepository(project).close();
+    store.reset();
+
+    batch.openRepository(project).close();
+    assertEquals(1, store.manifestReads(), "the first open on a node reads once");
+    store.reset();
+    for (int i = 0; i < 5; i++) {
+      batch.openRepository(project).close();
+    }
+    assertEquals(0, store.manifestReads(), "opens within the interval reuse the node's view");
+
+    ObjectId tip;
+    try (Repository repository = writer.openRepository(project)) {
+      tip = insertChain(repository, 1);
+      RefUpdate update = repository.updateRef(Constants.R_HEADS + "main");
+      update.setNewObjectId(tip);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+    }
+    store.reset();
+    try (Repository stale = batch.openRepository(project)) {
+      assertEquals(0, store.manifestReads());
+      assertNull(
+          stale.exactRef(Constants.R_HEADS + "main"),
+          "the trade-off: another node's write stays invisible for up to one interval");
+    }
+    try (Repository fresh = writer.openRepository(project)) {
+      assertEquals(1, store.manifestReads(), "by default every open revalidates");
+      assertEquals(tip, fresh.exactRef(Constants.R_HEADS + "main").getObjectId());
+    }
+
+    WalGitRepositoryManager always = manager(store, "0", false, "always");
+    store.reset();
+    always.openRepository(project).close();
+    always.openRepository(project).close();
+    assertEquals(2, store.manifestReads(), "an interval of 0 keeps every open revalidating");
+  }
+
   private WalGitRepositoryManager manager(ObjectStore store, String revalidateInterval) {
+    return manager(store, revalidateInterval, true, "node");
+  }
+
+  private WalGitRepositoryManager manager(
+      ObjectStore store, String revalidateInterval, boolean revalidateOnOpen, String node) {
     Config config = new Config();
-    config.setString("walgerrit", null, "storagePath", root.resolve("cache").toString());
-    config.setString("walgerrit", null, "indexCursorPath", root.resolve("cursors").toString());
+    config.setString("walgerrit", null, "storagePath", root.resolve(node + "-cache").toString());
+    config.setString(
+        "walgerrit", null, "indexCursorPath", root.resolve(node + "-cursors").toString());
     config.setString("walgerrit", null, "manifestRevalidateInterval", revalidateInterval);
+    config.setBoolean("walgerrit", null, "manifestRevalidateOnOpen", revalidateOnOpen);
     WalGitConfiguration configuration = WalGitConfiguration.from(config, root);
     return new WalGitRepositoryManager(
         configuration,

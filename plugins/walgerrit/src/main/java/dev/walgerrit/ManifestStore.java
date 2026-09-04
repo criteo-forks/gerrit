@@ -28,6 +28,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -143,6 +144,19 @@ final class ManifestStore {
     return refreshIfPresent().isPresent();
   }
 
+  /**
+   * Whether the repository exists, answered without a round trip when this node compared its view
+   * of the manifest with the store less than {@code maxAge} ago, and with one conditional read
+   * otherwise. Only opening a repository with {@code walgerrit.manifestRevalidateOnOpen} off uses
+   * this; writers and explicit refreshes always read.
+   */
+  boolean existsUnlessRecentlyValidated(Duration maxAge) throws IOException {
+    if (cache.validatedWithin(cacheKey, maxAge.toMillis(), clock.millis())) {
+      return true;
+    }
+    return exists();
+  }
+
   boolean create() throws IOException {
     createCacheDirectories();
     long now = clock.millis();
@@ -158,6 +172,7 @@ final class ManifestStore {
       ObjectStore.StoredObject stored =
           manifestObjects.putIfAbsent(MANIFEST_FILE, manifest.toByteArray());
       cache.offer(cacheKey, new VersionedManifest(manifest, stored.version()));
+      cache.markValidated(cacheKey, clock.millis());
       return true;
     } catch (ObjectAlreadyExistsException exception) {
       return false;
@@ -512,6 +527,7 @@ final class ManifestStore {
               "Object store reported an unchanged manifest without a known version: "
                   + repositoryName);
         }
+        cache.markValidated(cacheKey, clock.millis());
         yield Optional.of(known);
       }
       case ABSENT -> {
@@ -521,8 +537,10 @@ final class ManifestStore {
       case CHANGED -> {
         Manifest manifest = Manifest.parseFrom(read.object().bytes());
         validate(manifest);
-        yield Optional.of(
-            cache.offer(cacheKey, new VersionedManifest(manifest, read.object().version())));
+        VersionedManifest newest =
+            cache.offer(cacheKey, new VersionedManifest(manifest, read.object().version()));
+        cache.markValidated(cacheKey, clock.millis());
+        yield Optional.of(newest);
       }
     };
   }

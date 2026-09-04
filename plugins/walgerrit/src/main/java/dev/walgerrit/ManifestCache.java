@@ -28,9 +28,26 @@ final class ManifestCache {
   record VersionedManifest(Manifest manifest, String version) {}
 
   private final ConcurrentHashMap<String, VersionedManifest> latest = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, Long> validatedAtMillis = new ConcurrentHashMap<>();
 
   VersionedManifest get(String key) {
     return latest.get(key);
+  }
+
+  /** Records that this node compared its view of {@code key} with the store at {@code nowMillis}. */
+  void markValidated(String key, long nowMillis) {
+    if (latest.containsKey(key)) {
+      validatedAtMillis.put(key, nowMillis);
+    }
+  }
+
+  /**
+   * Whether a manifest for {@code key} is cached and was compared with the store less than {@code
+   * maxAgeMillis} ago; never true for a non-positive age.
+   */
+  boolean validatedWithin(String key, long maxAgeMillis, long nowMillis) {
+    Long at = validatedAtMillis.get(key);
+    return at != null && latest.containsKey(key) && maxAgeMillis > 0 && nowMillis - at < maxAgeMillis;
   }
 
   /** Records {@code candidate} unless a newer revision is already known; returns the newest. */
@@ -44,5 +61,6 @@ final class ManifestCache {
 
   void evict(String key) {
     latest.remove(key);
+    validatedAtMillis.remove(key);
   }
 }

@@ -74,6 +74,12 @@ handle may serve reads without another conditional read; `0` disables the period
 opens, ref transactions and `scanForRepoChanges` revalidate. All handles on a node share the newest
 manifest any of them observed, including the index-event tailer, so a handle adopts a newer
 manifest as soon as its node has seen one. See [Consistency](docs/consistency.md#freshness).
+`walgerrit.manifestRevalidateOnOpen` (default `true`) is what makes every open pay that conditional
+read, and so what lets a request that starts on any node see every write acknowledged before it.
+Set to `false`, an open reuses the node's view when it was validated less than
+`manifestRevalidateInterval` ago, one round trip less per open at the price of that guarantee;
+meant for offline programs such as `reindex`, which open a repository several times per change,
+and for single-node sites, whose own writes keep the view current.
 
 Daemon startup synchronously catches every node-local index cursor up to a freshly read manifest
 before Gerrit's SSH and HTTP listeners start. A successful full sweep publishes the gauge

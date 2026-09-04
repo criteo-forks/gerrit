@@ -37,6 +37,7 @@ record WalGitConfiguration(
     boolean indexTailerEnabled,
     Duration indexPollInterval,
     Duration manifestRevalidateInterval,
+    boolean manifestRevalidateOnOpen,
     long indexReplayLimit,
     boolean indexRebuildOnStaleCursor,
     boolean compactionEnabled,
@@ -51,7 +52,9 @@ record WalGitConfiguration(
     long cacheSizeLimit) {
   /**
    * Longest time an open repository handle serves reads without another conditional manifest
-   * read. Every handle also revalidates when it is opened and when it starts a ref transaction.
+   * read. Every handle also revalidates when it starts a ref transaction, and when it is opened
+   * unless {@code manifestRevalidateOnOpen} is off, in which case an open reuses the node's view
+   * when it was validated against the store less than this interval ago.
    */
   static final Duration DEFAULT_MANIFEST_REVALIDATE_INTERVAL = Duration.ofSeconds(1);
 
@@ -114,6 +117,7 @@ record WalGitConfiguration(
         true,
         Duration.ofSeconds(5),
         DEFAULT_MANIFEST_REVALIDATE_INTERVAL,
+        true,
         DEFAULT_INDEX_REPLAY_LIMIT,
         true,
         true,
@@ -148,6 +152,7 @@ record WalGitConfiguration(
             config.getBoolean(SECTION, null, "indexTailerEnabled", true),
             duration(config, "indexPollInterval", Duration.ofSeconds(5)),
             duration(config, "manifestRevalidateInterval", DEFAULT_MANIFEST_REVALIDATE_INTERVAL),
+            config.getBoolean(SECTION, null, "manifestRevalidateOnOpen", true),
             config.getLong(SECTION, null, "indexReplayLimit", DEFAULT_INDEX_REPLAY_LIMIT),
             config.getBoolean(SECTION, null, "indexRebuildOnStaleCursor", true),
             config.getBoolean(SECTION, null, "compactionEnabled", true),

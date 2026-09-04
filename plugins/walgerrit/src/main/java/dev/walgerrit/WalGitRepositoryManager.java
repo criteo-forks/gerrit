@@ -108,7 +108,12 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   public Repository openRepository(Project.NameKey name)
       throws RepositoryNotFoundException, IOException {
     ManifestStore manifestStore = storage.manifestStore(name);
-    if (!manifestStore.exists()) {
+    boolean exists =
+        configuration.manifestRevalidateOnOpen()
+            ? manifestStore.exists()
+            : manifestStore.existsUnlessRecentlyValidated(
+                configuration.manifestRevalidateInterval());
+    if (!exists) {
       throw new RepositoryNotFoundException(name.get());
     }
     return openInitialized(name, manifestStore);
