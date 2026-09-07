@@ -23,6 +23,11 @@ If index work or the cursor write fails, the entry is retried. A crash after ind
 cursor write also replays the entry, which is safe because the operations are idempotent. A
 successful manifest CAS cannot acknowledge a Git write without also making its event durable.
 
+EVENT entries share the log. They carry the Gerrit events the writing node fired, as JSON, and the
+tailer hands them to this node's event dispatcher when the writer host is another node; its own
+entries are skipped because those events were fired here already. See [events](events.md). The
+cursor advances over EVENT entries like any other.
+
 ## Ref-to-index mapping
 
 | Durable ref update | Node-local action |
@@ -37,6 +42,24 @@ successful manifest CAS cannot acknowledge a Git write without also making its e
 Object-only pack entries and compaction entries advance the cursor without index work. The tailer
 does not synthesize Gerrit's public `GitReferenceUpdated` stream events, avoiding a second external
 event stream for the same committed write.
+
+## Caches evicted on replay
+
+Replaying a ref transaction also evicts the Gerrit caches that the writing node evicted itself and
+that are not keyed by the ref they derive from. Most caches need nothing: accounts, external ids,
+change notes, project configs and default preferences are keyed by the tip of their ref, and the
+indexers the tailer drives evict the group and project caches themselves. Two are keyed by
+something else:
+
+- `sshkeys` is keyed by username and derived from the user's `refs/users/` ref. A replayed change
+  to that ref evicts the entry for the account's username.
+- The group membership caches (`groups_bymember`, `groups_bysubgroup`, `groups_byname`, `groups`)
+  are keyed by member, subgroup, name and legacy id and derived from `refs/groups/` refs. A replayed
+  change loads the group at both the old and the new revision and evicts the union of their
+  members, subgroups, names and ids, so a removal is forgotten as well as an addition.
+
+This is what the multi-site plugin's cache-eviction topic does; here the WAL entry is the trigger,
+so no broker is involved and the eviction lands in the same sweep as the index update.
 
 ## Durability requirement
 

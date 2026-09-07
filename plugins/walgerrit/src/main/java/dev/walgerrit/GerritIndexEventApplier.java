@@ -41,6 +41,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
+import org.eclipse.jgit.lib.ObjectId;
 
 /** Applies one committed WAL ref transaction to Gerrit's node-local derived state. */
 @Singleton
@@ -56,6 +57,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
   private final ChangeNotes.Factory changeNotesFactory;
   private final Provider<InternalChangeQuery> changeQuery;
   private final OneOffRequestContext requestContext;
+  private final ReplicatedCacheEvictions evictions;
 
   @Inject
   GerritIndexEventApplier(
@@ -67,7 +69,8 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       ProjectIndexer projectIndexer,
       ChangeNotes.Factory changeNotesFactory,
       Provider<InternalChangeQuery> changeQuery,
-      OneOffRequestContext requestContext) {
+      OneOffRequestContext requestContext,
+      ReplicatedCacheEvictions evictions) {
     this.allUsers = allUsers;
     this.changeIndexer = changeIndexer;
     this.accountIndexer = accountIndexer;
@@ -77,6 +80,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
     this.changeNotesFactory = changeNotesFactory;
     this.changeQuery = changeQuery;
     this.requestContext = requestContext;
+    this.evictions = evictions;
   }
 
   @Override
@@ -91,7 +95,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
     Set<Change.Id> deletedProjectChanges = new LinkedHashSet<>();
     Map<Change.Id, Boolean> allUsersChanges = new LinkedHashMap<>();
     Set<Account.Id> accounts = new LinkedHashSet<>();
-    Set<AccountGroup.UUID> groups = new LinkedHashSet<>();
+    Map<AccountGroup.UUID, RefUpdate> groups = new LinkedHashMap<>();
     Set<BranchNameKey> branches = new LinkedHashSet<>();
     boolean projectConfigChanged = false;
 
@@ -151,8 +155,17 @@ final class GerritIndexEventApplier implements IndexEventApplier {
         // There is no document left to update in that case.
       }
     }
-    accounts.forEach(accountIndexer::index);
-    groups.forEach(groupIndexer::index);
+    for (Account.Id account : accounts) {
+      accountIndexer.index(account);
+      evictions.accountChanged(account);
+    }
+    for (Map.Entry<AccountGroup.UUID, RefUpdate> group : groups.entrySet()) {
+      evictions.groupChanged(
+          group.getKey(),
+          objectIdOrNull(group.getValue().getOldObjectId()),
+          objectIdOrNull(group.getValue().getNewObjectId()));
+      groupIndexer.index(group.getKey());
+    }
 
     Set<Change.Id> alreadyIndexed = projectChanges;
     for (BranchNameKey branch : branches) {
@@ -175,7 +188,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       RefUpdate update,
       Map<Change.Id, Boolean> changes,
       Set<Account.Id> accounts,
-      Set<AccountGroup.UUID> groups) {
+      Map<AccountGroup.UUID, RefUpdate> groups) {
     String ref = update.getName();
     Change.Id changeId = Change.Id.fromAllUsersRef(ref);
     if (changeId != null) {
@@ -189,7 +202,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
     }
     AccountGroup.UUID group = AccountGroup.UUID.fromRef(ref);
     if (group != null) {
-      groups.add(group);
+      groups.put(group, update);
     }
   }
 
@@ -202,6 +215,10 @@ final class GerritIndexEventApplier implements IndexEventApplier {
   private static boolean isNoOp(RefUpdate update) {
     return update.getOldObjectId().equals(update.getNewObjectId())
         && update.getNewSymbolicTarget().isEmpty();
+  }
+
+  private static ObjectId objectIdOrNull(String objectId) {
+    return isZero(objectId) ? null : ObjectId.fromString(objectId);
   }
 
   private static boolean isZero(String objectId) {
