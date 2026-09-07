@@ -103,6 +103,8 @@ merges a deep reftable stack, publishing each result through the manifest CAS, a
 `walgerrit.reclaimInterval` (default `6h`) deletes files the manifest no longer references once they
 are older than `walgerrit.reclaimGrace` (default `24h`). The defaults suit production; the keys
 `compactMinPacks`, `compactGeometricFactor`, `compactMaxPackSize`, `compactMinReftables`,
+Only the node holding the leader lease (`leaderLeaseDuration`, default `60 s`, under
+`leases/cluster/leader`) deletes from the store; every node trims its own cache.
 `compactionLeaseDuration`, `reclaimEnabled`, `cacheSizeLimit` and JGit's `core.dfs.blockLimit` tune
 it. See [Compaction and reclamation](docs/compaction.md).
 
@@ -199,7 +201,9 @@ For every repository, WalGerrit writes:
 
 Publication order is immutable files, immutable log entry, then manifest replacement. A stale ref
 writer receives a JGit lock failure and must refresh before retrying. See the
-[storage format](docs/storage-format.md), [consistency contract](docs/consistency.md), and
+[storage format](docs/storage-format.md), [consistency contract](docs/consistency.md),
+[web sessions without a session store](docs/web-sessions.md),
+[events in the WAL](docs/events.md), and
 [JGit/CAS audit](docs/jgit-cas-deep-dive.md). See [WAL-driven index events](docs/index-events.md)
 for the local-Lucene convergence and recovery contract.
 

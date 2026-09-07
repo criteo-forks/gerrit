@@ -11,21 +11,27 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package dev.walgerrit;
 
-import com.google.gerrit.extensions.registration.DynamicSet;
-import com.google.gerrit.server.events.EventListener;
 
-import com.google.gerrit.lifecycle.LifecycleModule;
+/** Marks the thread that is delivering events replayed from another node's WAL entry. */
+final class EventReplay {
+  private static final ThreadLocal<Boolean> REPLAYING = ThreadLocal.withInitial(() -> false);
 
-/** Installs WAL-driven secondary-index convergence in Gerrit's system injector. */
-public final class WalGitIndexModule extends LifecycleModule {
-  @Override
-  protected void configure() {
-    listener().to(IndexEventTailer.class);
-    // Events this node fires travel in the WAL to the other nodes' tailers.
-    DynamicSet.bind(binder(), EventListener.class).to(WalEventJournal.class);
-    listener().to(WalEventJournal.class);
+  private EventReplay() {}
+
+  /** True while this thread dispatches events another node fired; the journal must not re-log them. */
+  static boolean isReplaying() {
+    return REPLAYING.get();
+  }
+
+  static Scope enter() {
+    REPLAYING.set(true);
+    return () -> REPLAYING.set(false);
+  }
+
+  interface Scope extends AutoCloseable {
+    @Override
+    void close();
   }
 }

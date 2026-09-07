@@ -327,6 +327,31 @@ final class ManifestStore {
       boolean requireExactRefRevision,
       RefTransaction refTransaction)
       throws IOException {
+    return publish(
+        expectedRefRevision, additions, supersedes, requireExactRefRevision, refTransaction, List.of());
+  }
+
+  /**
+   * Appends an EVENT entry carrying Gerrit events fired on this node, so every other node can
+   * deliver them to its own listeners. Nothing else in the manifest changes: no pack, no ref
+   * revision. The entry lands after the ref update that caused the events, because that update
+   * was published before Gerrit fired them.
+   */
+  Manifest publishEvents(List<String> eventJson) throws IOException {
+    if (eventJson.isEmpty()) {
+      return current();
+    }
+    return publish(0, List.of(), List.of(), false, null, eventJson);
+  }
+
+  private Manifest publish(
+      long expectedRefRevision,
+      Collection<PackRef> additions,
+      Collection<String> supersedes,
+      boolean requireExactRefRevision,
+      RefTransaction refTransaction,
+      List<String> eventJson)
+      throws IOException {
     createCacheDirectories();
     for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
       // The first attempt is optimistic against the manifest this node already observed; the
@@ -356,8 +381,12 @@ final class ManifestStore {
       LogEntry.Builder entry =
           LogEntry.newBuilder()
               .setSeq(sequence)
-              .setKind(entryKind(supersedes, requireExactRefRevision))
+              .setKind(
+                  eventJson.isEmpty()
+                      ? entryKind(supersedes, requireExactRefRevision)
+                      : LogEntry.Kind.EVENT)
               .addAllSupersedes(supersedes)
+              .addAllEventJson(eventJson)
               .setCreatedAtEpochMillis(now)
               .setWriter(writer)
               .setBaseRevision(current.getRevision())
@@ -743,7 +772,16 @@ final class ManifestStore {
   }
 
   static String writerIdentity() {
-    String host = System.getenv().getOrDefault("HOSTNAME", "localhost");
-    return host + ":" + ProcessHandle.current().pid();
+    return writerHost() + ":" + ProcessHandle.current().pid();
+  }
+
+  /** The node part of {@link #writerIdentity()}: stable across restarts of the same pod or host. */
+  static String writerHost() {
+    return System.getenv().getOrDefault("HOSTNAME", "localhost");
+  }
+
+  /** Whether a log entry's writer ran on this node, in this process or an earlier one. */
+  static boolean writtenOnThisHost(String writer) {
+    return writer.startsWith(writerHost() + ":");
   }
 }

@@ -35,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import org.eclipse.jgit.lib.Config;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,6 +59,9 @@ final class IndexEventTailer implements LifecycleListener {
 
   private final WalGitRepositoryManager repositories;
   private final IndexEventApplier applier;
+  private final EventReplayer replayer;
+  /** Whether a log entry's writer is another node; this node's own events were fired here already. */
+  private volatile Predicate<String> foreignWriter = writer -> !ManifestStore.writtenOnThisHost(writer);
   private final GerritRuntime runtime;
   private final String indexType;
   private final Config serverConfig;
@@ -76,7 +80,8 @@ final class IndexEventTailer implements LifecycleListener {
       IndexConfig indexConfig,
       @GerritServerConfig Config serverConfig,
       IndexEventReadiness readiness,
-      GerritIndexRebuilder rebuilder) {
+      GerritIndexRebuilder rebuilder,
+      GerritEventReplayer replayer) {
     this(
         asWalGit(repositories),
         (IndexEventApplier) applier,
@@ -84,7 +89,8 @@ final class IndexEventTailer implements LifecycleListener {
         indexConfig.type(),
         serverConfig,
         readiness,
-        rebuilder);
+        rebuilder,
+        replayer);
   }
 
   IndexEventTailer(
@@ -108,8 +114,21 @@ final class IndexEventTailer implements LifecycleListener {
       Config serverConfig,
       IndexEventReadiness readiness,
       IndexRebuilder rebuilder) {
+    this(repositories, applier, runtime, indexType, serverConfig, readiness, rebuilder, EventReplayer.NONE);
+  }
+
+  IndexEventTailer(
+      WalGitRepositoryManager repositories,
+      IndexEventApplier applier,
+      GerritRuntime runtime,
+      String indexType,
+      Config serverConfig,
+      IndexEventReadiness readiness,
+      IndexRebuilder rebuilder,
+      EventReplayer replayer) {
     this.repositories = repositories;
     this.applier = applier;
+    this.replayer = replayer;
     this.runtime = runtime;
     this.indexType = indexType;
     this.serverConfig = serverConfig;
@@ -275,8 +294,14 @@ final class IndexEventTailer implements LifecycleListener {
             manifest,
             repositories.configuration().indexReplayLimit());
     int applied = 0;
+    int replayed = 0;
     for (LogEntry entry : entries) {
-      if (entry.getKind() == LogEntry.Kind.REF_UPDATE) {
+      if (entry.getKind() == LogEntry.Kind.EVENT) {
+        if (foreignWriter.test(entry.getWriter())) {
+          replayer.replay(project, entry);
+          replayed++;
+        }
+      } else if (entry.getKind() == LogEntry.Kind.REF_UPDATE) {
         if (!entry.hasRefTransaction()) {
           throw new IOException(
               "REF_UPDATE WAL entry "
@@ -292,11 +317,13 @@ final class IndexEventTailer implements LifecycleListener {
     }
     if (!entries.isEmpty()) {
       logger.info(
-          "WalGerrit index-event replay advanced {} from {} to {} ({} ref transactions)",
+          "WalGerrit index-event replay advanced {} from {} to {} ({} ref transactions, {} event"
+              + " entries from other nodes)",
           project.get(),
           cursor.getSequence(),
           manifest.getHeadSeq(),
-          applied);
+          applied,
+          replayed);
     }
     if (!entries.isEmpty() || !versioned.version().equals(cursor.getManifestVersion())) {
       // At the head now; remember which manifest version that is.
@@ -370,6 +397,11 @@ final class IndexEventTailer implements LifecycleListener {
         "WalGerrit rebuilt this node's indexes in {} s and seeded cursors for {} repositories",
         TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started),
         seeds.size());
+  }
+
+  /** Test hook: decide by writer identity which entries came from another node. */
+  void foreignWriter(Predicate<String> foreignWriter) {
+    this.foreignWriter = foreignWriter;
   }
 
   void runBackgroundSweep() {

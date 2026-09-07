@@ -54,6 +54,9 @@ message LogEntry {
     PACK = 1;
     REF_UPDATE = 2;
     COMPACT = 3;
+    // Gerrit events fired on the writing node, carried as JSON for every other
+    // node to deliver to its own stream-events subscribers and plugins.
+    EVENT = 4;
   }
 
   uint64 seq = 1;
@@ -76,6 +79,9 @@ message LogEntry {
   // entries reachable from the manifest's head through this chain are history;
   // an entry written by a publication that lost its CAS is never referenced.
   string previous_transaction_id = 10;
+  // Present for EVENT: the Gerrit events, one JSON document each, in the order
+  // they were fired. Replayed by every node whose writer host differs.
+  repeated string event_json = 11;
 }
 
 message RefUpdate {
