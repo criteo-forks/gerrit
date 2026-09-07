@@ -13,6 +13,7 @@
 // limitations under the License.
 package dev.walgerrit;
 
+import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.entities.AccountGroup;
 import com.google.gerrit.entities.InternalGroup;
@@ -64,7 +65,7 @@ final class ReplicatedCacheEvictions {
   }
 
   private final Function<Account.Id, Optional<String>> usernames;
-  private final SshKeyCache sshKeys;
+  @Nullable private SshKeyCache sshKeys;
   private final GroupCache groups;
   private final GroupIncludeCache groupIncludes;
   private final GroupSnapshots snapshots;
@@ -74,12 +75,11 @@ final class ReplicatedCacheEvictions {
       AllUsersName allUsers,
       GitRepositoryManager repositories,
       AccountCache accounts,
-      SshKeyCache sshKeys,
       GroupCache groups,
       GroupIncludeCache groupIncludes) {
     this(
         id -> accounts.get(id).flatMap(AccountState::userName),
-        sshKeys,
+        null,
         groups,
         groupIncludes,
         (group, commit) -> {
@@ -94,7 +94,7 @@ final class ReplicatedCacheEvictions {
 
   ReplicatedCacheEvictions(
       Function<Account.Id, Optional<String>> usernames,
-      SshKeyCache sshKeys,
+      @Nullable SshKeyCache sshKeys,
       GroupCache groups,
       GroupIncludeCache groupIncludes,
       GroupSnapshots snapshots) {
@@ -105,8 +105,20 @@ final class ReplicatedCacheEvictions {
     this.snapshots = snapshots;
   }
 
+  /**
+   * The daemon binds the SSH key cache; init and reindex, which load this library too, do not.
+   * Optional so the applier can be created there.
+   */
+  @Inject(optional = true)
+  void setSshKeyCache(SshKeyCache sshKeys) {
+    this.sshKeys = sshKeys;
+  }
+
   /** The user's {@code refs/users/} ref changed: SSH keys live there, cached by username. */
   void accountChanged(Account.Id account) {
+    if (sshKeys == null) {
+      return;
+    }
     usernames.apply(account).ifPresent(sshKeys::evict);
   }
 

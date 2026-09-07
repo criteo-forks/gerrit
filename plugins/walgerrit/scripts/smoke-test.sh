@@ -49,6 +49,11 @@ git config --file "$site/etc/gerrit.config" \
   --add gerrit.installDbModule dev.walgerrit.WalGitModule
 git config --file "$site/etc/gerrit.config" \
   --add gerrit.installModule dev.walgerrit.WalGitIndexModule
+# Stateless web sessions: the daemon's first HTTP request builds a session through the library's
+# object-store signing key, so init, reindex and the daemon all load the module.
+git config --file "$site/etc/gerrit.config" \
+  --add gerrit.installModule dev.walgerrit.WalGitWebSessionModule
+git config --file "$site/etc/gerrit.config" auth.statelessSessions true
 git config --file "$site/etc/gerrit.config" walgerrit.backend local
 git config --file "$site/etc/gerrit.config" walgerrit.storagePath data/walgerrit
 git config --file "$site/etc/gerrit.config" walgerrit.indexCursorPath data/walgerrit-index-events

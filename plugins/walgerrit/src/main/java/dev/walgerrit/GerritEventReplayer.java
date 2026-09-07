@@ -14,11 +14,12 @@
 package dev.walgerrit;
 
 
+import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.extensions.registration.DynamicItem;
 import com.google.gerrit.server.events.Event;
 import com.google.gerrit.server.events.EventDispatcher;
-import com.google.gerrit.server.events.EventGson;
+import com.google.gerrit.server.events.EventGsonProvider;
 import com.google.gerrit.server.permissions.PermissionBackendException;
 import com.google.gerrit.server.util.ManualRequestContext;
 import com.google.gerrit.server.util.OneOffRequestContext;
@@ -39,23 +40,25 @@ import org.slf4j.LoggerFactory;
 final class GerritEventReplayer implements EventReplayer {
   private static final Logger logger = LoggerFactory.getLogger(GerritEventReplayer.class);
 
-  private final DynamicItem<EventDispatcher> dispatcher;
-  private final Gson gson;
+  /**
+   * Only the daemon installs Gerrit's EventBrokerModule; init and reindex load this library too,
+   * so the dispatcher is optional and replay is a no-op without it.
+   */
+  @Inject(optional = true)
+  @Nullable
+  private DynamicItem<EventDispatcher> dispatcher;
+
+  private final Gson gson = new EventGsonProvider().get();
   private final OneOffRequestContext requestContext;
 
   @Inject
-  GerritEventReplayer(
-      DynamicItem<EventDispatcher> dispatcher,
-      @EventGson Gson gson,
-      OneOffRequestContext requestContext) {
-    this.dispatcher = dispatcher;
-    this.gson = gson;
+  GerritEventReplayer(OneOffRequestContext requestContext) {
     this.requestContext = requestContext;
   }
 
   @Override
   public void replay(Project.NameKey project, LogEntry entry) {
-    EventDispatcher target = dispatcher.get();
+    EventDispatcher target = dispatcher == null ? null : dispatcher.get();
     if (target == null) {
       return;
     }

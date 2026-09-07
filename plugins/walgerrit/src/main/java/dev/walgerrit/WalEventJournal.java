@@ -19,7 +19,7 @@ import com.google.gerrit.extensions.events.LifecycleListener;
 import com.google.gerrit.server.config.AllProjectsName;
 import com.google.gerrit.server.config.GerritRuntime;
 import com.google.gerrit.server.events.Event;
-import com.google.gerrit.server.events.EventGson;
+import com.google.gerrit.server.events.EventGsonProvider;
 import com.google.gerrit.server.events.EventListener;
 import com.google.gerrit.server.events.ProjectEvent;
 import com.google.gerrit.server.git.GitRepositoryManager;
@@ -55,7 +55,9 @@ final class WalEventJournal implements EventListener, LifecycleListener {
   static final int FLUSH_AT = 100;
 
   private final WalGitRepositoryManager repositories;
-  private final Gson gson;
+  // Gerrit's event Gson, built here because only the daemon binds @EventGson and init/reindex
+  // load this library too.
+  private final Gson gson = new EventGsonProvider().get();
   private final Project.NameKey allProjects;
   private final GerritRuntime runtime;
   private final JournalBuffer buffer = new JournalBuffer();
@@ -63,12 +65,8 @@ final class WalEventJournal implements EventListener, LifecycleListener {
 
   @Inject
   WalEventJournal(
-      GitRepositoryManager repositories,
-      @EventGson Gson gson,
-      AllProjectsName allProjects,
-      GerritRuntime runtime) {
+      GitRepositoryManager repositories, AllProjectsName allProjects, GerritRuntime runtime) {
     this.repositories = asWalGit(repositories);
-    this.gson = gson;
     this.allProjects = allProjects;
     this.runtime = runtime;
   }
