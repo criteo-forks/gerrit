@@ -68,7 +68,7 @@ final class Compactor {
   private final Reclaimer reclaimer;
   private final Set<Project.NameKey> queued = ConcurrentHashMap.newKeySet();
   private volatile ScheduledExecutorService executor;
-  private volatile ClusterLeader leader;
+  private volatile SweepLease sweepLease;
 
   Compactor(WalGitRepositoryManager repositories) {
     this(repositories, Clock.systemUTC());
@@ -109,14 +109,14 @@ final class Compactor {
       logger.warn(
           "walgerrit.cacheSizeLimit is ignored: with the local backend the cache is the store");
     }
-    // Leadership decides which node deletes unreferenced files from the shared store; the lease
-    // is renewed every third of its term and the first tick runs before the first sweep.
-    ClusterLeader elected =
-        new ClusterLeader(
-            repositories.storage().clusterLease("leader"), configuration.leaderLeaseDuration());
-    leader = elected;
+    // The sweep lease decides which node deletes unreferenced files from the shared store; it is
+    // renewed every third of its term and the first tick runs before the first sweep.
+    SweepLease lease =
+        new SweepLease(
+            repositories.storage().clusterLease("sweep"), configuration.sweepLeaseDuration());
+    sweepLease = lease;
     executor.scheduleWithFixedDelay(
-        elected::tick, 0, elected.tickInterval().toMillis(), TimeUnit.MILLISECONDS);
+        lease::tick, 0, lease.tickInterval().toMillis(), TimeUnit.MILLISECONDS);
     long interval = Math.max(1, configuration.reclaimInterval().toMillis());
     executor.scheduleWithFixedDelay(this::sweep, 0, interval, TimeUnit.MILLISECONDS);
     logger.info(
@@ -137,10 +137,10 @@ final class Compactor {
     if (running == null) {
       return;
     }
-    ClusterLeader elected = leader;
-    leader = null;
-    if (elected != null) {
-      elected.resign();
+    SweepLease lease = sweepLease;
+    sweepLease = null;
+    if (lease != null) {
+      lease.release();
     }
     running.shutdownNow();
     try {
@@ -298,28 +298,27 @@ final class Compactor {
 
   /** Visible for tests: one sweep over every repository, as the executor runs it. */
   /**
-   * Whether this node currently holds the deployment's leader lease. Without an election running
-   * (a batch program, or a compactor that was never started) the caller is the only node that
-   * matters and is treated as leading.
+   * Whether this node currently holds the sweep lease. Without one in play (a batch program, or a
+   * compactor that was never started) the caller is the only node that matters and sweeps.
    */
-  boolean isLeader() {
-    ClusterLeader elected = leader;
-    return elected == null || elected.isLeader();
+  boolean holdsSweepLease() {
+    SweepLease lease = sweepLease;
+    return lease == null || lease.isHeld();
   }
 
   void sweep() {
     try {
-      boolean leads = isLeader();
+      boolean sweeps = holdsSweepLease();
       Reclaimer.Report report =
           configuration.reclaimEnabled()
-              ? reclaimer.reclaimAll(this::consider, leads)
+              ? reclaimer.reclaimAll(this::consider, sweeps)
               : reclaimer.observeAll(this::consider);
       logger.info(
           "WalGerrit sweep over {} repositories deleted {} store file(s){}, evicted {} cached file(s) "
               + "and trimmed {} bytes for the cache limit",
           report.repositories(),
           report.deleted(),
-          leads ? "" : " (another node leads and deletes from the store)",
+          sweeps ? "" : " (another node holds the sweep lease and deletes from the store)",
           report.evicted(),
           report.trimmedBytes());
     } catch (IOException | RuntimeException exception) {

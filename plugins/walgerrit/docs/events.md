@@ -44,8 +44,8 @@ restarts therefore does not replay the events it fired before the restart.
   different repositories carry no relative order, as before.
 - Latency is the tailer's poll interval plus the journal's flush interval, a few seconds at most.
 - Plugins cannot tell a replayed event from a local one. A plugin that publishes events outside
-  Gerrit therefore publishes on every node. Give such a plugin one node with the leader lease
-  (`WalGitRepositoryManager.isLeader()`), or run it on one node only.
+  Gerrit therefore publishes on every node. Give such a plugin one node with the sweep lease
+  (`WalGitRepositoryManager.holdsSweepLease()`), or run it on one node only.
 
 ## Configuration
 
@@ -54,13 +54,14 @@ restarts therefore does not replay the events it fired before the restart.
   eventJournalEnabled = true    # default; false journals nothing and replays nothing sent by others
 ```
 
-## Leader lease
+## Sweep lease
 
-Some work should run on one node: deleting unreferenced files from the shared store, or forwarding
-events to an external system. `ClusterLeader` elects that node with a `StoreLease` on
-`leases/cluster/leader`: the holder renews every third of `walgerrit.leaderLeaseDuration` (60 s by
-default), another node takes over once the lease has lapsed, and a node that fails to renew stops
-leading at once. A node may believe it leads for up to one tick after losing the lease, so
-leader-only work must be safe to run twice; store reclamation is, because it only deletes files no
-manifest references and older than the grace period. Every node still trims its own cache and
-evicts its own copies of unreferenced files.
+Some work should run on one node, not once per node: deleting unreferenced files from the shared
+store, or forwarding events to an external system. There is no leader in the data path, every node
+writes through the manifest CAS and converges from the log; `SweepLease` is a `StoreLease` on
+`leases/cluster/sweep` for that housekeeping only. The holder renews every third of
+`walgerrit.sweepLeaseDuration` (60 s by default), another node takes over once the lease has lapsed,
+and a node that fails to renew stops at once. A node may believe it holds the lease for up to one
+tick after losing it, so the work behind it must be safe to run twice; store reclamation is, because
+it only deletes files no manifest references and older than the grace period. Every node still trims
+its own cache and evicts its own copies of unreferenced files.

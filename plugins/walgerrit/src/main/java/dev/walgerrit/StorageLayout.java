@@ -119,7 +119,7 @@ final class StorageLayout {
     return new PrefixedObjectStore(objectStore, clusterPrefix);
   }
 
-  /** A lease every node competes for, such as {@code leader}; lives under {@code leases/cluster/}. */
+  /** A lease every node competes for, such as {@code sweep}; lives under {@code leases/cluster/}. */
   StoreLease clusterLease(String name) {
     return new StoreLease(
         objectStore,

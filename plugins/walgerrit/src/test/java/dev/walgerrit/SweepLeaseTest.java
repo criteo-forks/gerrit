@@ -24,21 +24,21 @@ import java.time.Instant;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-class ClusterLeaderTest {
+class SweepLeaseTest {
   private static final Duration TERM = Duration.ofSeconds(60);
   @TempDir Path root;
 
   @Test
-  void exactlyOneNodeLeadsAndTheOtherTakesOverAfterTheTermLapses() throws Exception {
+  void exactlyOneNodeHoldsTheLeaseAndTheOtherTakesOverAfterTheTermLapses() throws Exception {
     FileObjectStore store = new FileObjectStore(root);
     SteppingClock clock = new SteppingClock(Instant.parse("2026-09-07T12:00:00Z"));
-    ClusterLeader a = new ClusterLeader(new StoreLease(store, "leases/cluster/leader", clock, "a"), TERM);
-    ClusterLeader b = new ClusterLeader(new StoreLease(store, "leases/cluster/leader", clock, "b"), TERM);
+    SweepLease a = new SweepLease(new StoreLease(store, "leases/cluster/sweep", clock, "a"), TERM);
+    SweepLease b = new SweepLease(new StoreLease(store, "leases/cluster/sweep", clock, "b"), TERM);
 
     assertTrue(a.tick());
     assertFalse(b.tick());
-    assertTrue(a.isLeader());
-    assertFalse(b.isLeader());
+    assertTrue(a.isHeld());
+    assertFalse(b.isHeld());
 
     // a keeps renewing: b never gets it.
     clock.advance(TERM.minusSeconds(5));
@@ -50,30 +50,30 @@ class ClusterLeaderTest {
     clock.advance(TERM.plusSeconds(1));
     assertTrue(b.tick());
     assertFalse(a.tick());
-    assertFalse(a.isLeader());
-    assertTrue(b.isLeader());
+    assertFalse(a.isHeld());
+    assertTrue(b.isHeld());
   }
 
   @Test
-  void resigningHandsOverImmediately() throws Exception {
+  void releasingHandsOverImmediately() throws Exception {
     FileObjectStore store = new FileObjectStore(root);
     SteppingClock clock = new SteppingClock(Instant.parse("2026-09-07T12:00:00Z"));
-    ClusterLeader a = new ClusterLeader(new StoreLease(store, "leases/cluster/leader", clock, "a"), TERM);
-    ClusterLeader b = new ClusterLeader(new StoreLease(store, "leases/cluster/leader", clock, "b"), TERM);
+    SweepLease a = new SweepLease(new StoreLease(store, "leases/cluster/sweep", clock, "a"), TERM);
+    SweepLease b = new SweepLease(new StoreLease(store, "leases/cluster/sweep", clock, "b"), TERM);
     assertTrue(a.tick());
 
-    a.resign();
+    a.release();
 
-    assertFalse(a.isLeader());
+    assertFalse(a.isHeld());
     assertTrue(b.tick());
     assertEquals(Duration.ofSeconds(20), b.tickInterval());
   }
 
   @Test
   void tickIntervalNeverDropsBelowOneSecond() {
-    ClusterLeader quick =
-        new ClusterLeader(
-            new StoreLease(new FileObjectStore(root), "leases/cluster/leader", new SteppingClock(Instant.EPOCH), "a"),
+    SweepLease quick =
+        new SweepLease(
+            new StoreLease(new FileObjectStore(root), "leases/cluster/sweep", new SteppingClock(Instant.EPOCH), "a"),
             Duration.ofMillis(900));
     assertEquals(Duration.ofSeconds(1), quick.tickInterval());
   }

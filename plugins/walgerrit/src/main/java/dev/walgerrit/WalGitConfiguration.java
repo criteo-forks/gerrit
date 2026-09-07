@@ -53,7 +53,7 @@ record WalGitConfiguration(
     boolean rangedPackReads,
     long packFetchChunkSize,
     boolean eventJournalEnabled,
-    Duration leaderLeaseDuration) {
+    Duration sweepLeaseDuration) {
   /**
    * Longest time an open repository handle serves reads without another conditional manifest
    * read. Every handle also revalidates when it starts a ref transaction, and when it is opened
@@ -105,8 +105,8 @@ record WalGitConfiguration(
    */
   static final Duration DEFAULT_RECLAIM_GRACE = Duration.ofHours(24);
 
-  /** How long one node leads before another may take over; renewed every third of it. */
-  static final Duration DEFAULT_LEADER_LEASE = Duration.ofSeconds(60);
+  /** How long a node holds the sweep lease before another may take over; renewed every third of it. */
+  static final Duration DEFAULT_SWEEP_LEASE = Duration.ofSeconds(60);
 
   /** How often a node sweeps every repository to reclaim files and queue overdue compactions. */
   static final Duration DEFAULT_RECLAIM_INTERVAL = Duration.ofHours(6);
@@ -147,7 +147,7 @@ record WalGitConfiguration(
         true,
         DEFAULT_PACK_FETCH_CHUNK_SIZE,
         true,
-        DEFAULT_LEADER_LEASE);
+        DEFAULT_SWEEP_LEASE);
   }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
@@ -186,7 +186,7 @@ record WalGitConfiguration(
             config.getBoolean(SECTION, null, "rangedPackReads", true),
             config.getLong(SECTION, null, "packFetchChunkSize", DEFAULT_PACK_FETCH_CHUNK_SIZE),
             config.getBoolean(SECTION, null, "eventJournalEnabled", true),
-            duration(config, "leaderLeaseDuration", DEFAULT_LEADER_LEASE));
+            duration(config, "sweepLeaseDuration", DEFAULT_SWEEP_LEASE));
     configuration.validate();
     return configuration;
   }
@@ -225,7 +225,7 @@ record WalGitConfiguration(
     require(isPositive(compactionLeaseDuration), "compactionLeaseDuration must be positive");
     require(!reclaimGrace.isNegative(), "reclaimGrace must be zero or positive");
     require(isPositive(reclaimInterval), "reclaimInterval must be positive");
-    require(isPositive(leaderLeaseDuration), "leaderLeaseDuration must be positive");
+    require(isPositive(sweepLeaseDuration), "sweepLeaseDuration must be positive");
     require(cacheSizeLimit >= 0, "cacheSizeLimit must be zero or positive");
   }
 

@@ -103,8 +103,8 @@ merges a deep reftable stack, publishing each result through the manifest CAS, a
 `walgerrit.reclaimInterval` (default `6h`) deletes files the manifest no longer references once they
 are older than `walgerrit.reclaimGrace` (default `24h`). The defaults suit production; the keys
 `compactMinPacks`, `compactGeometricFactor`, `compactMaxPackSize`, `compactMinReftables`,
-Only the node holding the leader lease (`leaderLeaseDuration`, default `60 s`, under
-`leases/cluster/leader`) deletes from the store; every node trims its own cache.
+Only the node holding the sweep lease (`sweepLeaseDuration`, default `60 s`, under
+`leases/cluster/sweep`) deletes from the store; every node trims its own cache.
 `compactionLeaseDuration`, `reclaimEnabled`, `cacheSizeLimit` and JGit's `core.dfs.blockLimit` tune
 it. See [Compaction and reclamation](docs/compaction.md).
 

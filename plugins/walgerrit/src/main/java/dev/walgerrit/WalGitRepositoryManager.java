@@ -154,9 +154,9 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     return configuration;
   }
 
-  /** Whether this node holds the deployment's leader lease (see {@link ClusterLeader}). */
-  public boolean isLeader() {
-    return compactor.isLeader();
+  /** Whether this node holds the sweep lease (see {@link SweepLease}). */
+  public boolean holdsSweepLease() {
+    return compactor.holdsSweepLease();
   }
 
   Compactor compactor() {

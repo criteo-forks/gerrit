@@ -21,25 +21,26 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Elects one node for work the deployment should do once, such as deleting unreferenced files from
- * the store. Leadership is a {@link StoreLease} on {@code leases/cluster/leader}: the holder renews
- * it every third of its term, another node takes it over once it has expired, and a node that fails
- * to renew stops leading at once. Between two ticks a node can therefore believe it leads for up to
- * one term after it lost the lease, so leader-only work must itself be safe to run twice.
+ * The lease for work the deployment should do once, not once per node: deleting unreferenced files
+ * from the shared store. It is a {@link StoreLease} on {@code leases/cluster/sweep}: the holder
+ * renews it every third of its term, another node takes it over once it has expired, and a node
+ * that fails to renew stops at once. Between two ticks a node can believe it still holds the lease
+ * for up to one term after losing it, so the work behind it must be safe to run twice. There is no
+ * leader in the data path: every node writes through the manifest CAS and converges from the log.
  */
-final class ClusterLeader {
-  private static final Logger logger = LoggerFactory.getLogger(ClusterLeader.class);
+final class SweepLease {
+  private static final Logger logger = LoggerFactory.getLogger(SweepLease.class);
 
   private final StoreLease lease;
   private final Duration term;
   private StoreLease.Held held;
 
-  ClusterLeader(StoreLease lease, Duration term) {
+  SweepLease(StoreLease lease, Duration term) {
     this.lease = lease;
     this.term = term;
   }
 
-  /** Renews or tries to acquire the lease; returns whether this node leads now. */
+  /** Renews or tries to acquire the lease; returns whether this node holds it now. */
   synchronized boolean tick() {
     if (held != null) {
       try {
@@ -47,30 +48,33 @@ final class ClusterLeader {
         return true;
       } catch (IOException lost) {
         held = null;
-        logger.info("WalGerrit: this node no longer leads ({})", lost.getMessage());
+        logger.info("WalGerrit: this node lost the sweep lease ({})", lost.getMessage());
       }
     }
     try {
       Optional<StoreLease.Held> acquired = lease.acquire(term);
       if (acquired.isPresent()) {
         held = acquired.get();
-        logger.info("WalGerrit: this node leads the deployment for the next {}", term);
+        logger.info(
+            "WalGerrit: this node holds the sweep lease for the next {} and deletes unreferenced"
+                + " files from the store",
+            term);
       }
     } catch (IOException unreachable) {
-      logger.warn("WalGerrit could not read the leader lease", unreachable);
+      logger.warn("WalGerrit could not read the sweep lease", unreachable);
     }
     return held != null;
   }
 
-  synchronized boolean isLeader() {
+  synchronized boolean isHeld() {
     return held != null;
   }
 
-  synchronized void resign() {
+  synchronized void release() {
     if (held != null) {
       held.close();
       held = null;
-      logger.info("WalGerrit: this node stopped leading");
+      logger.info("WalGerrit: this node released the sweep lease");
     }
   }
 
