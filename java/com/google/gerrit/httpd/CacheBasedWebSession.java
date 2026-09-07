@@ -55,6 +55,7 @@ public abstract class CacheBasedWebSession extends WebSession {
   private final EnumSet<AccessPath> okPaths = EnumSet.of(AccessPath.UNKNOWN);
   private final AccountCache byIdCache;
   private Cookie outCookie;
+  private Cookie refreshCookie;
 
   private WebSessionManager.Key key;
   private WebSessionManager.Val val;
@@ -77,7 +78,8 @@ public abstract class CacheBasedWebSession extends WebSession {
     this.byIdCache = byIdCache;
 
     String cookie = readCookie(request);
-    if (cookie != null) {
+    boolean fromCookie = cookie != null;
+    if (fromCookie) {
       authFromCookie(cookie);
     } else if (request.getRequestURI() == null || !GitSmartHttpTools.isGitClient(request)) {
       String token;
@@ -96,7 +98,13 @@ public abstract class CacheBasedWebSession extends WebSession {
     }
     if (val != null && val.needsCookieRefresh()) {
       // Session is more than half old; update cache entry with new expiration date.
+      String before = key.getToken();
       val = manager.createVal(key, val);
+      if (fromCookie && !before.equals(key.getToken())) {
+        // A stateless session lives in the token itself, so the client must receive the new one.
+        saveCookie();
+        refreshCookie = outCookie;
+      }
     }
   }
 
@@ -255,9 +263,10 @@ public abstract class CacheBasedWebSession extends WebSession {
       }
     }
 
-    if (outCookie != null) {
+    if (outCookie != null && outCookie != refreshCookie) {
       throw new IllegalStateException("Cookie " + ACCOUNT_COOKIE + " was set");
     }
+    // A login or logout after a refresh sets the cookie again; the last Set-Cookie wins.
 
     outCookie = new Cookie(ACCOUNT_COOKIE, token);
 

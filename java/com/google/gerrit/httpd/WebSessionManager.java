@@ -37,7 +37,9 @@ import com.google.gerrit.server.account.externalids.ExternalIdKeyFactory;
 import com.google.gerrit.server.config.ConfigUtil;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.inject.Inject;
+import com.google.inject.Provider;
 import com.google.inject.assistedinject.Assisted;
+import com.google.inject.name.Named;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
@@ -55,10 +57,24 @@ public class WebSessionManager {
   private final SecureRandom prng;
   private final Cache<String, Val> self;
 
+  /**
+   * Set when {@code auth.statelessSessions} is true: the cookie then carries the signed session
+   * and {@link #self} is never written, so every node accepts every session.
+   */
+  @Nullable private final WebSessionTokenCodec codec;
+
   @Inject
-  WebSessionManager(@GerritServerConfig Config cfg, @Assisted Cache<String, Val> cache) {
+  WebSessionManager(
+      @GerritServerConfig Config cfg,
+      @Assisted Cache<String, Val> cache,
+      ExternalIdKeyFactory externalIdKeyFactory,
+      @Named(WebSessionSigningKeyModule.KEY) Provider<byte[]> signingKey) {
     prng = new SecureRandom();
     self = cache;
+    codec =
+        cfg.getBoolean("auth", null, "statelessSessions", false)
+            ? new WebSessionTokenCodec(signingKey.get(), externalIdKeyFactory)
+            : null;
 
     sessionMaxAgeMillis =
         SECONDS.toMillis(
@@ -131,7 +147,12 @@ public class WebSessionManager {
     }
 
     Val val = new Val(who, refreshCookieAt, remember, lastLogin, expiresAt, sid, auth);
-    self.put(key.token, val);
+    if (codec != null) {
+      // The session travels in the cookie; the caller reads the new token back from the key.
+      key.token = codec.encode(val);
+    } else {
+      self.put(key.token, val);
+    }
     return val;
   }
 
@@ -152,16 +173,23 @@ public class WebSessionManager {
 
   @Nullable
   Val get(Key key) {
-    Val val = self.getIfPresent(key.token);
+    Val val = codec != null ? codec.decode(key.token) : self.getIfPresent(key.token);
     if (val != null && val.expiresAt <= nowMs()) {
-      self.invalidate(key.token);
+      destroy(key);
       return null;
     }
     return val;
   }
 
   void destroy(Key key) {
-    self.invalidate(key.token);
+    if (codec == null) {
+      self.invalidate(key.token);
+    }
+    // A stateless session cannot be revoked server-side; the cookie is cleared at the client.
+  }
+
+  boolean isStateless() {
+    return codec != null;
   }
 
   static final class Key {
@@ -218,6 +246,10 @@ public class WebSessionManager {
 
     public long getExpiresAt() {
       return expiresAt;
+    }
+
+    long getRefreshCookieAt() {
+      return refreshCookieAt;
     }
 
     /**

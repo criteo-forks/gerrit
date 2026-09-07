@@ -579,6 +579,28 @@ values can't be accessed by client side scripts.
 +
 By default, `true`.
 
+
+[[auth.statelessSessions]]auth.statelessSessions::
++
+If true, web sessions are not stored on the server. The `GerritAccount`
+cookie carries the signed session record (account, expiry, refresh time,
+sign-in identity, session id and XSRF token), so every node behind a load
+balancer accepts it and a restarted node keeps its users signed in. Signing
+out clears the cookie in that browser only; a copy of the cookie stays
+valid until the session expires (link:#cache.name.maxAge[cache.web_sessions.maxAge],
+12 hours by default). The record is signed with HMAC-SHA256 using
+link:#auth.sessionSigningKey[auth.sessionSigningKey], or a key supplied by a
+library module that replaces the `web-session-signing-key` module.
++
+Default is false.
+
+[[auth.sessionSigningKey]]auth.sessionSigningKey::
++
+Base64 encoding of at least 16 random bytes that sign stateless session
+cookies. Every node must use the same key; keep it in `secure.config`.
+Changing the key signs every user out.
++
+Only used when link:#auth.statelessSessions[auth.statelessSessions] is true.
 [[auth.externalIdsRefExpiry]]auth.externalIdsRefExpiry::
 +
 Define TTL value for memoizing the refs/meta/external-ids sha1 rather than opening

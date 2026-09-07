@@ -31,6 +31,7 @@ import com.google.gerrit.httpd.GerritAuthModule;
 import com.google.gerrit.httpd.GetUserFilter.GetUserFilterModule;
 import com.google.gerrit.httpd.GitOverHttpModule;
 import com.google.gerrit.httpd.H2CacheBasedWebSession;
+import com.google.gerrit.httpd.WebSessionSigningKeyModule;
 import com.google.gerrit.httpd.HttpCanonicalWebUrlProvider;
 import com.google.gerrit.httpd.HttpdModule;
 import com.google.gerrit.httpd.RequestCleanupFilter;
@@ -600,6 +601,7 @@ public class Daemon extends SiteProgram {
     }
     modules.add(new LocalMergeSuperSetComputationModule());
     modules.add(new DefaultLockManagerModule());
+    modules.add(new WebSessionSigningKeyModule());
 
     List<Module> libModules =
         LibModuleLoader.loadModules(cfgInjector, LibModuleType.SYS_MODULE_TYPE);
