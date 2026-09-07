@@ -15,6 +15,7 @@
 package com.google.gerrit.httpd;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.google.common.cache.Cache;
@@ -70,7 +71,9 @@ public class WebSessionManagerStatelessTest {
 
     Val refreshed = manager.createVal(key, first);
 
-    assertThat(key.getToken()).isNotEqualTo(firstToken);
+    // The token is a deterministic encoding of the session, so it only changes when the clock
+    // moved between the two calls; what matters is that it still carries the same session.
+    assertThat(refreshed.getExpiresAt()).isAtLeast(first.getExpiresAt());
     assertThat(refreshed.getSessionId()).isEqualTo(first.getSessionId());
     assertThat(refreshed.getAuth()).isEqualTo(first.getAuth());
     assertThat(manager.get(new WebSessionManager.Key(key.getToken()))).isNotNull();
@@ -88,6 +91,20 @@ public class WebSessionManagerStatelessTest {
 
     // Stateless sessions are revoked at the client by clearing the cookie, not on the server.
     assertThat(manager.get(new WebSessionManager.Key(key.getToken()))).isNotNull();
+  }
+
+  @Test
+  public void configuredKeyProviderIsHarmlessWhenStatelessSessionsAreOff() {
+    Config cfg = new Config();
+    assertThat(new WebSessionSigningKeyModule.ConfigSigningKey(cfg).get()).isEmpty();
+
+    cfg.setBoolean("auth", null, "statelessSessions", true);
+    assertThrows(
+        com.google.inject.ProvisionException.class,
+        () -> new WebSessionSigningKeyModule.ConfigSigningKey(cfg).get());
+
+    cfg.setString("auth", null, "sessionSigningKey", java.util.Base64.getEncoder().encodeToString(KEY));
+    assertThat(new WebSessionSigningKeyModule.ConfigSigningKey(cfg).get()).isEqualTo(KEY);
   }
 
   @Test

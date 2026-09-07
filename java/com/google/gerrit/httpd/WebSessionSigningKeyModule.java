@@ -61,6 +61,11 @@ public class WebSessionSigningKeyModule extends AbstractModule {
     public byte[] get() {
       String encoded = cfg.getString("auth", null, "sessionSigningKey");
       if (Strings.isNullOrEmpty(encoded)) {
+        if (!cfg.getBoolean("auth", null, "statelessSessions", false)) {
+          // Singletons are created eagerly at injector creation; a site that keeps sessions in
+          // the cache has no key and must not fail to start because of it.
+          return new byte[0];
+        }
         throw new ProvisionException(
             "auth.statelessSessions is enabled but auth.sessionSigningKey is not set; put the"
                 + " base64 of at least 16 random bytes in secure.config on every node, or install a"
