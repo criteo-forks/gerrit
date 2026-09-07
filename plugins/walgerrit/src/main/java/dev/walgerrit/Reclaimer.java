@@ -83,10 +83,20 @@ final class Reclaimer {
    * policy for repositories nobody has written to since it last ran, at no extra read.
    */
   Report reclaimAll(BiConsumer<Project.NameKey, Manifest> observer) throws IOException {
+    return reclaimAll(observer, true);
+  }
+
+  /**
+   * Sweeps every repository. With {@code deleteFromStore} false only this node's cached copies of
+   * unreferenced files go, which is what a node that does not lead the deployment does: the store
+   * is shared, so one node deleting from it is enough, and the grace period makes it safe to wait.
+   */
+  Report reclaimAll(BiConsumer<Project.NameKey, Manifest> observer, boolean deleteFromStore)
+      throws IOException {
     Report total = new Report(0, 0, 0, 0);
     for (Project.NameKey project : repositories.storage().listProjects()) {
       try {
-        total = total.plus(reclaim(project, observer));
+        total = total.plus(reclaim(project, observer, deleteFromStore));
       } catch (IOException exception) {
         logger.warn("WalGerrit could not reclaim files of {}", project.get(), exception);
       }
@@ -110,10 +120,13 @@ final class Reclaimer {
 
   /** One repository: store files past the grace period, then the local cache. */
   Report reclaim(Project.NameKey project) throws IOException {
-    return reclaim(project, (name, manifest) -> {});
+    return reclaim(project, (name, manifest) -> {}, true);
   }
 
-  private Report reclaim(Project.NameKey project, BiConsumer<Project.NameKey, Manifest> observer)
+  private Report reclaim(
+      Project.NameKey project,
+      BiConsumer<Project.NameKey, Manifest> observer,
+      boolean deleteFromStore)
       throws IOException {
     ManifestStore store = repositories.storage().manifestStore(project);
     Manifest manifest = store.refresh();
@@ -121,12 +134,14 @@ final class Reclaimer {
     Set<String> live = ManifestStore.liveFileNames(manifest);
     long cutoff = clock.millis() - grace.toMillis();
     int deleted = 0;
-    for (ObjectStore.ObjectSummary object : store.listWalObjects()) {
-      if (live.contains(object.key()) || object.lastModifiedEpochMillis() > cutoff) {
-        continue;
+    if (deleteFromStore) {
+      for (ObjectStore.ObjectSummary object : store.listWalObjects()) {
+        if (live.contains(object.key()) || object.lastModifiedEpochMillis() > cutoff) {
+          continue;
+        }
+        store.deleteWalObject(object.key());
+        deleted++;
       }
-      store.deleteWalObject(object.key());
-      deleted++;
     }
     int evicted = store.evictLocalFilesExcept(live);
     if (deleted > 0 || evicted > 0) {

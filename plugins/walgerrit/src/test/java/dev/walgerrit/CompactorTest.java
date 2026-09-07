@@ -269,7 +269,7 @@ class CompactorTest {
       }
     }
 
-    try (CompactionLease.Held byB =
+    try (StoreLease.Held byB =
         nodeB.storage().compactionLease(PROJECT).acquire(Duration.ofMinutes(5)).orElseThrow()) {
       assertEquals(Outcome.LEASED_ELSEWHERE, nodeA.compactor().compact(PROJECT));
       assertTrue(objectPacks(manifest(nodeA)).size() >= 4, "nothing was rewritten");

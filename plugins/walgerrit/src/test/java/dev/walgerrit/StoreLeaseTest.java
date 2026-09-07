@@ -25,7 +25,7 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-class CompactionLeaseTest {
+class StoreLeaseTest {
   private static final String KEY = "leases/platform/repo.git/compaction";
   private static final Duration TTL = Duration.ofMinutes(10);
 
@@ -35,10 +35,10 @@ class CompactionLeaseTest {
   void onlyOneNodeHoldsTheLeaseUntilItIsReleased() throws IOException {
     FileObjectStore store = new FileObjectStore(root);
     SteppingClock clock = new SteppingClock(Instant.parse("2026-09-02T12:00:00Z"));
-    CompactionLease nodeA = new CompactionLease(store, KEY, clock, "node-a");
-    CompactionLease nodeB = new CompactionLease(store, KEY, clock, "node-b");
+    StoreLease nodeA = new StoreLease(store, KEY, clock, "node-a");
+    StoreLease nodeB = new StoreLease(store, KEY, clock, "node-b");
 
-    Optional<CompactionLease.Held> held = nodeA.acquire(TTL);
+    Optional<StoreLease.Held> held = nodeA.acquire(TTL);
     assertTrue(held.isPresent());
     assertTrue(nodeB.acquire(TTL).isEmpty(), "an unexpired lease is not taken over");
     assertEquals("node-a", nodeA.current().orElseThrow().getOwner());
@@ -52,12 +52,12 @@ class CompactionLeaseTest {
   void anExpiredLeaseIsTakenOverAndTheOldHolderCannotRenew() throws IOException {
     FileObjectStore store = new FileObjectStore(root);
     SteppingClock clock = new SteppingClock(Instant.parse("2026-09-02T12:00:00Z"));
-    CompactionLease nodeA = new CompactionLease(store, KEY, clock, "node-a");
-    CompactionLease nodeB = new CompactionLease(store, KEY, clock, "node-b");
+    StoreLease nodeA = new StoreLease(store, KEY, clock, "node-a");
+    StoreLease nodeB = new StoreLease(store, KEY, clock, "node-b");
 
-    CompactionLease.Held byA = nodeA.acquire(TTL).orElseThrow();
+    StoreLease.Held byA = nodeA.acquire(TTL).orElseThrow();
     clock.advance(TTL.plusSeconds(1));
-    CompactionLease.Held byB = nodeB.acquire(TTL).orElseThrow();
+    StoreLease.Held byB = nodeB.acquire(TTL).orElseThrow();
     assertEquals("node-b", nodeB.current().orElseThrow().getOwner());
 
     assertThrows(IOException.class, () -> byA.renew(TTL));

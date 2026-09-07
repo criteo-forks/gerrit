@@ -28,7 +28,7 @@ import java.util.Optional;
  * the object or by replacing an expired one through a compare-and-swap on its version; releasing
  * writes an expiry of zero rather than deleting, so the object never churns delete markers.
  */
-final class CompactionLease {
+final class StoreLease {
   static final String FILE = "compaction";
 
   private final ObjectStore store;
@@ -36,7 +36,7 @@ final class CompactionLease {
   private final Clock clock;
   private final String owner;
 
-  CompactionLease(ObjectStore store, String key, Clock clock, String owner) {
+  StoreLease(ObjectStore store, String key, Clock clock, String owner) {
     this.store = store;
     this.key = key;
     this.clock = clock;

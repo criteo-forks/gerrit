@@ -37,6 +37,7 @@ final class StorageLayout {
   private static final String MANIFESTS_DIRECTORY = "manifests";
   private static final String REPOSITORIES_DIRECTORY = "repos";
   private static final String LEASES_DIRECTORY = "leases";
+  private static final String CLUSTER_DIRECTORY = "cluster";
   private static final String REPOSITORY_SUFFIX = ".git";
 
   private final ObjectStore objectStore;
@@ -45,6 +46,7 @@ final class StorageLayout {
   private final String manifestsPrefix;
   private final String repositoriesPrefix;
   private final String leasesPrefix;
+  private final String clusterPrefix;
   private final boolean cacheIsStore;
   private final long packFetchChunkSize;
   private final ManifestCache manifestCache = new ManifestCache();
@@ -81,6 +83,7 @@ final class StorageLayout {
     manifestsPrefix = under(normalizedPrefix, MANIFESTS_DIRECTORY);
     repositoriesPrefix = under(normalizedPrefix, REPOSITORIES_DIRECTORY);
     leasesPrefix = under(normalizedPrefix, LEASES_DIRECTORY);
+    clusterPrefix = under(normalizedPrefix, CLUSTER_DIRECTORY);
     cacheIsStore =
         objectStore instanceof FileObjectStore files
             && files.root().equals(cacheRoot.toAbsolutePath().normalize());
@@ -108,10 +111,27 @@ final class StorageLayout {
     return cacheRepositoriesPath;
   }
 
-  CompactionLease compactionLease(Project.NameKey name) throws IOException {
-    return new CompactionLease(
+  /**
+   * Objects that belong to the deployment as a whole rather than to one repository: keys, leases
+   * and cursors every node must agree on. Lives under {@code <prefix>/cluster/}.
+   */
+  ObjectStore clusterStore() {
+    return new PrefixedObjectStore(objectStore, clusterPrefix);
+  }
+
+  /** A lease every node competes for, such as {@code leader}; lives under {@code leases/cluster/}. */
+  StoreLease clusterLease(String name) {
+    return new StoreLease(
         objectStore,
-        leasesPrefix + "/" + repositoryRelativePath(name) + "/" + CompactionLease.FILE,
+        leasesPrefix + "/" + CLUSTER_DIRECTORY + "/" + name,
+        Clock.systemUTC(),
+        ManifestStore.writerIdentity());
+  }
+
+  StoreLease compactionLease(Project.NameKey name) throws IOException {
+    return new StoreLease(
+        objectStore,
+        leasesPrefix + "/" + repositoryRelativePath(name) + "/" + StoreLease.FILE,
         Clock.systemUTC(),
         ManifestStore.writerIdentity());
   }
