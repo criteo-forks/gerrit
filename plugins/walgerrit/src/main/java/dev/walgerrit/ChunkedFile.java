@@ -42,6 +42,10 @@ import java.util.UUID;
  * <p>Reads of present chunks proceed concurrently and without locking; a missing chunk is fetched
  * under the file's lock, together with the missing chunks that follow it within the requested
  * range, so a sequential scan costs one request per run rather than per chunk.
+ *
+ * <p>No file descriptor is held between operations: every read and every chunk write opens the
+ * data file and closes it again. A node materialising thousands of packs would otherwise pin one
+ * descriptor per pack for the life of the process, and a container's limit can be as low as 1024.
  */
 final class ChunkedFile {
   /** Reads {@code length} bytes of the store object starting at {@code offset}. */
@@ -60,20 +64,20 @@ final class ChunkedFile {
   private final int chunkSize;
   private final int chunkCount;
   private final Fetcher fetcher;
-  private final FileChannel channel;
+  private final Runnable onComplete;
   private final BitSet present;
   private final Object lock = new Object();
   private volatile boolean complete;
 
   private ChunkedFile(
-      Path data, long size, int chunkSize, Fetcher fetcher, FileChannel channel, BitSet present) {
+      Path data, long size, int chunkSize, Fetcher fetcher, Runnable onComplete, BitSet present) {
     this.data = data;
     this.sidecar = sidecarFor(data);
     this.size = size;
     this.chunkSize = chunkSize;
     this.chunkCount = chunkCount(size, chunkSize);
     this.fetcher = fetcher;
-    this.channel = channel;
+    this.onComplete = onComplete;
     this.present = present;
     this.complete = present.cardinality() == chunkCount;
   }
@@ -100,6 +104,13 @@ final class ChunkedFile {
    * written to again.
    */
   static ChunkedFile open(Path data, long size, int chunkSize, Fetcher fetcher) throws IOException {
+    return open(data, size, chunkSize, fetcher, () -> {});
+  }
+
+  /** As {@link #open(Path, long, int, Fetcher)}; {@code onComplete} runs once the last chunk lands. */
+  static ChunkedFile open(
+      Path data, long size, int chunkSize, Fetcher fetcher, Runnable onComplete)
+      throws IOException {
     if (size <= 0 || chunkSize <= 0) {
       throw new IllegalArgumentException("size and chunk size must be positive");
     }
@@ -108,8 +119,7 @@ final class ChunkedFile {
     BitSet present = new BitSet(chunkCount);
     if (Files.isRegularFile(data) && !Files.exists(sidecar)) {
       present.set(0, chunkCount);
-      FileChannel channel = FileChannel.open(data, StandardOpenOption.READ);
-      return new ChunkedFile(data, size, chunkSize, fetcher, channel, present);
+      return new ChunkedFile(data, size, chunkSize, fetcher, onComplete, present);
     }
     boolean resume = false;
     if (Files.isRegularFile(data) && Files.isRegularFile(sidecar)) {
@@ -132,9 +142,7 @@ final class ChunkedFile {
       present = new BitSet(chunkCount);
       writeSidecar(sidecar, size, chunkSize, present);
     }
-    FileChannel channel =
-        FileChannel.open(data, StandardOpenOption.READ, StandardOpenOption.WRITE);
-    return new ChunkedFile(data, size, chunkSize, fetcher, channel, present);
+    return new ChunkedFile(data, size, chunkSize, fetcher, onComplete, present);
   }
 
   Path path() {
@@ -205,7 +213,9 @@ final class ChunkedFile {
 
   /** Positional read of present bytes; callers ensure the range first. */
   int read(ByteBuffer destination, long position) throws IOException {
-    return channel.read(destination, position);
+    try (FileChannel channel = FileChannel.open(data, StandardOpenOption.READ)) {
+      return channel.read(destination, position);
+    }
   }
 
   private boolean has(int chunk) {
@@ -225,15 +235,18 @@ final class ChunkedFile {
               + length);
     }
     ByteBuffer buffer = ByteBuffer.wrap(bytes);
-    long position = start;
-    while (buffer.hasRemaining()) {
-      position += channel.write(buffer, position);
+    try (FileChannel channel = FileChannel.open(data, StandardOpenOption.WRITE)) {
+      long position = start;
+      while (buffer.hasRemaining()) {
+        position += channel.write(buffer, position);
+      }
+      channel.force(false);
     }
-    channel.force(false);
     present.set(firstChunk, lastChunk + 1);
     if (present.cardinality() == chunkCount) {
       Files.deleteIfExists(sidecar);
       complete = true;
+      onComplete.run();
     } else {
       writeSidecar(sidecar, size, chunkSize, present);
     }

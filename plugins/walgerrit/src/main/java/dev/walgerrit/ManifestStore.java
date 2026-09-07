@@ -461,6 +461,7 @@ final class ManifestStore {
     createCacheDirectories();
     Path target = walPath.resolve(fileName);
     if (Files.isRegularFile(target) && !Files.exists(ChunkedFile.sidecarFor(target))) {
+      chunkedFiles.remove(target);
       return new FileReadableChannel(target);
     }
     if (!fetchesPacksInChunks() || size <= packFetchChunkSize) {
@@ -473,8 +474,9 @@ final class ManifestStore {
     Path target = walPath.resolve(fileName);
     String key = WAL_DIRECTORY + "/" + fileName;
     ChunkedFile existing = chunkedFiles.get(target);
-    if (existing != null && !existing.exists()) {
-      // Trimmed from the cache while registered; start over rather than read an unlinked file.
+    if (existing != null && (!existing.exists() || existing.isComplete())) {
+      // Trimmed from the cache while registered, or complete: the registry only tracks packs
+      // that are still arriving.
       chunkedFiles.remove(target, existing);
     }
     try {
@@ -486,7 +488,8 @@ final class ManifestStore {
                   path,
                   size,
                   (int) packFetchChunkSize,
-                  (offset, length) -> objectStore.getRange(key, offset, length));
+                  (offset, length) -> objectStore.getRange(key, offset, length),
+                  () -> chunkedFiles.remove(path));
             } catch (IOException exception) {
               throw new java.io.UncheckedIOException(exception);
             }

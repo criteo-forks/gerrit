@@ -94,6 +94,11 @@ final class StorageLayout {
     return cacheIsStore;
   }
 
+  /** Packs still being fetched in chunks on this node; complete ones leave the registry. */
+  int packsArrivingInChunks() {
+    return chunkedFiles.size();
+  }
+
   /** Observes every manifest a store created by this layout publishes. */
   void onPublication(BiConsumer<Project.NameKey, Manifest> listener) {
     publicationListener = listener;

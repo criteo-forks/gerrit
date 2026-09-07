@@ -111,6 +111,7 @@ class ChunkedPackReadsTest {
     }
     assertEquals(0, store.rangeReads.get(), "a complete pack is read locally");
     assertTrue(store.downloads.isEmpty(), "nothing is downloaded again");
+    assertEquals(0, cold.storage().packsArrivingInChunks(), "complete packs leave the registry");
   }
 
   @Test
