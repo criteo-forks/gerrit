@@ -127,6 +127,8 @@ final class GroupPublisher {
   private final Deque<Request> queue = new ArrayDeque<>();
   private final List<Admission> inFlight = new ArrayList<>();
   private final Map<String, PackRef> pendingAdditions = new LinkedHashMap<>();
+  /** Pending packs a publication in flight carries; still listed and protected until it resolves. */
+  private final Map<String, PackRef> inFlightAdditions = new LinkedHashMap<>();
   private boolean publishing;
   private long epoch;
   private long knownRefRevision = -1;
@@ -201,11 +203,16 @@ final class GroupPublisher {
     }
   }
 
-  /** Packs uploaded on this node that no manifest lists yet, in commit order. */
+  /**
+   * Packs uploaded on this node that no manifest is known to list yet, in commit order: those
+   * waiting for a publication and those a publication in flight is carrying.
+   */
   List<PackRef> pending() {
     state.lock();
     try {
-      return List.copyOf(pendingAdditions.values());
+      List<PackRef> packs = new ArrayList<>(inFlightAdditions.values());
+      packs.addAll(pendingAdditions.values());
+      return List.copyOf(packs);
     } finally {
       state.unlock();
     }
@@ -214,18 +221,18 @@ final class GroupPublisher {
   boolean hasPending() {
     state.lock();
     try {
-      return !pendingAdditions.isEmpty();
+      return !pendingAdditions.isEmpty() || !inFlightAdditions.isEmpty();
     } finally {
       state.unlock();
     }
   }
 
-  /** Whether any of the named packs still waits for a publication. */
+  /** Whether any of the named packs still waits for a publication to resolve. */
   boolean hasPendingAny(Collection<String> names) {
     state.lock();
     try {
       for (String name : names) {
-        if (pendingAdditions.containsKey(name)) {
+        if (pendingAdditions.containsKey(name) || inFlightAdditions.containsKey(name)) {
           return true;
         }
       }
@@ -235,11 +242,23 @@ final class GroupPublisher {
     }
   }
 
-  /** Names of the pending packs. */
+  /** Requests waiting for a publisher; lets tests wait for a transaction to queue. */
+  int queuedForTesting() {
+    state.lock();
+    try {
+      return queue.size();
+    } finally {
+      state.unlock();
+    }
+  }
+
+  /** Names of every pack {@link #pending()} lists. */
   Set<String> pendingNames() {
     state.lock();
     try {
-      return Set.copyOf(pendingAdditions.keySet());
+      Set<String> names = new HashSet<>(inFlightAdditions.keySet());
+      names.addAll(pendingAdditions.keySet());
+      return Set.copyOf(names);
     } finally {
       state.unlock();
     }
@@ -325,6 +344,11 @@ final class GroupPublisher {
     state.lock();
     try {
       drained = new ArrayList<>(pendingAdditions.values());
+      // Until the outcome is known the packs are neither pending nor published; readers on this
+      // node and the reclaimer keep seeing them through the in-flight set.
+      for (PackRef pack : drained) {
+        inFlightAdditions.put(pack.getName(), pack);
+      }
       pendingAdditions.clear();
       groupEpoch = epoch;
       expectedRefRevision = knownRefRevision;
@@ -348,18 +372,20 @@ final class GroupPublisher {
         // A compaction of packs no manifest lists yet (JGit's compactor run over a handle's own
         // flushes): list them first, so an entry only ever supersedes what was live.
         store.publish(0, drained, List.of(), false, null);
+        settle(drained, true);
         drained = List.of();
         additions.clear();
       }
+      Manifest before = store.current();
       Set<String> live = new HashSet<>();
-      for (PackRef pack : store.current().getPacksList()) {
+      for (PackRef pack : before.getPacksList()) {
         live.add(pack.getName());
       }
       Set<String> superseded = new HashSet<>();
       for (Request member : group) {
         IOException rejection = rejection(member, groupEpoch, expectedRefRevision, live, superseded);
         if (rejection != null) {
-          complete(List.of(member), null, false, rejection);
+          complete(List.of(member), null, false, expectedRefRevision, rejection);
           continue;
         }
         superseded.addAll(member.supersedes);
@@ -372,14 +398,18 @@ final class GroupPublisher {
         }
       }
       if (accepted.isEmpty()) {
-        defer(drained);
+        settle(drained, false);
         return;
       }
       if (additions.isEmpty() && supersedes.isEmpty() && !refUpdate) {
         // Nothing to publish: flush requests that found the pending packs already gone.
-        complete(accepted, store.current(), false, null);
+        complete(accepted, before, false, expectedRefRevision, null);
         return;
       }
+      // What this publication itself does to the ref revision; anything beyond it in the manifest
+      // that comes back was written by another node after members validated.
+      long produced =
+          expectedRefRevision + (ManifestStore.changesRefs(additions, supersedes, before) ? 1 : 0);
       Manifest updated =
           store.publish(
               refUpdate ? expectedRefRevision : 0,
@@ -387,9 +417,12 @@ final class GroupPublisher {
               supersedes,
               refUpdate,
               refUpdate ? transaction.build() : null);
-      complete(accepted, updated, accepted.size() > 1 || !drained.isEmpty(), null);
+      settle(drained, true);
+      complete(accepted, updated, accepted.size() > 1 || !drained.isEmpty(), produced, null);
     } catch (IOException failure) {
-      defer(drained);
+      // Whether the CAS landed is unknown when the response was lost; the packs go back to pending
+      // and the next publication skips whichever the manifest turns out to list already.
+      settle(drained, false);
       if (failure instanceof ManifestConflictException) {
         // The store answered with a manifest whose refs this node did not write.
         try {
@@ -398,11 +431,26 @@ final class GroupPublisher {
           // The members re-read the manifest when they re-run.
         }
       }
-      complete(accepted, null, false, failure);
+      complete(accepted, null, false, expectedRefRevision, failure);
     } catch (RuntimeException failure) {
-      defer(drained);
-      complete(accepted, null, false, new IOException("Publication failed", failure));
+      settle(drained, false);
+      complete(accepted, null, false, expectedRefRevision, new IOException("Publication failed", failure));
       throw failure;
+    }
+  }
+
+  /** Takes the group's packs out of the in-flight set: published, or back to pending. */
+  private void settle(List<PackRef> drained, boolean published) {
+    state.lock();
+    try {
+      for (PackRef pack : drained) {
+        inFlightAdditions.remove(pack.getName());
+        if (!published) {
+          pendingAdditions.putIfAbsent(pack.getName(), pack);
+        }
+      }
+    } finally {
+      state.unlock();
     }
   }
 
@@ -423,10 +471,23 @@ final class GroupPublisher {
     return null;
   }
 
-  private void complete(List<Request> members, Manifest landed, boolean shared, IOException failure) {
+  /**
+   * Hands the outcome to the members. A landed manifest whose ref revision exceeds what this
+   * publication produced (a lost CAS response recovered from a later read) carries another node's
+   * ref changes, so the validation epoch advances and queued members re-run against them.
+   */
+  private void complete(
+      List<Request> members,
+      Manifest landed,
+      boolean shared,
+      long producedRefRevision,
+      IOException failure) {
     state.lock();
     try {
       if (landed != null) {
+        if (landed.getRefRevision() > producedRefRevision) {
+          epoch++;
+        }
         knownRefRevision = Math.max(knownRefRevision, landed.getRefRevision());
       }
       for (Request member : members) {

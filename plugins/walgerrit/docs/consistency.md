@@ -26,8 +26,12 @@ lock, releases it, and hands the publication to the publisher. Members admitted 
 against states this node itself produced, so their reftables land in one log entry with one CAS,
 together with every object pack JGit committed ahead of a transaction: a received pack or an
 inserter flush is uploaded at once but published by the next ref transaction on the node, or when
-the handle that committed it closes, so a push is one CAS rather than three. Across nodes the
-manifest compare-and-swap is the only fence. A group that loses it to another node's ref change
+the handle that committed it closes, so a push is one CAS rather than three. A pack stays listed on
+its node until the publication carrying it is known to have landed, and a publication whose
+response was lost is reconciled against the manifest before anything is retried: a pack the
+manifest already lists is not added twice, and a manifest that came back with more ref changes
+than the publication made ends the validation epoch of every transaction still queued. Across nodes
+the manifest compare-and-swap is the only fence. A group that loses it to another node's ref change
 fails as a whole, and every member is re-run from scratch against the reloaded manifest,
 expected-value checks included, up to five times; independent updates to different refs therefore
 all land, as they do on Gerrit's file-based backends. A real ref conflict is reported to Gerrit as

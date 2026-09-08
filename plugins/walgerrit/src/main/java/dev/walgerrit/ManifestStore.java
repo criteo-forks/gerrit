@@ -384,7 +384,18 @@ final class ManifestStore {
         }
       }
 
-      boolean changesRefs = changesRefs(additions, supersedes, current);
+      // Pack names are unique per write, so a name the manifest already lists is this node's own
+      // earlier publication whose response was lost; there is nothing left to add for it.
+      List<PackRef> newAdditions = new ArrayList<>();
+      for (PackRef addition : additions) {
+        if (!livePacks.containsKey(addition.getName())) {
+          newAdditions.add(addition);
+        }
+      }
+      if (newAdditions.isEmpty() && supersedes.isEmpty() && refTransaction == null && eventJson.isEmpty()) {
+        return current;
+      }
+      boolean changesRefs = changesRefs(newAdditions, supersedes, current);
       LogEntry.Builder entry =
           LogEntry.newBuilder()
               .setSeq(sequence)
@@ -402,11 +413,9 @@ final class ManifestStore {
       if (refTransaction != null) {
         entry.setRefTransaction(refTransaction);
       }
-      for (PackRef addition : additions) {
+      for (PackRef addition : newAdditions) {
         PackRef published = addition.toBuilder().setSeq(sequence).build();
-        if (livePacks.putIfAbsent(published.getName(), published) != null) {
-          throw new IOException("Pack already exists in manifest: " + published.getName());
-        }
+        livePacks.put(published.getName(), published);
         entry.addAdditions(published);
       }
 
@@ -749,7 +758,8 @@ final class ManifestStore {
     return supersedes.isEmpty() ? LogEntry.Kind.PACK : LogEntry.Kind.COMPACT;
   }
 
-  private static boolean changesRefs(
+  /** Whether publishing these additions and supersedes on {@code current} advances the ref revision. */
+  static boolean changesRefs(
       Collection<PackRef> additions, Collection<String> supersedes, Manifest current) {
     if (additions.stream().anyMatch(ManifestStore::hasReftable)) {
       return true;
