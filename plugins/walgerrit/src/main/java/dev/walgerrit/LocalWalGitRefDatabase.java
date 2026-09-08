@@ -15,6 +15,7 @@
 package dev.walgerrit;
 
 import java.io.IOException;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -114,6 +115,18 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
     stackRevision = objectDatabase.observedManifestRevision();
   }
 
+  /**
+   * JGit folds a small transaction into the small table on top of the stack instead of deepening
+   * it. Two concurrent transactions on this node would both fold the same table, so folding is only
+   * allowed while this transaction is the only one in flight; otherwise the stack deepens by one
+   * and the compactor merges it later.
+   */
+  @Override
+  protected boolean compactDuringCommit() {
+    return objectDatabase.publisher().alone();
+  }
+
+
   private static final class WalGitBatchRefUpdate extends DfsReftableBatchRefUpdate {
     private static final Logger logger = LoggerFactory.getLogger(WalGitBatchRefUpdate.class);
     private static final int MAX_ATTEMPTS = 5;
@@ -140,44 +153,66 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
     @Override
     public void execute(
         RevWalk walk, ProgressMonitor monitor, List<String> options) {
-      ReentrantLock nodeLock = objectDatabase.writeLock();
-      nodeLock.lock();
-      try {
-        for (int attempt = 1; ; attempt++) {
-          List<ReceiveCommand> pending = pending();
-          if (pending.isEmpty()) {
-            return;
-          }
+      GroupPublisher publisher = objectDatabase.publisher();
+      ReentrantLock nodeLock = publisher.nodeLock();
+      for (int attempt = 1; ; attempt++) {
+        List<ReceiveCommand> pending = pending();
+        if (pending.isEmpty()) {
+          return;
+        }
+        GroupPublisher.Admission admission = null;
+        int heldBefore = nodeLock.getHoldCount();
+        try {
+          // One conditional manifest read, outside every lock, so expected-value checks run
+          // against the current global state.
+          objectDatabase.revalidateNow();
+          admission = publisher.admit(refNames(pending));
+          nodeLock.lock();
           try {
             objectDatabase.beginRefTransaction();
             refDatabase.refresh();
             super.execute(walk, monitor, options);
-            if (!objectDatabase.refTransactionConflicted() || attempt >= MAX_ATTEMPTS) {
-              return;
-            }
-          } catch (IOException exception) {
-            logger.error("WalGerrit could not start a ref transaction", exception);
-            abort(pending);
-            return;
           } finally {
-            objectDatabase.endRefTransaction();
+            // A publication released the lock as soon as the reftable was written; a transaction
+            // that failed validation still holds it.
+            while (nodeLock.getHoldCount() > heldBefore) {
+              nodeLock.unlock();
+            }
           }
-          logger.info(
-              "Refs of {} changed on another node during a ref transaction; retrying ({}/{})",
-              objectDatabase.repositoryName(),
-              attempt,
-              MAX_ATTEMPTS);
-          for (ReceiveCommand command : pending) {
-            command.setResult(ReceiveCommand.Result.NOT_ATTEMPTED);
-          }
-          if (!pause(attempt)) {
-            abort(pending);
+          if (!objectDatabase.refTransactionConflicted() || attempt >= MAX_ATTEMPTS) {
             return;
+          }
+        } catch (IOException exception) {
+          logger.error("WalGerrit could not start a ref transaction", exception);
+          abort(pending);
+          return;
+        } finally {
+          objectDatabase.endRefTransaction();
+          if (admission != null) {
+            admission.release();
           }
         }
-      } finally {
-        nodeLock.unlock();
+        logger.info(
+            "Refs of {} changed on another node during a ref transaction; retrying ({}/{})",
+            objectDatabase.repositoryName(),
+            attempt,
+            MAX_ATTEMPTS);
+        for (ReceiveCommand command : pending) {
+          command.setResult(ReceiveCommand.Result.NOT_ATTEMPTED);
+        }
+        if (!pause(attempt)) {
+          abort(pending);
+          return;
+        }
       }
+    }
+
+    private static Set<String> refNames(List<ReceiveCommand> commands) {
+      Set<String> names = new HashSet<>();
+      for (ReceiveCommand command : commands) {
+        names.add(command.getRefName());
+      }
+      return names;
     }
 
     private List<ReceiveCommand> pending() {

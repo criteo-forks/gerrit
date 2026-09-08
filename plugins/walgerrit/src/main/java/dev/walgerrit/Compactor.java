@@ -211,8 +211,8 @@ final class Compactor {
             compacted |= compactPacks(repository, plan.packs());
             held.renew(leaseDuration);
           }
-          if (plan.reftables()) {
-            compacted |= compactReftables(repository);
+          if (!plan.reftables().isEmpty()) {
+            compacted |= compactReftables(repository, plan.reftables());
             held.renew(leaseDuration);
           }
         }
@@ -264,18 +264,28 @@ final class Compactor {
     return true;
   }
 
-  /** Merges the whole reftable stack into one table; false if it is already shallow enough. */
-  private boolean compactReftables(LocalWalGitRepository repository) throws IOException {
+  /**
+   * Merges the named tables, the top of the stack as {@link CompactionPolicy#plan} chose it, into
+   * one {@code COMPACT} table; false if the stack changed since the plan was made.
+   */
+  private boolean compactReftables(LocalWalGitRepository repository, List<String> names)
+      throws IOException {
     DfsObjDatabase objects = repository.getObjectDatabase();
-    DfsReftable[] tables = objects.getReftables();
-    if (tables.length < policy.minReftables()) {
+    Set<String> wanted = new java.util.HashSet<>(names);
+    List<DfsReftable> inputs = new java.util.ArrayList<>();
+    for (DfsReftable table : objects.getReftables()) {
+      if (wanted.remove(LocalWalGitObjectDatabase.packName(table.getPackDescription()))) {
+        inputs.add(table);
+      }
+    }
+    if (!wanted.isEmpty() || inputs.size() < 2) {
       return false;
     }
     DfsPackCompactor compactor =
         new DfsPackCompactor(repository)
             .setReftableConfig(
                 ((DfsReftableDatabase) repository.getRefDatabase()).getReftableConfig());
-    for (DfsReftable table : tables) {
+    for (DfsReftable table : inputs) {
       compactor.add(table);
     }
     long started = System.nanoTime();
@@ -289,8 +299,9 @@ final class Compactor {
       return false;
     }
     logger.info(
-        "WalGerrit compacted the {}-table reftable stack of {} into one table in {} ms",
-        tables.length,
+        "WalGerrit compacted {} of the {} reftables of {} into one table in {} ms",
+        inputs.size(),
+        objects.getReftables().length,
         repository.getDescription().getRepositoryName(),
         (System.nanoTime() - started) / 1_000_000);
     return true;

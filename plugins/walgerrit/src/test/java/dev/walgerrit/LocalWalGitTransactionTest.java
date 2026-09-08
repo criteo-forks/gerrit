@@ -82,7 +82,12 @@ class LocalWalGitTransactionTest {
                 repositoryPath(project)
                     .resolve(ManifestStore.logKey(manifest.getHeadSeq(), manifest.getHeadTransactionId()))));
     assertEquals(LogEntry.Kind.REF_UPDATE, entry.getKind());
-    assertEquals(1, entry.getAdditionsCount());
+    assertEquals(2, entry.getAdditionsCount(), "the objects' pack rides in the ref transaction's entry");
+    assertEquals(
+        Set.of("pack", "ref"),
+        entry.getAdditionsList().stream()
+            .map(pack -> pack.getFiles(0).getExtension())
+            .collect(Collectors.toSet()));
     assertTrue(entry.hasRefTransaction());
     assertEquals(2, entry.getRefTransaction().getUpdatesCount());
     assertEquals(

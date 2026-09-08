@@ -71,7 +71,10 @@ class ManifestReadCountTest {
           0,
           store.manifestReads(),
           "object insertion consults JGit's in-memory pack list, not the object store");
-      assertEquals(1, store.count("CAS manifest.pb"), "one flush publishes with one CAS");
+      assertEquals(
+          0,
+          store.count("CAS manifest.pb"),
+          "a flush uploads its pack but publishes nothing; the ref transaction carries it");
       store.reset();
 
       RefUpdate update = repository.updateRef(Constants.R_HEADS + "main");
@@ -121,7 +124,7 @@ class ManifestReadCountTest {
       }
     }
     assertEquals(cycles, store.manifestReads(), "one conditional read per ref transaction");
-    assertEquals(2 * cycles, store.count("CAS manifest.pb"), "one CAS per pack and per reftable");
+    assertEquals(cycles, store.count("CAS manifest.pb"), "one CAS per cycle: the reftable carries the pack");
   }
 
   @Test
@@ -169,7 +172,7 @@ class ManifestReadCountTest {
     tailer.runOnce();
     assertEquals(1, store.count("LIST-versions manifests/"));
     assertEquals(1, store.manifestReads(), "only the repository whose manifest version changed is read");
-    assertEquals(2, store.count("GET log/*"), "its pack and ref-update entries are replayed");
+    assertEquals(1, store.count("GET log/*"), "its one entry, pack and ref update together, is replayed");
     assertEquals(0, store.writes());
   }
 

@@ -77,6 +77,7 @@ final class ManifestStore {
   private final ManifestCache cache;
   private final String cacheKey;
   private final ReentrantLock writeLock;
+  private final GroupPublisher publisher;
   private final boolean cacheIsStore;
 
   ManifestStore(Path repositoryPath, String repositoryName) {
@@ -140,7 +141,8 @@ final class ManifestStore {
     this.afterPublish = afterPublish;
     this.cache = cache;
     this.cacheKey = cacheKey;
-    this.writeLock = locks.forRepository(cacheKey);
+    this.publisher = locks.publisherFor(cacheKey);
+    this.writeLock = publisher.nodeLock();
     this.cacheIsStore = cacheIsStore;
     stagingPath = this.repositoryPath.resolve(STAGING_DIRECTORY);
     walPath = this.repositoryPath.resolve(WAL_DIRECTORY);
@@ -149,6 +151,11 @@ final class ManifestStore {
   /** This node's write lock for the repository; ref transactions hold it end to end. */
   ReentrantLock writeLock() {
     return writeLock;
+  }
+
+  /** This node's publication pipeline for the repository, shared by every handle on it. */
+  GroupPublisher publisher() {
+    return publisher;
   }
 
   /** Conditionally re-reads the manifest and reports whether the repository exists. */
@@ -549,8 +556,13 @@ final class ManifestStore {
 
   /** Every file name, extension included, that the manifest references beneath {@code wal/}. */
   static java.util.Set<String> liveFileNames(Manifest manifest) {
+    return fileNames(manifest.getPacksList());
+  }
+
+  /** The file names the given packs occupy in {@code wal/}. */
+  static java.util.Set<String> fileNames(Collection<PackRef> packs) {
     java.util.Set<String> names = new java.util.HashSet<>();
-    for (PackRef pack : manifest.getPacksList()) {
+    for (PackRef pack : packs) {
       for (var file : pack.getFilesList()) {
         names.add(pack.getName() + "." + file.getExtension());
       }

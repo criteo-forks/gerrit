@@ -52,7 +52,7 @@ class CompactionPolicyTest {
     Manifest manifest = manifest(objectPacks("INSERT", 8, 100));
     Plan plan = policy.plan(manifest);
     assertEquals(8, plan.packs().size());
-    assertFalse(plan.reftables());
+    assertTrue(plan.reftables().isEmpty());
   }
 
   @Test
@@ -81,11 +81,56 @@ class CompactionPolicyTest {
   @Test
   void reftableStackCompactsAtTheConfiguredDepth() {
     List<PackRef> shallow = reftables(7);
-    assertFalse(policy.plan(manifest(shallow)).reftables());
+    assertTrue(policy.plan(manifest(shallow)).reftables().isEmpty());
     List<PackRef> deep = reftables(8);
     Plan plan = policy.plan(manifest(deep));
-    assertTrue(plan.reftables());
+    assertEquals(8, plan.reftables().size());
     assertTrue(plan.packs().isEmpty(), "reftables are not object packs");
+  }
+
+  @Test
+  void largeCompactedBasesStayBeneathTheMerge() {
+    CompactionPolicy tiered = new CompactionPolicy(8, 2, 1L << 30, 8, 1000, 32);
+    List<PackRef> stack = new java.util.ArrayList<>();
+    stack.add(reftable("base", "COMPACT", 5000, 10));
+    stack.add(reftable("mid", "COMPACT", 500, 20));
+    for (int i = 0; i < 7; i++) {
+      stack.add(reftable("txn-" + i, "INSERT", 200, 21 + i));
+    }
+    // Listed out of stack order on purpose: the plan follows JGit's ordering, not the manifest's.
+    java.util.Collections.reverse(stack);
+    List<String> names = tiered.plan(manifest(stack)).reftables();
+    assertEquals(8, names.size());
+    assertFalse(names.contains("base"));
+    assertEquals("mid", names.get(0), "compacted tables sort below transaction tables");
+    assertEquals("txn-6", names.get(7));
+  }
+
+  @Test
+  void aLargeTransactionTableIsMergedWithEverythingAboveIt() {
+    CompactionPolicy tiered = new CompactionPolicy(8, 2, 1L << 30, 8, 1000, 32);
+    List<PackRef> stack = new java.util.ArrayList<>();
+    stack.add(reftable("base", "COMPACT", 5000, 10));
+    stack.add(reftable("import", "INSERT", 900000, 11));
+    for (int i = 0; i < 7; i++) {
+      stack.add(reftable("txn-" + i, "INSERT", 200, 12 + i));
+    }
+    List<String> names = tiered.plan(manifest(stack)).reftables();
+    assertEquals(8, names.size());
+    assertTrue(names.contains("import"), "a transaction table left beneath the merge would shadow it");
+    assertFalse(names.contains("base"));
+  }
+
+  @Test
+  void theWholeStackMergesOnceItIsDeepEnough() {
+    CompactionPolicy tiered = new CompactionPolicy(8, 2, 1L << 30, 8, 1000, 4);
+    List<PackRef> stack = new java.util.ArrayList<>();
+    for (int i = 0; i < 4; i++) {
+      stack.add(reftable("base-" + i, "COMPACT", 5000, 10 + i));
+    }
+    assertEquals(4, tiered.plan(manifest(stack)).reftables().size());
+    stack.remove(3);
+    assertTrue(tiered.plan(manifest(stack)).reftables().isEmpty(), "three large bases are left alone");
   }
 
   private static Manifest manifest(List<PackRef> packs) {
@@ -112,13 +157,18 @@ class CompactionPolicyTest {
   private static List<PackRef> reftables(int count) {
     List<PackRef> packs = new java.util.ArrayList<>();
     for (int i = 0; i < count; i++) {
-      packs.add(
-          PackRef.newBuilder()
-              .setName("ref-" + i)
-              .setSource("INSERT")
-              .addFiles(PackFile.newBuilder().setExtension("ref").setSize(200))
-              .build());
+      packs.add(reftable("ref-" + i, "INSERT", 200, i + 1));
     }
     return packs;
+  }
+
+  private static PackRef reftable(String name, String source, long size, long updateIndex) {
+    return PackRef.newBuilder()
+        .setName(name)
+        .setSource(source)
+        .setMinUpdateIndex(updateIndex)
+        .setMaxUpdateIndex(updateIndex)
+        .addFiles(PackFile.newBuilder().setExtension("ref").setSize(size))
+        .build();
   }
 }

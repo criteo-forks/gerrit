@@ -22,6 +22,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.BiConsumer;
@@ -131,7 +132,9 @@ final class Reclaimer {
     ManifestStore store = repositories.storage().manifestStore(project);
     Manifest manifest = store.refresh();
     observer.accept(project, manifest);
-    Set<String> live = ManifestStore.liveFileNames(manifest);
+    Set<String> live = new HashSet<>(ManifestStore.liveFileNames(manifest));
+    // Uploaded on this node, published by the next ref transaction: referenced, just not yet.
+    live.addAll(store.publisher().pendingFileNames());
     long cutoff = clock.millis() - grace.toMillis();
     int deleted = 0;
     if (deleteFromStore) {
@@ -157,7 +160,9 @@ final class Reclaimer {
   /** Drops this node's cached copies of files the repository's manifest no longer lists. */
   int evictLocal(Project.NameKey project) throws IOException {
     ManifestStore store = repositories.storage().manifestStore(project);
-    return store.evictLocalFilesExcept(ManifestStore.liveFileNames(store.current()));
+    Set<String> live = new HashSet<>(ManifestStore.liveFileNames(store.current()));
+    live.addAll(store.publisher().pendingFileNames());
+    return store.evictLocalFilesExcept(live);
   }
 
   /**

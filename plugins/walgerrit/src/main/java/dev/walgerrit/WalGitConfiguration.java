@@ -45,6 +45,8 @@ record WalGitConfiguration(
     int compactGeometricFactor,
     long compactMaxPackSize,
     int compactMinReftables,
+    long compactSmallReftableSize,
+    int compactMaxReftables,
     Duration compactionLeaseDuration,
     boolean reclaimEnabled,
     Duration reclaimGrace,
@@ -96,6 +98,12 @@ record WalGitConfiguration(
   /** Reftable stack depth at which the whole stack is compacted into one table. */
   static final int DEFAULT_COMPACT_MIN_REFTABLES = 8;
 
+  /** Reftables up to this size are merged with every new table above them; larger ones are left as bases. */
+  static final long DEFAULT_COMPACT_SMALL_REFTABLE_SIZE = 8L << 20;
+
+  /** Stack depth at which even the large base tables are merged into one. */
+  static final int DEFAULT_COMPACT_MAX_REFTABLES = 32;
+
   /** How long one node's compaction lease on a repository lasts without renewal. */
   static final Duration DEFAULT_COMPACTION_LEASE = Duration.ofMinutes(30);
 
@@ -139,6 +147,8 @@ record WalGitConfiguration(
         DEFAULT_COMPACT_GEOMETRIC_FACTOR,
         DEFAULT_COMPACT_MAX_PACK_SIZE,
         DEFAULT_COMPACT_MIN_REFTABLES,
+        DEFAULT_COMPACT_SMALL_REFTABLE_SIZE,
+        DEFAULT_COMPACT_MAX_REFTABLES,
         DEFAULT_COMPACTION_LEASE,
         true,
         DEFAULT_RECLAIM_GRACE,
@@ -178,6 +188,8 @@ record WalGitConfiguration(
             config.getInt(SECTION, null, "compactGeometricFactor", DEFAULT_COMPACT_GEOMETRIC_FACTOR),
             config.getLong(SECTION, null, "compactMaxPackSize", DEFAULT_COMPACT_MAX_PACK_SIZE),
             config.getInt(SECTION, null, "compactMinReftables", DEFAULT_COMPACT_MIN_REFTABLES),
+            config.getLong(SECTION, null, "compactSmallReftableSize", DEFAULT_COMPACT_SMALL_REFTABLE_SIZE),
+            config.getInt(SECTION, null, "compactMaxReftables", DEFAULT_COMPACT_MAX_REFTABLES),
             duration(config, "compactionLeaseDuration", DEFAULT_COMPACTION_LEASE),
             config.getBoolean(SECTION, null, "reclaimEnabled", true),
             duration(config, "reclaimGrace", DEFAULT_RECLAIM_GRACE),
@@ -222,6 +234,10 @@ record WalGitConfiguration(
     require(compactGeometricFactor >= 2, "compactGeometricFactor must be at least 2");
     require(compactMaxPackSize >= 1, "compactMaxPackSize must be positive");
     require(compactMinReftables >= 2, "compactMinReftables must be at least 2");
+    require(compactSmallReftableSize >= 1, "compactSmallReftableSize must be positive");
+    require(
+        compactMaxReftables >= compactMinReftables,
+        "compactMaxReftables must be at least compactMinReftables");
     require(isPositive(compactionLeaseDuration), "compactionLeaseDuration must be positive");
     require(!reclaimGrace.isNegative(), "reclaimGrace must be zero or positive");
     require(isPositive(reclaimInterval), "reclaimInterval must be positive");

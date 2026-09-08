@@ -28,19 +28,23 @@ of them have accumulated, so a repository is not rewritten after every write. Pa
 a few large packs in geometric progression and a short tail of recent small ones, and the amount of
 data rewritten per byte written is logarithmic in the repository's size.
 
-**Reftables** are compacted whole: once the stack is `walgerrit.compactMinReftables` (default 8)
-tables deep it is merged into one `COMPACT` table, deletions included. JGit already folds a small
-new table into the top of the stack at commit time, so the stack deepens only by about one table per
-12 KB of ref and reflog data. A partial merge would have to respect the order JGit derives from the
-pack source and the update index, and is not worth the risk for tables that are small next to object
-data.
+**Reftables** are merged from the top of the stack down. Every table a ref transaction wrote is
+merged, deletions included, together with the compacted tables directly beneath it that are no
+larger than `walgerrit.compactSmallReftableSize` (default 8 MiB), once
+`walgerrit.compactMinReftables` (default 8) tables qualify. Larger compacted tables stay as bases
+until the whole stack is `walgerrit.compactMaxReftables` (default 32) deep, when everything is
+merged. That respects the order JGit derives from the pack source and the update index, in which
+compacted tables always sort below transaction tables, and keeps a large repository from rewriting
+its whole ref history every few pushes. JGit still folds a small new table into the top of the stack
+at commit time when the transaction is alone on its node; under contention it extends the stack
+instead.
 
 JGit's `DfsPackCompactor` is the repacking engine for both. Object compaction and reftable compaction
 are separate manifest transactions, because a reftable change advances the ref revision and a ref
 transaction in flight on another node must notice it. On the compacting node itself a reftable
-compaction is published under the repository's write lock, the one ref transactions hold, so a local
-transaction in flight finishes first and the next one starts from the compacted manifest; local
-writers never lose a CAS to local compaction. Object compaction needs no such care: it leaves the
+compaction goes through the repository's publisher, the queue ref transactions publish through, so
+it lands after the group in flight and before the next one; local writers never lose a CAS to local
+compaction. Object compaction needs no such care: it leaves the
 ref revision alone, and a writer whose CAS it pre-empts merely retries the CAS on the merged
 manifest without rewriting anything.
 
@@ -113,7 +117,9 @@ JGit's own default of 32 MB suits a laptop, not a server holding thousands of re
 | `walgerrit.compactMinPacks` | `8` | Smallest run of undersized packs worth rolling up. |
 | `walgerrit.compactGeometricFactor` | `2` | Each pack should be this many times all smaller packs combined. |
 | `walgerrit.compactMaxPackSize` | `8g` | Packs above this size are never rewritten. |
-| `walgerrit.compactMinReftables` | `8` | Stack depth at which the reftable stack is merged into one table. |
+| `walgerrit.compactMinReftables` | `8` | Transaction tables (plus small compacted ones) that trigger a reftable merge. |
+| `walgerrit.compactSmallReftableSize` | `8m` | Compacted tables up to this size are merged with the tables above them. |
+| `walgerrit.compactMaxReftables` | `32` | Stack depth at which the large base tables are merged too. |
 | `walgerrit.compactionLeaseDuration` | `30 min` | Lease lifetime without renewal. |
 | `walgerrit.reclaimEnabled` | `true` | Delete unreferenced store files past the grace period. |
 | `walgerrit.reclaimGrace` | `24 h` | Minimum age of an unreferenced file before it is deleted. |

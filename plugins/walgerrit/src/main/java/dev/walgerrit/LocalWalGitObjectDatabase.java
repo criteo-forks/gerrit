@@ -45,6 +45,8 @@ import org.eclipse.jgit.internal.storage.dfs.ReadableChannel;
 import org.eclipse.jgit.internal.storage.pack.PackExt;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.transport.ReceiveCommand;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * JGit DFS object database backed by immutable local files and a CAS manifest.
@@ -55,9 +57,13 @@ import org.eclipse.jgit.transport.ReceiveCommand;
  * from JGit's in-memory pack list, which mirrors the newest manifest this node has observed.
  */
 final class LocalWalGitObjectDatabase extends DfsObjDatabase {
+  private static final Logger logger = LoggerFactory.getLogger(LocalWalGitObjectDatabase.class);
   private static final int SHA1_BYTES = 20;
 
   private final ManifestStore manifestStore;
+  private final GroupPublisher publisher;
+  /** Packs this handle committed ahead of a ref transaction and has not seen published. */
+  private final Set<String> deferredPacks = java.util.concurrent.ConcurrentHashMap.newKeySet();
   private final long revalidateIntervalNanos;
   /** The ref transaction the current thread is running through this handle, if any. */
   private final ThreadLocal<RefTransactionState> refTransaction = new ThreadLocal<>();
@@ -70,6 +76,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
       throws IOException {
     super(repository, new DfsReaderOptions());
     this.manifestStore = manifestStore;
+    this.publisher = manifestStore.publisher();
     this.revalidateIntervalNanos = revalidateInterval.toNanos();
     // JGit 7.7 can synthesize multi-pack-index descriptions. WalGerrit's manifest currently
     // records independent immutable pack families, not MIDX coverage, so keep this representation
@@ -114,26 +121,6 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
           break;
       }
     }
-
-    for (DfsPackDescription description : descriptions) {
-      for (PackExt extension : PackExt.values()) {
-        if (description.hasFileExt(extension)) {
-          manifestStore.publishImmutableFile(description.getFileName(extension));
-        }
-      }
-    }
-
-    List<PackRef> additions = new ArrayList<>(descriptions.size());
-    for (DfsPackDescription description : descriptions) {
-      additions.add(toPackRef(description));
-    }
-    List<String> supersedes = new ArrayList<>();
-    if (replacements != null) {
-      for (DfsPackDescription replacement : replacements) {
-        supersedes.add(packName(replacement));
-      }
-    }
-
     boolean logicalRefUpdate =
         descriptions.stream()
             .anyMatch(
@@ -148,40 +135,86 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     if (logicalRefUpdate && state.transaction == null) {
       throw new IOException("Reftable publication has no recorded ref transaction");
     }
-    Long expectedRefRevision = state == null ? null : state.expectedRefRevision;
-    RefTransaction logicalTransaction = state == null ? null : state.transaction;
-    // A reftable compaction advances the ref revision, which would make a ref transaction in
-    // flight on this node lose its CAS and re-run. Publishing it under the node's write lock
-    // instead lets local transactions finish first and start their successors from the compacted
-    // manifest; writers on other nodes are still fenced by the CAS alone.
-    boolean reftableCompaction =
-        compaction && descriptions.stream().anyMatch(d -> d.hasFileExt(PackExt.REFTABLE));
-    ReentrantLock nodeLock = manifestStore.writeLock();
-    if (reftableCompaction) {
-      nodeLock.lock();
-    }
-    Manifest updated;
-    try {
-      updated =
-          manifestStore.publish(
-              expectedRefRevision == null ? 0 : expectedRefRevision,
-              additions,
-              supersedes,
-              logicalRefUpdate,
-              logicalTransaction);
-    } catch (ManifestConflictException conflict) {
-      // Another node changed refs since this transaction began. Nothing was committed; the
-      // batch update re-runs its checks against the newer manifest and tries again.
-      state.conflicted = true;
-      throw conflict;
-    } finally {
-      if (reftableCompaction) {
+    if (logicalRefUpdate) {
+      // Validation and the reftable write are over. The next transaction on this node may start
+      // while this one uploads and publishes; its publication joins the group behind this one.
+      ReentrantLock nodeLock = publisher.nodeLock();
+      if (nodeLock.isHeldByCurrentThread()) {
         nodeLock.unlock();
       }
     }
-    afterOwnPublication(updated, compaction);
+    for (DfsPackDescription description : descriptions) {
+      for (PackExt extension : PackExt.values()) {
+        if (description.hasFileExt(extension)) {
+          manifestStore.publishImmutableFile(description.getFileName(extension));
+        }
+      }
+    }
+    List<PackRef> additions = new ArrayList<>(descriptions.size());
+    for (DfsPackDescription description : descriptions) {
+      additions.add(toPackRef(description));
+    }
+    List<String> supersedes = new ArrayList<>();
+    if (replacements != null) {
+      for (DfsPackDescription replacement : replacements) {
+        supersedes.add(packName(replacement));
+      }
+    }
+    if (!compaction && !logicalRefUpdate) {
+      // An object pack committed ahead of its ref transaction (the received pack, an inserter
+      // flush): uploaded now, listed by every handle on this node, published by the transaction.
+      publisher.defer(additions);
+      for (PackRef addition : additions) {
+        deferredPacks.add(addition.getName());
+      }
+      return;
+    }
+    GroupPublisher.Request request =
+        new GroupPublisher.Request(
+            manifestStore,
+            additions,
+            supersedes,
+            logicalRefUpdate ? state.transaction : null,
+            state == null ? -1 : state.observedRefRevision,
+            state == null ? -1 : state.epoch);
+    GroupPublisher.Result result;
+    try {
+      result = publisher.publish(request);
+    } catch (ManifestConflictException conflict) {
+      // Another node changed refs since this transaction began. Nothing was committed; the
+      // batch update re-runs its checks against the newer manifest and tries again.
+      if (state != null) {
+        state.conflicted = true;
+      }
+      throw conflict;
+    }
+    deferredPacks.retainAll(publisher.pendingNames());
+    afterOwnPublication(result.manifest(), compaction || result.shared());
     if (logicalRefUpdate) {
       state.committed = true;
+    }
+  }
+
+  /**
+   * Publishes the packs this handle committed without a ref transaction, so an aborted push or an
+   * inserter flush never waits for an unrelated write to this repository.
+   */
+  @Override
+  public void close() {
+    super.close();
+    if (deferredPacks.isEmpty()) {
+      return;
+    }
+    try {
+      if (publisher.hasPendingAny(deferredPacks)) {
+        publisher.publish(GroupPublisher.Request.flush(manifestStore));
+      }
+      deferredPacks.clear();
+    } catch (IOException exception) {
+      logger.warn(
+          "WalGerrit could not publish packs committed on {}; the next publication carries them",
+          repositoryName(),
+          exception);
     }
   }
 
@@ -194,13 +227,23 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     }
   }
 
-  /** Enumerates the newest manifest this node has observed; never a network read by itself. */
+  /**
+   * Enumerates the newest manifest this node has observed plus the packs this node uploaded ahead
+   * of the ref transaction that will publish them; never a network read by itself.
+   */
   @Override
   protected List<DfsPackDescription> listPacks() throws IOException {
     Manifest manifest = manifestStore.current();
     List<DfsPackDescription> descriptions = new ArrayList<>(manifest.getPacksCount());
+    Set<String> listed = new HashSet<>();
     for (PackRef pack : manifest.getPacksList()) {
       descriptions.add(fromPackRef(pack));
+      listed.add(pack.getName());
+    }
+    for (PackRef pack : publisher.pending()) {
+      if (listed.add(pack.getName())) {
+        descriptions.add(fromPackRef(pack));
+      }
     }
     return descriptions;
   }
@@ -254,12 +297,19 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   }
 
   /**
-   * Starts a ref transaction: one conditional manifest read so expected-value checks run against
-   * the current global state, then remember the reftable-stack generation the CAS must match.
+   * Starts a ref transaction against the newest manifest this node has observed; the caller has
+   * just revalidated it. The publisher records which ref revision the transaction validates against
+   * and which epoch of this node's own publications it belongs to.
    */
   void beginRefTransaction() throws IOException {
-    revalidateNow();
-    refTransaction.set(new RefTransactionState(manifestStore.current().getRefRevision()));
+    adoptObservedManifest();
+    long refRevision = manifestStore.current().getRefRevision();
+    refTransaction.set(new RefTransactionState(refRevision, publisher.observe(refRevision)));
+  }
+
+  /** This node's publication pipeline for the repository, shared by every handle on it. */
+  GroupPublisher publisher() {
+    return publisher;
   }
 
   /** This node's write lock for the repository, shared by every handle on it. */
@@ -333,13 +383,15 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   }
 
   private static final class RefTransactionState {
-    final long expectedRefRevision;
+    final long observedRefRevision;
+    final long epoch;
     RefTransaction transaction;
     boolean committed;
     boolean conflicted;
 
-    RefTransactionState(long expectedRefRevision) {
-      this.expectedRefRevision = expectedRefRevision;
+    RefTransactionState(long observedRefRevision, long epoch) {
+      this.observedRefRevision = observedRefRevision;
+      this.epoch = epoch;
     }
   }
 
@@ -360,16 +412,17 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   /**
    * After this handle published, JGit adds the new pack or reftable to its own in-memory list, so
-   * the list still mirrors the manifest when the publication was the only change. A compaction
-   * (JGit does not update the list itself) or a manifest that absorbed other writers' work in the
-   * meantime requires a rescan from the cached manifest; no network read is involved either way.
+   * the list still mirrors the manifest when the publication carried nothing but this handle's own
+   * files. A compaction (JGit does not update the list itself), a group that carried other
+   * handles' files, or a manifest that absorbed other writers' work in the meantime requires a
+   * rescan from the cached manifest; no network read is involved either way.
    */
-  private void afterOwnPublication(Manifest updated, boolean compaction) {
+  private void afterOwnPublication(Manifest updated, boolean rescan) {
     synchronized (this) {
       long previous = observedManifestRevision;
       observedManifestRevision = updated.getRevision();
       lastRevalidationNanos = System.nanoTime();
-      if (compaction || updated.getRevision() != previous + 1) {
+      if (rescan || updated.getRevision() != previous + 1) {
         clearCache();
       }
     }

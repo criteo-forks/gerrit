@@ -19,11 +19,16 @@ Objects may exist before their refs. Refs must never point to unavailable object
 Gerrit's `BatchRefUpdate` may update several refs atomically. The backend must validate every
 expected old object ID and publish either all requested ref changes or none of them.
 
-Within a node, ref transactions on one repository run one at a time: every handle on the node
-shares a per-repository lock, so a transaction always starts from the manifest the previous local
-one published, as JGit's reftable batch update assumes when it serializes writers on a single
-repository instance. Across nodes the manifest compare-and-swap is the only fence. A transaction
-that loses it to another node's ref change is re-run from scratch against the reloaded manifest,
+Within a node, every handle shares one publisher per repository. A ref transaction is admitted
+once no transaction in flight on the node touches a ref name that could interfere with its own (the
+same name, or one nested under the other); it then validates and writes its reftable under the node
+lock, releases it, and hands the publication to the publisher. Members admitted together validated
+against states this node itself produced, so their reftables land in one log entry with one CAS,
+together with every object pack JGit committed ahead of a transaction: a received pack or an
+inserter flush is uploaded at once but published by the next ref transaction on the node, or when
+the handle that committed it closes, so a push is one CAS rather than three. Across nodes the
+manifest compare-and-swap is the only fence. A group that loses it to another node's ref change
+fails as a whole, and every member is re-run from scratch against the reloaded manifest,
 expected-value checks included, up to five times; independent updates to different refs therefore
 all land, as they do on Gerrit's file-based backends. A real ref conflict is reported to Gerrit as
 a lock failure; it must not be silently overwritten. The reftable a lost attempt already uploaded
@@ -75,8 +80,9 @@ replaces, and both enter the live set through the same manifest CAS as a write, 
 check that every superseded file is still live. A reader therefore sees either the old files or the
 new ones, both complete, and a writer racing a compaction on another node either lands first, in
 which case the compaction's manifest update merges the writer's additions, or lands second and
-re-runs against the compacted manifest. On the same node a reftable compaction publishes under the
-repository's write lock, so it waits for the transaction in flight rather than failing it. Superseded files stay in the store for the reclamation grace period, which
+re-runs against the compacted manifest. On the same node a reftable compaction goes through the
+repository's publisher like a ref transaction, so it queues behind the publication in flight rather
+than failing it. Superseded files stay in the store for the reclamation grace period, which
 bounds how long a reader may keep using a manifest it read earlier. See
 [compaction.md](compaction.md).
 

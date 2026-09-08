@@ -80,8 +80,8 @@ class WalGitRepositoryManagerTest {
     Path manifestPath =
         storagePath.resolve("manifests/platform/example.git").resolve(ManifestStore.MANIFEST_FILE);
     Manifest manifest = Manifest.parseFrom(Files.readAllBytes(manifestPath));
-    assertEquals(3, manifest.getHeadSeq());
-    assertEquals(3, manifest.getRevision());
+    assertEquals(2, manifest.getHeadSeq(), "creation, then one entry for the pack and its ref");
+    assertEquals(2, manifest.getRevision());
     assertTrue(manifest.getPacksCount() >= 2);
     for (PackRef pack : manifest.getPacksList()) {
       for (var file : pack.getFilesList()) {

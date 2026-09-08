@@ -80,7 +80,10 @@ owner and an expiry, kept apart from the manifests prefix so a listing of manife
 of repositories.
 
 JGit represents a batch ref update as one reftable file, so all refs in that batch share one manifest
-publication. Reftable compaction may supersede an earlier reftable in the same transaction.
+publication. The object packs JGit committed ahead of the transaction (the received pack, an inserter
+flush) ride in the same entry, and concurrent transactions on one node that touch unrelated refs
+share an entry too, their ref transactions concatenated in order. Reftable compaction may supersede
+an earlier reftable in the same transaction.
 
 ## Deliberate limitations
 
