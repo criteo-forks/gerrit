@@ -43,8 +43,8 @@ JGit's `DfsPackCompactor` is the repacking engine for both. Object compaction an
 are separate manifest transactions, because a reftable change advances the ref revision and a ref
 transaction in flight on another node must notice it. On the compacting node itself a reftable
 compaction goes through the repository's publisher, the queue ref transactions publish through, so
-it lands after the group in flight and before the next one; local writers never lose a CAS to local
-compaction. Object compaction needs no such care: it leaves the
+it lands after the group in flight and before the next one. A writer still uploading a folded
+table can be overtaken; it rebuilds and revalidates if compaction replaced that table. Object compaction needs no such care: it leaves the
 ref revision alone, and a writer whose CAS it pre-empts merely retries the CAS on the merged
 manifest without rewriting anything.
 
@@ -81,12 +81,27 @@ lost or expired mid-compaction wastes an upload, never data.
 
 ## Reclamation
 
-A file beneath `wal/` that the current manifest does not list and whose store timestamp is older
-than `walgerrit.reclaimGrace` (default 24h) is deleted by the sweep. That one rule covers packs and
-reftables superseded by compaction, reftables of ref transactions that lost their CAS, and outputs
-of compactions that lost theirs. The grace period is what makes it safe: it exceeds by orders of
-magnitude the seconds between a file's upload and the publication that references it, and any reader
-still holding an older manifest, since handles revalidate every `walgerrit.manifestRevalidateInterval`.
+Reclamation uses two grace intervals, each `walgerrit.reclaimGrace` (default 24h):
+
+1. A file beneath `wal/` must first be older than the grace period and absent from both the current
+   manifest and this node's unpublished view. This protects uploads awaiting publication.
+2. The reclaimer records when it first observed that eligible file as absent. Only a later sweep,
+   at least another grace period afterwards, may delete the same file version if it is still absent.
+   This protects readers of a manifest that referenced a recently retired file. Upload age alone
+   cannot provide that protection: a years-old pack may have been compacted a moment ago.
+
+Observation records live in the reclaiming node's memory. A restart starts observation again and postpones
+deletion; a sweep as a follower also drops that node's records. Seeing a file live, young, missing, or replaced resets its
+record. The records are bounded by the eligible leftovers awaiting deletion, and the procedure adds
+no object-store reads to the existing manifest read and file listing per sweep.
+
+This contract requires the upload-to-publication interval (including deferred packs and delayed
+conditional requests) and the lifetime of old reader snapshots each to fit within the configured
+grace period. A file eligible for observation can no longer be awaiting its first publication;
+publication recovery never re-adds an already committed pack. These conditions make absence final.
+Arbitrarily stalled writers or readers require distributed publication/reader leases or disabling
+reclamation; periodic revalidation alone does not enforce their maximum lifetime.
+
 On a versioned bucket a deleted file remains recoverable as a non-current version for the bucket's
 lifecycle window, which is the real knob for how far back object data can be rewound. Log objects
 are never deleted; they remain the complete history of every ref change and every compaction.
@@ -122,7 +137,7 @@ JGit's own default of 32 MB suits a laptop, not a server holding thousands of re
 | `walgerrit.compactMaxReftables` | `32` | Stack depth at which the large base tables are merged too. |
 | `walgerrit.compactionLeaseDuration` | `30 min` | Lease lifetime without renewal. |
 | `walgerrit.reclaimEnabled` | `true` | Delete unreferenced store files past the grace period. |
-| `walgerrit.reclaimGrace` | `24 h` | Minimum age of an unreferenced file before it is deleted. |
+| `walgerrit.reclaimGrace` | `24 h` | Minimum file age before absence is tracked, and minimum observation interval before deletion. |
 | `walgerrit.reclaimInterval` | `6 h` | Period of the sweep that reclaims and queues overdue repositories. |
 | `walgerrit.cacheSizeLimit` | `0` | Node-local cache size above which the oldest cached files are dropped. |
 | `core.dfs.blockLimit` | a tenth of the heap | JGit block cache size in bytes. |

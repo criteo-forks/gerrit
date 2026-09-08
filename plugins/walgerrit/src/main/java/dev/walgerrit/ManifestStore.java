@@ -39,8 +39,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Durable protobuf manifest and immutable transaction-log storage for one repository.
@@ -52,6 +55,7 @@ import java.util.stream.Stream;
  * manifest on its own initiative except to establish a CAS base.
  */
 final class ManifestStore {
+  private static final Logger logger = LoggerFactory.getLogger(ManifestStore.class);
   static final String MANIFEST_FILE = "manifest.pb";
 
   private static final int FORMAT_VERSION = 3;
@@ -338,6 +342,26 @@ final class ManifestStore {
         expectedRefRevision, additions, supersedes, requireExactRefRevision, refTransaction, List.of());
   }
 
+  /** Registers each attempt before its CAS so local read snapshots can resolve in-flight packs. */
+  Manifest publish(
+      long expectedRefRevision,
+      Collection<PackRef> additions,
+      Collection<String> supersedes,
+      boolean requireExactRefRevision,
+      RefTransaction refTransaction,
+      BiConsumer<Long, String> beforeCas)
+      throws IOException {
+    return publish(
+        expectedRefRevision,
+        additions,
+        supersedes,
+        requireExactRefRevision,
+        refTransaction,
+        List.of(),
+        false,
+        beforeCas);
+  }
+
   /**
    * Appends an EVENT entry carrying Gerrit events fired on this node, so every other node can
    * deliver them to its own listeners. Nothing else in the manifest changes: no pack, no ref
@@ -358,6 +382,27 @@ final class ManifestStore {
       boolean requireExactRefRevision,
       RefTransaction refTransaction,
       List<String> eventJson)
+      throws IOException {
+    return publish(
+        expectedRefRevision,
+        additions,
+        supersedes,
+        requireExactRefRevision,
+        refTransaction,
+        eventJson,
+        false,
+        (sequence, transactionId) -> {});
+  }
+
+  private Manifest publish(
+      long expectedRefRevision,
+      Collection<PackRef> additions,
+      Collection<String> supersedes,
+      boolean requireExactRefRevision,
+      RefTransaction refTransaction,
+      List<String> eventJson,
+      boolean fence,
+      BiConsumer<Long, String> beforeCas)
       throws IOException {
     createCacheDirectories();
     for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
@@ -384,18 +429,14 @@ final class ManifestStore {
         }
       }
 
-      // Pack names are unique per write, so a name the manifest already lists is this node's own
-      // earlier publication whose response was lost; there is nothing left to add for it.
-      List<PackRef> newAdditions = new ArrayList<>();
-      for (PackRef addition : additions) {
-        if (!livePacks.containsKey(addition.getName())) {
-          newAdditions.add(addition);
-        }
-      }
-      if (newAdditions.isEmpty() && supersedes.isEmpty() && refTransaction == null && eventJson.isEmpty()) {
+      if (!fence
+          && additions.isEmpty()
+          && supersedes.isEmpty()
+          && refTransaction == null
+          && eventJson.isEmpty()) {
         return current;
       }
-      boolean changesRefs = changesRefs(newAdditions, supersedes, current);
+      boolean changesRefs = changesRefs(additions, supersedes, current);
       LogEntry.Builder entry =
           LogEntry.newBuilder()
               .setSeq(sequence)
@@ -413,9 +454,11 @@ final class ManifestStore {
       if (refTransaction != null) {
         entry.setRefTransaction(refTransaction);
       }
-      for (PackRef addition : newAdditions) {
+      for (PackRef addition : additions) {
         PackRef published = addition.toBuilder().setSeq(sequence).build();
-        livePacks.put(published.getName(), published);
+        if (livePacks.putIfAbsent(published.getName(), published) != null) {
+          throw new IOException("Pack already exists in manifest: " + published.getName());
+        }
         entry.addAdditions(published);
       }
 
@@ -433,40 +476,74 @@ final class ManifestStore {
               .setWriter(writer)
               .build();
 
+      beforeCas.accept(sequence, transactionId);
+      ObjectStore.StoredObject stored;
       try {
-        ObjectStore.StoredObject stored =
+        stored =
             manifestObjects.compareAndSwap(
                 MANIFEST_FILE, versioned.version(), updated.toByteArray());
-        cache.offer(cacheKey, new VersionedManifest(updated, stored.version()));
-        afterPublish.accept(updated);
-        return updated;
-      } catch (ObjectStoreConflictException conflict) {
-        // Usually another writer got there first, and the loop merges an object-only publication
-        // or lets a ref publication fail on the ref revision. But the HTTP client retries a
-        // request whose response was lost, and a retried CAS that had already landed is refused
-        // by its own precondition, so check for this attempt before treating it as lost.
-        if (transactionLanded(refresh(), sequence, transactionId)) {
-          Manifest landed = current();
-          afterPublish.accept(landed);
-          return landed;
-        }
-      } catch (IOException ambiguous) {
+      } catch (IOException | RuntimeException failure) {
+        // A precondition failure may be the SDK retry of a successful request. Every CAS error
+        // follows the same verification path; failures inside that path retain the attempt id.
+        IOException cause =
+            failure instanceof IOException io
+                ? io
+                : new IOException("Manifest conditional write failed", failure);
+        Manifest fresh;
+        boolean landed;
         try {
-          Manifest fresh = refresh();
-          if (transactionLanded(fresh, sequence, transactionId)) {
-            afterPublish.accept(fresh);
-            return fresh;
-          }
-        } catch (IOException verificationFailure) {
-          ambiguous.addSuppressed(verificationFailure);
+          fresh = refresh();
+          landed = transactionLanded(fresh, sequence, transactionId);
+        } catch (IOException | RuntimeException verificationFailure) {
+          cause.addSuppressed(verificationFailure);
+          throw new AmbiguousPublicationException(sequence, transactionId, cause);
         }
-        // Not seen in the chain, or the chain could not be read: a write whose response was lost
-        // may still land, so the caller must settle this transaction from the log before it
-        // retries anything the attempt carried.
-        throw new AmbiguousPublicationException(sequence, transactionId, ambiguous);
+        if (landed) {
+          notifyPublished(fresh);
+          return fresh;
+        }
+        if (fresh.getHeadSeq() < sequence) {
+          throw new AmbiguousPublicationException(sequence, transactionId, cause);
+        }
+        // A different transaction occupies the sequence, so this CAS cannot still land. A
+        // conflict retries on that manifest; other definite failures retain their original cause.
+        if (!(failure instanceof ObjectStoreConflictException)) {
+          throw cause;
+        }
+        continue;
       }
+      cache.offer(cacheKey, new VersionedManifest(updated, stored.version()));
+      notifyPublished(updated);
+      return updated;
     }
     throw new IOException("Manifest CAS did not converge after " + MAX_CAS_ATTEMPTS + " attempts");
+  }
+
+  /** A definitive outcome, proved against a manifest that has reached the attempt's sequence. */
+  record Resolution(Manifest manifest, boolean landed) {}
+
+  Resolution resolvePublication(long sequence, String transactionId) throws IOException {
+    Manifest fresh = refresh();
+    if (fresh.getHeadSeq() < sequence) {
+      // Absence from an earlier snapshot is not failure: the timed-out request may still run.
+      // A data-free WAL entry fences its version. If the original wins first, the fence's CAS
+      // retry follows that history instead. Neither outcome changes refs or adds any pack.
+      fresh = publish(0, List.of(), List.of(), false, null, List.of(), true, (seq, id) -> {});
+    }
+    if (fresh.getHeadSeq() < sequence) {
+      throw new IOException("Manifest history precedes unresolved publication " + transactionId);
+    }
+    return new Resolution(fresh, transactionLanded(fresh, sequence, transactionId));
+  }
+
+  private void notifyPublished(Manifest manifest) {
+    try {
+      afterPublish.accept(manifest);
+    } catch (RuntimeException failure) {
+      // Scheduling maintenance is downstream of the commit point. A stopped executor or a
+      // listener failure must not turn an acknowledged durable write into an apparent failure.
+      logger.warn("Post-publication notification failed for {}", repositoryName, failure);
+    }
   }
 
   Path stagingFile(String fileName) throws IOException {
@@ -741,7 +818,6 @@ final class ManifestStore {
    * passes through the attempt's transaction id at its sequence. No read when the attempt is the
    * head itself.
    */
-  /** Whether the log chain behind {@code manifest} holds this transaction at this sequence. */
   boolean transactionLanded(Manifest manifest, long sequence, String transactionId)
       throws IOException {
     if (manifest.getHeadSeq() < sequence) {

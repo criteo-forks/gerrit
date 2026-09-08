@@ -180,18 +180,24 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     GroupPublisher.Result result;
     try {
       result = publisher.publish(request);
-    } catch (ManifestConflictException conflict) {
-      // Another node changed refs since this transaction began. Nothing was committed; the
-      // batch update re-runs its checks against the newer manifest and tries again.
+    } catch (ManifestConflictException | StaleCompactionInputException conflict) {
+      // Refs changed or a compaction replaced a table this transaction folded while uploading.
+      // Nothing committed; re-run validation and build a new table against the current stack.
       if (state != null) {
         state.conflicted = true;
       }
       throw conflict;
     }
-    deferredPacks.retainAll(publisher.pendingNames());
-    afterOwnPublication(result.manifest(), compaction || result.shared());
     if (logicalRefUpdate) {
       state.committed = true;
+    }
+    try {
+      deferredPacks.retainAll(publisher.pendingNames());
+      afterOwnPublication(result.manifest(), compaction || result.shared());
+    } catch (RuntimeException failure) {
+      invalidateCaches();
+      logger.warn(
+          "Publication committed on {}; invalidating the local cache", repositoryName(), failure);
     }
   }
 
@@ -229,18 +235,20 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   /**
    * Enumerates the newest manifest this node has observed plus the packs this node uploaded ahead
-   * of the ref transaction that will publish them; never a network read by itself.
+   * of the ref transaction that will publish them. A sampled pending record may require log reads
+   * to exclude a pack whose publication landed and was later compacted away.
    */
   @Override
   protected List<DfsPackDescription> listPacks() throws IOException {
-    Manifest manifest = manifestStore.current();
+    GroupPublisher.Snapshot snapshot = publisher.snapshot(manifestStore, false);
+    Manifest manifest = snapshot.manifest();
     List<DfsPackDescription> descriptions = new ArrayList<>(manifest.getPacksCount());
     Set<String> listed = new HashSet<>();
     for (PackRef pack : manifest.getPacksList()) {
       descriptions.add(fromPackRef(pack));
       listed.add(pack.getName());
     }
-    for (PackRef pack : publisher.pending()) {
+    for (PackRef pack : snapshot.unpublished()) {
       if (listed.add(pack.getName())) {
         descriptions.add(fromPackRef(pack));
       }
@@ -376,7 +384,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     return state != null && state.committed;
   }
 
-  /** Whether the current ref transaction lost the manifest CAS to another node's ref change. */
+  /** Whether the current ref transaction must revalidate after a ref or compaction conflict. */
   boolean refTransactionConflicted() {
     RefTransactionState state = refTransaction.get();
     return state != null && state.conflicted;

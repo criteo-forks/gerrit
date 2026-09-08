@@ -21,7 +21,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.locks.ReentrantLock;
-import org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableBatchRefUpdate;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
@@ -193,7 +192,7 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
           }
         }
         logger.info(
-            "Refs of {} changed on another node during a ref transaction; retrying ({}/{})",
+            "Storage of {} changed while preparing a ref transaction; retrying ({}/{})",
             objectDatabase.repositoryName(),
             attempt,
             MAX_ATTEMPTS);
@@ -245,7 +244,7 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
       objectDatabase.recordRefTransaction(pending);
       try {
         super.applyUpdates(newRefs, pending);
-      } catch (IOException exception) {
+      } catch (IOException | RuntimeException exception) {
         if (objectDatabase.refTransactionCommitted()) {
           // The manifest CAS is the commit point. Failure to update this
           // process's JGit cache after it landed must not turn a successful
@@ -254,6 +253,7 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
               "WalGerrit ref transaction committed, but local cache update failed; refreshing",
               exception);
           try {
+            objectDatabase.invalidateCaches();
             refDatabase.refresh();
           } catch (RuntimeException repairFailure) {
             objectDatabase.invalidateCaches();

@@ -25,7 +25,6 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneOffset;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -90,9 +89,13 @@ class RecoveryFaultTest {
       String retired = pending.get(0).getName();
       assertFalse(b.storage().manifestStore(PROJECT).refresh().getPacksList().stream()
           .anyMatch(pack -> pack.getName().equals(retired)));
-      Clock afterGrace = Clock.fixed(Instant.now().plus(Duration.ofDays(2)), ZoneOffset.UTC);
-      new Reclaimer(b, afterGrace, Duration.ofDays(1), 0).reclaim(PROJECT);
-      assertTrue(shared.get(WAL + retired + ".idx").isEmpty(), "retired files are legitimately reclaimed");
+      SteppingClock afterGrace = new SteppingClock(Instant.now().plus(Duration.ofDays(2)));
+      Reclaimer reclaimer = new Reclaimer(b, afterGrace, Duration.ofDays(1), 0);
+      reclaimer.reclaim(PROJECT);
+      afterGrace.advance(Duration.ofDays(2));
+      reclaimer.reclaim(PROJECT);
+      assertTrue(
+          shared.get(WAL + retired + ".idx").isEmpty(), "retired files are legitimately reclaimed");
 
       assertEquals(RefUpdate.Result.NEW, update(a, "unrelated", first));
       org.eclipse.jgit.internal.storage.dfs.DfsBlockCache.reconfigure(
@@ -118,7 +121,8 @@ class RecoveryFaultTest {
     WalGitRepositoryManager a = node("a", hooked);
     ExecutorService pool = Executors.newCachedThreadPool();
     try (Repository writer = a.openRepository(PROJECT)) {
-      ObjectId pending = WalGitRepositoryManagerTest.insertCommit(writer, "waiting for publication");
+      ObjectId pending =
+          WalGitRepositoryManagerTest.insertCommit(writer, "waiting for publication");
       var packs = a.storage().manifestStore(PROJECT).publisher().pending();
       for (var pack : packs) {
         for (var file : pack.getFilesList()) {
@@ -147,8 +151,10 @@ class RecoveryFaultTest {
   private WalGitRepositoryManager node(String name, ObjectStore store) {
     Config config = new Config();
     config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
-    return new WalGitRepositoryManager(WalGitConfiguration.from(config, root.resolve(name)),
-        new StorageLayout(store, root.resolve(name + "-cache"), root.resolve(name + "-cursors"), ""));
+    return new WalGitRepositoryManager(
+        WalGitConfiguration.from(config, root.resolve(name)),
+        new StorageLayout(
+            store, root.resolve(name + "-cache"), root.resolve(name + "-cursors"), ""));
   }
 
   private static RefUpdate.Result update(WalGitRepositoryManager node, String name, ObjectId id) throws IOException {

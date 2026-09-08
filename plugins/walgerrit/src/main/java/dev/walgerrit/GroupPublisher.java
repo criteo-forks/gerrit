@@ -126,11 +126,31 @@ final class GroupPublisher {
   private final Condition changed = state.newCondition();
   private final Deque<Request> queue = new ArrayDeque<>();
   private final List<Admission> inFlight = new ArrayList<>();
-  private final Map<String, PackRef> pendingAdditions = new LinkedHashMap<>();
-  /** Pending packs a publication in flight carries; still listed and protected until it resolves. */
-  private final Map<String, PackRef> inFlightAdditions = new LinkedHashMap<>();
+  private final Map<String, PendingPack> pendingAdditions = new LinkedHashMap<>();
+
+  /**
+   * Pending packs a publication in flight carries; still listed and protected until it resolves.
+   */
+  private final Map<String, PendingPack> inFlightAdditions = new LinkedHashMap<>();
+
   /** Publications whose outcome is unknown, with the packs they carried; settled from the log. */
   private final List<Uncertain> uncertain = new ArrayList<>();
+
+  private record Attempt(long sequence, String transactionId) {}
+
+  /**
+   * Shared with read snapshots even after it leaves the inventory. Registering the attempt before
+   * its CAS lets a reader exclude a pack already committed and retired while the reply is in
+   * flight.
+   */
+  private static final class PendingPack {
+    final PackRef pack;
+    volatile Attempt attempt;
+
+    PendingPack(PackRef pack) {
+      this.pack = pack;
+    }
+  }
 
   /** A lost-response publication: which transaction, and which pending packs rode in it. */
   private record Uncertain(long sequence, String transactionId, Set<String> packNames) {}
@@ -201,7 +221,7 @@ final class GroupPublisher {
     state.lock();
     try {
       for (PackRef addition : additions) {
-        pendingAdditions.putIfAbsent(addition.getName(), addition);
+        pendingAdditions.putIfAbsent(addition.getName(), new PendingPack(addition));
       }
     } finally {
       state.unlock();
@@ -215,12 +235,47 @@ final class GroupPublisher {
   List<PackRef> pending() {
     state.lock();
     try {
-      List<PackRef> packs = new ArrayList<>(inFlightAdditions.values());
+      List<PendingPack> packs = new ArrayList<>(inFlightAdditions.values());
       packs.addAll(pendingAdditions.values());
-      return List.copyOf(packs);
+      return packs.stream().map(pending -> pending.pack).toList();
     } finally {
       state.unlock();
     }
+  }
+
+  /** A read view sampled in publication order: unpublished state first, then the manifest. */
+  record Snapshot(Manifest manifest, List<PackRef> unpublished) {}
+
+  Snapshot snapshot(ManifestStore store, boolean refresh) throws IOException {
+    List<PendingPack> packs;
+    state.lock();
+    try {
+      packs = new ArrayList<>(inFlightAdditions.values());
+      packs.addAll(pendingAdditions.values());
+    } finally {
+      state.unlock();
+    }
+    Manifest manifest = refresh ? store.refresh() : store.current();
+    Map<Attempt, Boolean> outcomes = new LinkedHashMap<>();
+    List<PackRef> unpublished = new ArrayList<>();
+    for (PendingPack pending : packs) {
+      // Read the attempt after the manifest. A CAS registered after this inventory snapshot may
+      // already have landed by the manifest read. The shared record survives inventory removal.
+      Attempt attempt = pending.attempt;
+      boolean landed = false;
+      if (attempt != null && manifest.getHeadSeq() >= attempt.sequence()) {
+        Boolean known = outcomes.get(attempt);
+        if (known == null) {
+          known = store.transactionLanded(manifest, attempt.sequence(), attempt.transactionId());
+          outcomes.put(attempt, known);
+        }
+        landed = known;
+      }
+      if (!landed) {
+        unpublished.add(pending.pack);
+      }
+    }
+    return new Snapshot(manifest, List.copyOf(unpublished));
   }
 
   boolean hasPending() {
@@ -343,38 +398,29 @@ final class GroupPublisher {
   }
 
   private void publishGroup(List<Request> group) {
-    List<PackRef> drained;
-    long groupEpoch;
-    long expectedRefRevision;
-    state.lock();
-    try {
-      drained = new ArrayList<>(pendingAdditions.values());
-      // Until the outcome is known the packs are neither pending nor published; readers on this
-      // node and the reclaimer keep seeing them through the in-flight set.
-      for (PackRef pack : drained) {
-        inFlightAdditions.put(pack.getName(), pack);
-      }
-      pendingAdditions.clear();
-      groupEpoch = epoch;
-      expectedRefRevision = knownRefRevision;
-    } finally {
-      state.unlock();
-    }
+    List<PackRef> drained = List.of();
+    long expectedRefRevision = -1;
     List<Request> accepted = new ArrayList<>();
-    List<PackRef> additions = new ArrayList<>(drained);
-    List<String> supersedes = new ArrayList<>();
-    RefTransaction.Builder transaction = RefTransaction.newBuilder();
-    boolean refUpdate = false;
     try {
       ManifestStore store = group.get(0).store;
-      Set<String> published = settleUncertain(store);
-      if (!published.isEmpty()) {
-        // Carried by an earlier publication that did land after all: nothing to add, and whatever
-        // superseded them since is the manifest's business.
-        forget(published);
-        drained = drained.stream().filter(pack -> !published.contains(pack.getName())).toList();
-        additions.removeIf(pack -> published.contains(pack.getName()));
+      // Finish recovery before moving packs into this group. Partial recovery can retire an
+      // earlier pack without a later failure putting it back into the pending inventory.
+      settleUncertain(store);
+      long groupEpoch;
+      state.lock();
+      try {
+        drained = pendingAdditions.values().stream().map(pending -> pending.pack).toList();
+        inFlightAdditions.putAll(pendingAdditions);
+        pendingAdditions.clear();
+        groupEpoch = epoch;
+        expectedRefRevision = knownRefRevision;
+      } finally {
+        state.unlock();
       }
+      List<PackRef> additions = new ArrayList<>(drained);
+      List<String> supersedes = new ArrayList<>();
+      RefTransaction.Builder transaction = RefTransaction.newBuilder();
+      boolean refUpdate = false;
       Set<String> pendingNames = new HashSet<>();
       for (PackRef pack : drained) {
         pendingNames.add(pack.getName());
@@ -384,7 +430,7 @@ final class GroupPublisher {
       if (supersedesPending) {
         // A compaction of packs no manifest lists yet (JGit's compactor run over a handle's own
         // flushes): list them first, so an entry only ever supersedes what was live.
-        store.publish(0, drained, List.of(), false, null);
+        publishCarrying(store, 0, drained, List.of(), false, null, drained);
         settle(drained, true);
         drained = List.of();
         additions.clear();
@@ -424,21 +470,18 @@ final class GroupPublisher {
       long produced =
           expectedRefRevision + (ManifestStore.changesRefs(additions, supersedes, before) ? 1 : 0);
       Manifest updated =
-          store.publish(
+          publishCarrying(
+              store,
               refUpdate ? expectedRefRevision : 0,
               additions,
               supersedes,
               refUpdate,
-              refUpdate ? transaction.build() : null);
+              refUpdate ? transaction.build() : null,
+              drained);
       settle(drained, true);
       complete(accepted, updated, accepted.size() > 1 || !drained.isEmpty(), produced, null);
     } catch (IOException failure) {
-      // The packs go back to pending. If the CAS may have landed, remember the transaction: the
-      // next publication settles it from the log before it would add the same packs again.
       settle(drained, false);
-      if (failure instanceof AmbiguousPublicationException unknown && !drained.isEmpty()) {
-        remember(unknown, drained);
-      }
       if (failure instanceof ManifestConflictException) {
         // The store answered with a manifest whose refs this node did not write.
         try {
@@ -447,11 +490,47 @@ final class GroupPublisher {
           // The members re-read the manifest when they re-run.
         }
       }
-      complete(accepted, null, false, expectedRefRevision, failure);
+      // Recovery and pre-publication uploads can fail before accepted is populated. Every
+      // dequeued request must finish, including a waiter interrupted after it was taken.
+      complete(group, null, false, expectedRefRevision, failure);
     } catch (RuntimeException failure) {
       settle(drained, false);
-      complete(accepted, null, false, expectedRefRevision, new IOException("Publication failed", failure));
-      throw failure;
+      complete(
+          group, null, false, expectedRefRevision, new IOException("Publication failed", failure));
+    }
+  }
+
+  private Manifest publishCarrying(
+      ManifestStore store,
+      long expectedRefRevision,
+      Collection<PackRef> additions,
+      Collection<String> supersedes,
+      boolean refUpdate,
+      RefTransaction transaction,
+      List<PackRef> carried)
+      throws IOException {
+    try {
+      return store.publish(
+          expectedRefRevision,
+          additions,
+          supersedes,
+          refUpdate,
+          transaction,
+          (sequence, transactionId) -> {
+            Attempt attempt = new Attempt(sequence, transactionId);
+            state.lock();
+            try {
+              for (PackRef pack : carried) {
+                inFlightAdditions.get(pack.getName()).attempt = attempt;
+              }
+            } finally {
+              state.unlock();
+            }
+          });
+    } catch (AmbiguousPublicationException unknown) {
+      // Associate packs only with their own attempted publication, never with a recovery fence.
+      remember(unknown, carried);
+      throw unknown;
     }
   }
 
@@ -469,38 +548,36 @@ final class GroupPublisher {
   }
 
   /**
-   * Settles every publication with an unknown outcome against the log chain behind a fresh
-   * manifest, and returns the packs that turn out to be published. A transaction the chain does not
-   * show cannot land any more once its sequence is taken, and until then this publication's own
-   * CAS on the same version decides it; either way its packs are ordinary pending packs again.
-   * Pack presence is no substitute for this check: a published pack may already have been
-   * compacted away and reclaimed.
+   * Settles unknown publications from the log, fencing any attempt whose sequence is not yet
+   * occupied. The record is removed only after a definitive outcome. A recovery read or fence
+   * failure leaves both the record and its packs available for the next attempt.
    */
-  private Set<String> settleUncertain(ManifestStore store) throws IOException {
+  private void settleUncertain(ManifestStore store) throws IOException {
     List<Uncertain> unsettled;
     state.lock();
     try {
       if (uncertain.isEmpty()) {
-        return Set.of();
+        return;
       }
       unsettled = new ArrayList<>(uncertain);
     } finally {
       state.unlock();
     }
-    Manifest fresh = store.refresh();
-    Set<String> published = new HashSet<>();
     for (Uncertain publication : unsettled) {
-      if (store.transactionLanded(fresh, publication.sequence(), publication.transactionId())) {
-        published.addAll(publication.packNames());
+      ManifestStore.Resolution resolution =
+          store.resolvePublication(publication.sequence(), publication.transactionId());
+      state.lock();
+      try {
+        if (resolution.landed()) {
+          forget(publication.packNames());
+        }
+        uncertain.remove(publication);
+        // Ref changes seen during recovery invalidate candidates validated before that outcome.
+        observe(resolution.manifest().getRefRevision());
+      } finally {
+        state.unlock();
       }
     }
-    state.lock();
-    try {
-      uncertain.removeAll(unsettled);
-    } finally {
-      state.unlock();
-    }
-    return published;
   }
 
   /** Drops packs from every node-local list: they are in a manifest, past or present. */
@@ -521,9 +598,9 @@ final class GroupPublisher {
     state.lock();
     try {
       for (PackRef pack : drained) {
-        inFlightAdditions.remove(pack.getName());
-        if (!published) {
-          pendingAdditions.putIfAbsent(pack.getName(), pack);
+        PendingPack pending = inFlightAdditions.remove(pack.getName());
+        if (!published && pending != null) {
+          pendingAdditions.putIfAbsent(pack.getName(), pending);
         }
       }
     } finally {
@@ -568,6 +645,9 @@ final class GroupPublisher {
         knownRefRevision = Math.max(knownRefRevision, landed.getRefRevision());
       }
       for (Request member : members) {
+        if (member.done) {
+          continue;
+        }
         member.landed = landed;
         member.shared = shared;
         member.failure = failure;

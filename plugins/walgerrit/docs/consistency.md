@@ -28,13 +28,12 @@ together with every object pack JGit committed ahead of a transaction: a receive
 inserter flush is uploaded at once but published by the next ref transaction on the node, or when
 the handle that committed it closes, so a push is one CAS rather than three. A pack stays listed on
 its node until the publication carrying it is known to have landed, and a publication whose
-response was lost is settled from the log chain before anything it carried is retried: a
-transaction the chain shows has published its packs, whatever compaction did to them since, and a
-manifest that came back with more ref changes than the publication made ends the validation epoch
-of every transaction still queued. The reclaimer samples a node's unpublished packs before it reads
-the manifest, so a publication landing between the two reads leaves its packs in one snapshot or
-the other. Across nodes
-the manifest compare-and-swap is the only fence. A group that loses it to another node's ref change
+response was lost is settled from the log chain before anything it carried is retried. A transaction
+the chain shows has published its packs, whatever compaction did to them since. A manifest that
+came back with more ref changes than the publication made ends the validation epoch of every
+transaction still queued. Readers and the reclaimer sample pending packs before the manifest and
+resolve their publication identities against that manifest, as described below. Across nodes the
+manifest compare-and-swap is the only fence. A group that loses it to another node's ref change
 fails as a whole, and every member is re-run from scratch against the reloaded manifest,
 expected-value checks included, up to five times; independent updates to different refs therefore
 all land, as they do on Gerrit's file-based backends. A real ref conflict is reported to Gerrit as
@@ -44,6 +43,57 @@ stays in the store unreferenced, like any other immutable file a failed publicat
 The manifest carries a separate ref revision. Appending unreachable object packs is safe before ref
 publication and therefore does not invalidate a ref transaction. Only a change to the live
 reftable stack advances the ref revision.
+
+## Ambiguous outcomes and recovery
+
+A conditional-write error does not by itself tell the caller whether a publication committed.
+This includes a precondition failure: an SDK retry can receive it after an earlier request succeeded.
+Every CAS error, including an unchecked SDK exception, is verified using the attempted sequence and
+transaction ID. A failed manifest or log read preserves that identity for recovery.
+
+Recovery has three outcomes:
+
+| Evidence from the manifest's log chain | Action |
+| --- | --- |
+| The attempted transaction occupies its sequence | Forget its pending packs; never add them again, even if compaction removed them from the manifest. |
+| Another transaction occupies that sequence | The old CAS can no longer land. Its pending packs may be carried by a new publication. |
+| The head has not reached that sequence, or verification fails | Keep the attempt unresolved. An older manifest is not proof that a delayed request failed. |
+
+When the head is still behind the attempt, recovery appends an empty `PACK` entry using the normal
+conditional manifest write. This fences the version the old request could still replace. The empty
+entry changes the log head and manifest revision, but no refs, ref revision, or packs. If the old
+request wins the race, the fence follows that history on retry. Either result lets recovery settle
+the original identity from the chain. If the fence or its verification fails, recovery retains the
+original record. The fence never carries pending packs and is never mistaken for their publication.
+No fence or additional store request is added to healthy publication.
+
+Settlement finishes before pending packs are moved into a new group. Each dequeued request gets a
+terminal result even when recovery or preparation fails before group acceptance. A waiter interrupted
+before it is taken is removed; one interrupted after it is taken waits for the group's result and
+then retains its interrupt flag. Ref transactions whose folded table was replaced by compaction
+revalidate and rebuild, just like transactions whose ref revision changed.
+
+Read snapshots also need publication identity. A pack's shared pending record receives the attempted
+sequence and transaction ID **before** the CAS is sent. A reader samples those records first, then
+the manifest, then the attempt identities. Records already sampled survive removal from the node's
+inventory. A transaction found in that manifest's chain is excluded from the unpublished view:
+its pack is either still in the manifest or has been superseded. This also covers a committed write
+whose response is still in flight, and a write that commits and is compacted between the two
+snapshot reads. Readers never fence or mutate the inventory. A chain walk is necessary only when
+an attempted publication trails the sampled head; packs carried by one attempt share the lookup.
+
+The manifest CAS is the commit point. Maintenance notification or local JGit cache failures after
+it must not report a durable ref update as failed. Failed local cache updates invalidate the cache
+so a later read rebuilds it from the manifest.
+
+All pending records and uncertainty are node memory only. A restart forgets both, so it cannot
+re-add a forgotten pack. Its files are already represented by committed history or become orphans
+that reclamation can remove. Recovery assumes linearizable conditional writes, immutable log entries
+retained for the recovery interval, and a manifest history that does not roll back or reuse versions.
+Reclamation waits a separate grace interval after first observing an eligible file as absent;
+file age alone cannot protect a reader of the previous manifest. Upload-to-publication latency and
+old reader lifetimes must each fit the configured grace period; see [compaction.md](compaction.md#reclamation).
+This protocol does not add distributed publication or reader leases.
 
 ## Freshness
 
@@ -88,8 +138,9 @@ check that every superseded file is still live. A reader therefore sees either t
 new ones, both complete, and a writer racing a compaction on another node either lands first, in
 which case the compaction's manifest update merges the writer's additions, or lands second and
 re-runs against the compacted manifest. On the same node a reftable compaction goes through the
-repository's publisher like a ref transaction, so it queues behind the publication in flight rather
-than failing it. Superseded files stay in the store for the reclamation grace period, which
+repository's publisher like a ref transaction, so it queues behind a publication already in flight.
+A ref transaction still uploading its folded table may be overtaken by compaction; if so, it rebuilds
+against the new stack. Superseded files stay in the store for the reclamation grace period, which
 bounds how long a reader may keep using a manifest it read earlier. See
 [compaction.md](compaction.md).
 

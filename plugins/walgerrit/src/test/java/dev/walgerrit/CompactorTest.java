@@ -123,7 +123,8 @@ class CompactorTest {
         publish(repository, head("b" + i), "commit " + i);
       }
     }
-    Set<String> cachedBefore = cachedFiles(root.resolve("node-a-cache/repos/platform/compact.git/wal"));
+    Set<String> cachedBefore =
+        cachedFiles(root.resolve("node-a-cache/repos/platform/compact.git/wal"));
 
     assertEquals(Outcome.COMPACTED, node.compactor().compact(PROJECT));
 
@@ -163,6 +164,8 @@ class CompactorTest {
     SteppingClock clock = new SteppingClock(Instant.now().plus(Duration.ofDays(2)));
     Reclaimer reclaimer = new Reclaimer(node, clock, Duration.ofDays(1), 1);
     assertEquals(0, reclaimer.enforceCacheLimit(), "a size limit never trims the store");
+    assertEquals(0, reclaimer.reclaim(PROJECT).deleted());
+    clock.advance(Duration.ofDays(2));
     reclaimer.reclaim(PROJECT);
     assertEquals(live, cachedFiles(wal), "reclamation with its grace period is the only deletion");
     assertEquals(refs, allRefs(node));
@@ -191,7 +194,9 @@ class CompactorTest {
     Manifest after = manifest(node);
     assertEquals(1, reftables(after).size());
     assertEquals("COMPACT", reftables(after).get(0).getSource());
-    assertTrue(after.getRefRevision() > before.getRefRevision(), "a stack change advances the ref revision");
+    assertTrue(
+        after.getRefRevision() > before.getRefRevision(),
+        "a stack change advances the ref revision");
     assertEquals(expected, allRefs(node));
     try (Repository repository = node.openRepository(PROJECT)) {
       assertNull(repository.exactRef(head("doomed")));
@@ -216,7 +221,8 @@ class CompactorTest {
       long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
       while (System.nanoTime() < deadline
           && (node.compactor().isQueued(PROJECT)
-              || objectPacks(manifest(node)).stream().noneMatch(p -> p.getSource().equals("COMPACT")))) {
+              || objectPacks(manifest(node)).stream()
+                  .noneMatch(p -> p.getSource().equals("COMPACT")))) {
         Thread.sleep(50);
       }
       Manifest manifest = manifest(node);
@@ -224,7 +230,8 @@ class CompactorTest {
           objectPacks(manifest).stream().anyMatch(pack -> pack.getSource().equals("COMPACT")),
           "the write that crossed the threshold triggered a compaction");
       assertTrue(node.compactor().policy().plan(manifest).isEmpty(), "the policy is satisfied");
-      assertTrue(objectPacks(manifest).size() <= 2, "a late write may sit above the compacted pack");
+      assertTrue(
+          objectPacks(manifest).size() <= 2, "a late write may sit above the compacted pack");
     } finally {
       node.compactor().stop();
     }
@@ -251,7 +258,8 @@ class CompactorTest {
         Thread.sleep(50);
       }
       Manifest manifest = manifest(daemon);
-      assertTrue(daemon.compactor().policy().plan(manifest).isEmpty(), "the sweep found and compacted it");
+      assertTrue(
+          daemon.compactor().policy().plan(manifest).isEmpty(), "the sweep found and compacted it");
       assertEquals(1, objectPacks(manifest).size());
     } finally {
       daemon.compactor().stop();
@@ -335,7 +343,10 @@ class CompactorTest {
     assertTrue(shared.list(WAL).contains(WAL + lostPack), "the lost output stays for now");
     assertFalse(live.contains(lostPack), "but nothing references it");
     SteppingClock later = new SteppingClock(Instant.now().plus(Duration.ofDays(2)));
-    new Reclaimer(nodeA, later, Duration.ofDays(1), 0).reclaim(PROJECT);
+    Reclaimer reclaimer = new Reclaimer(nodeA, later, Duration.ofDays(1), 0);
+    assertEquals(0, reclaimer.reclaim(PROJECT).deleted());
+    later.advance(Duration.ofDays(2));
+    reclaimer.reclaim(PROJECT);
     assertFalse(
         shared.list(WAL).contains(WAL + lostPack), "reclamation removes it after the grace period");
     assertEquals(refs, allRefs(nodeA));
@@ -364,7 +375,8 @@ class CompactorTest {
               HookedObjectStore::publishesReftableCompaction,
               () -> {
                 try (Repository repository = nodeB.openRepository(PROJECT)) {
-                  expected.put(head("during"), publish(repository, head("during"), "during compaction"));
+                  expected.put(
+                      head("during"), publish(repository, head("during"), "during compaction"));
                 } catch (Exception exception) {
                   throw new IllegalStateException(exception);
                 }
@@ -372,7 +384,9 @@ class CompactorTest {
       WalGitRepositoryManager nodeA = node("node-a1", hooked, ignored -> {});
       assertEquals(Outcome.COMPACTED, nodeA.compactor().compact(PROJECT));
       assertEquals(
-          2, hooked.matchedCasAttempts.get(), "the CAS lost once and merged node B's table on retry");
+          2,
+          hooked.matchedCasAttempts.get(),
+          "the CAS lost once and merged node B's table on retry");
       assertEquals(expected, allRefs(node("node-c1", shared, ignored -> {})));
       assertTrue(reftables(manifest(nodeB)).size() <= 2, "the compacted stack plus node B's table");
     }
@@ -494,6 +508,9 @@ class CompactorTest {
     assertTrue(store.list(WAL).containsAll(before));
 
     clock.advance(Duration.ofHours(2));
+    assertEquals(
+        0, reclaimer.reclaim(PROJECT).deleted(), "first eligible absence starts reader grace");
+    clock.advance(Duration.ofHours(2));
     Reclaimer.Report old = reclaimer.reclaim(PROJECT);
     Set<String> remaining = new HashSet<>();
     for (String key : store.list(WAL)) {
@@ -502,7 +519,10 @@ class CompactorTest {
     assertEquals(live, remaining, "exactly the live files remain");
     long superseded = before.stream().filter(key -> !live.contains(key.substring(WAL.length()))).count();
     assertEquals(superseded + 1, old.deleted(), "the superseded files and the orphan were deleted");
-    assertEquals(logsBefore, new HashSet<>(store.list("repos/platform/compact.git/log/")), "log objects are never touched");
+    assertEquals(
+        logsBefore,
+        new HashSet<>(store.list("repos/platform/compact.git/log/")),
+        "log objects are never touched");
     assertEquals(manifest, manifest(node), "reclamation changes no manifest");
     assertEquals(refs, allRefs(node("node-b", store, ignored -> {})));
   }
@@ -544,7 +564,8 @@ class CompactorTest {
     tweak.accept(config);
     WalGitConfiguration configuration = WalGitConfiguration.from(config, root.resolve(name));
     StorageLayout layout =
-        new StorageLayout(store, root.resolve(name + "-cache"), root.resolve(name + "-cursors"), "");
+        new StorageLayout(
+            store, root.resolve(name + "-cache"), root.resolve(name + "-cursors"), "");
     return new WalGitRepositoryManager(configuration, layout);
   }
 

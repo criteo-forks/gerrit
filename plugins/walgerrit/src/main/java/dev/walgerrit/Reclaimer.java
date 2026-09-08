@@ -22,8 +22,10 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.stream.Stream;
@@ -33,14 +35,12 @@ import org.slf4j.LoggerFactory;
 /**
  * Removes files the manifest no longer references, and bounds the node-local cache.
  *
- * <p>One rule covers every kind of leftover, packs and reftables superseded by compaction, outputs
- * of a compaction that lost its CAS and reftables of ref transactions that lost theirs: a file
- * beneath {@code wal/} that the current manifest does not list and whose store timestamp is older
- * than the grace period is deleted. The grace period is what makes this safe. It exceeds by orders
- * of magnitude the seconds between a file's upload and the publication that references it, and any
- * reader still holding an older manifest, since handles revalidate every second. Log objects are
- * never touched, and on a versioned bucket a deleted pack stays recoverable for the bucket's
- * non-current-version retention.
+ * <p>A file must be old enough that its upload cannot still be awaiting publication, then remain
+ * unreferenced for a further grace period observed by this reclaimer. File age alone does not
+ * protect a reader of an old manifest: a years-old pack may have been superseded only a moment ago.
+ * Observation state is node memory only; a restart waits again. A published pack is never re-added,
+ * so an eligible absent file cannot become live again. Upload-to-publication latency and reader
+ * lifetime must each be shorter than the configured grace period. Log objects are never touched.
  *
  * <p>The local cache is only a cache: files the manifest no longer lists are removed at once, and
  * when a size limit is configured the oldest cached files are dropped first, to be fetched again on
@@ -65,6 +65,11 @@ final class Reclaimer {
   private final Clock clock;
   private final Duration grace;
   private final long cacheSizeLimit;
+
+  private record Candidate(String version, long modified, long observedAt) {}
+
+  // Guarded by this. Lost observations postpone deletion; they never make a file eligible sooner.
+  private final Map<Project.NameKey, Map<String, Candidate>> candidates = new HashMap<>();
 
   Reclaimer(WalGitRepositoryManager repositories, Clock clock, Duration grace, long cacheSizeLimit) {
     this.repositories = repositories;
@@ -92,10 +97,12 @@ final class Reclaimer {
    * unreferenced files go, which is what a node that does not lead the deployment does: the store
    * is shared, so one node deleting from it is enough, and the grace period makes it safe to wait.
    */
-  Report reclaimAll(BiConsumer<Project.NameKey, Manifest> observer, boolean deleteFromStore)
-      throws IOException {
+  synchronized Report reclaimAll(
+      BiConsumer<Project.NameKey, Manifest> observer, boolean deleteFromStore) throws IOException {
     Report total = new Report(0, 0, 0, 0);
-    for (Project.NameKey project : repositories.storage().listProjects()) {
+    Set<Project.NameKey> projects = repositories.storage().listProjects();
+    candidates.keySet().retainAll(projects);
+    for (Project.NameKey project : projects) {
       try {
         total = total.plus(reclaim(project, observer, deleteFromStore));
       } catch (IOException exception) {
@@ -124,34 +131,57 @@ final class Reclaimer {
     return reclaim(project, (name, manifest) -> {}, true);
   }
 
-  private Report reclaim(
+  private synchronized Report reclaim(
       Project.NameKey project,
       BiConsumer<Project.NameKey, Manifest> observer,
       boolean deleteFromStore)
       throws IOException {
     ManifestStore store = repositories.storage().manifestStore(project);
-    // This node's unpublished packs are sampled before the manifest is read: a pack whose
-    // publication lands between the two reads is then in one snapshot or the other, never neither.
-    Set<String> unpublished = store.publisher().pendingFileNames();
-    Manifest manifest = store.refresh();
+    GroupPublisher.Snapshot snapshot = store.publisher().snapshot(store, true);
+    Manifest manifest = snapshot.manifest();
     observer.accept(project, manifest);
     Set<String> live = new HashSet<>(ManifestStore.liveFileNames(manifest));
-    live.addAll(unpublished);
-    long cutoff = clock.millis() - grace.toMillis();
+    live.addAll(ManifestStore.fileNames(snapshot.unpublished()));
+    long now = clock.millis();
+    long cutoff = now - grace.toMillis();
     int deleted = 0;
     if (deleteFromStore) {
+      Map<String, Candidate> observed =
+          candidates.computeIfAbsent(project, ignored -> new HashMap<>());
+      Set<String> eligible = new HashSet<>();
       for (ObjectStore.ObjectSummary object : store.listWalObjects()) {
         if (live.contains(object.key()) || object.lastModifiedEpochMillis() > cutoff) {
+          observed.remove(object.key());
+          continue;
+        }
+        eligible.add(object.key());
+        Candidate candidate = observed.get(object.key());
+        if (candidate == null
+            || !candidate.version().equals(object.version())
+            || candidate.modified() != object.lastModifiedEpochMillis()) {
+          candidate = new Candidate(object.version(), object.lastModifiedEpochMillis(), now);
+          observed.put(object.key(), candidate);
+        }
+        if (candidate.observedAt() > cutoff) {
           continue;
         }
         store.deleteWalObject(object.key());
+        observed.remove(object.key());
         deleted++;
       }
+      observed.keySet().retainAll(eligible);
+      if (observed.isEmpty()) {
+        candidates.remove(project);
+      }
+    } else {
+      // A node newly elected to reclaim starts a fresh observation interval.
+      candidates.remove(project);
     }
     int evicted = store.evictLocalFilesExcept(live);
     if (deleted > 0 || evicted > 0) {
       logger.info(
-          "WalGerrit reclaimed {} unreferenced file(s) of {} from the store and {} from the local cache",
+          "WalGerrit reclaimed {} unreferenced file(s) of {} from the store and {} from the local"
+              + " cache",
           deleted,
           project.get(),
           evicted);
@@ -162,9 +192,9 @@ final class Reclaimer {
   /** Drops this node's cached copies of files the repository's manifest no longer lists. */
   int evictLocal(Project.NameKey project) throws IOException {
     ManifestStore store = repositories.storage().manifestStore(project);
-    Set<String> unpublished = store.publisher().pendingFileNames();
-    Set<String> live = new HashSet<>(ManifestStore.liveFileNames(store.current()));
-    live.addAll(unpublished);
+    GroupPublisher.Snapshot snapshot = store.publisher().snapshot(store, false);
+    Set<String> live = new HashSet<>(ManifestStore.liveFileNames(snapshot.manifest()));
+    live.addAll(ManifestStore.fileNames(snapshot.unpublished()));
     return store.evictLocalFilesExcept(live);
   }
 
@@ -212,7 +242,9 @@ final class Reclaimer {
       Files.deleteIfExists(ChunkedFile.sidecarFor(file.path()));
     }
     logger.info(
-        "WalGerrit trimmed {} bytes from the local cache to stay under {} bytes", freed, cacheSizeLimit);
+        "WalGerrit trimmed {} bytes from the local cache to stay under {} bytes",
+        freed,
+        cacheSizeLimit);
     return freed;
   }
 }
