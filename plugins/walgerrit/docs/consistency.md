@@ -28,9 +28,12 @@ together with every object pack JGit committed ahead of a transaction: a receive
 inserter flush is uploaded at once but published by the next ref transaction on the node, or when
 the handle that committed it closes, so a push is one CAS rather than three. A pack stays listed on
 its node until the publication carrying it is known to have landed, and a publication whose
-response was lost is reconciled against the manifest before anything is retried: a pack the
-manifest already lists is not added twice, and a manifest that came back with more ref changes
-than the publication made ends the validation epoch of every transaction still queued. Across nodes
+response was lost is settled from the log chain before anything it carried is retried: a
+transaction the chain shows has published its packs, whatever compaction did to them since, and a
+manifest that came back with more ref changes than the publication made ends the validation epoch
+of every transaction still queued. The reclaimer samples a node's unpublished packs before it reads
+the manifest, so a publication landing between the two reads leaves its packs in one snapshot or
+the other. Across nodes
 the manifest compare-and-swap is the only fence. A group that loses it to another node's ref change
 fails as a whole, and every member is re-run from scratch against the reloaded manifest,
 expected-value checks included, up to five times; independent updates to different refs therefore

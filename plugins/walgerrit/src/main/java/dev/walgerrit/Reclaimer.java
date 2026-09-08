@@ -130,11 +130,13 @@ final class Reclaimer {
       boolean deleteFromStore)
       throws IOException {
     ManifestStore store = repositories.storage().manifestStore(project);
+    // This node's unpublished packs are sampled before the manifest is read: a pack whose
+    // publication lands between the two reads is then in one snapshot or the other, never neither.
+    Set<String> unpublished = store.publisher().pendingFileNames();
     Manifest manifest = store.refresh();
     observer.accept(project, manifest);
     Set<String> live = new HashSet<>(ManifestStore.liveFileNames(manifest));
-    // Uploaded on this node, published by the next ref transaction: referenced, just not yet.
-    live.addAll(store.publisher().pendingFileNames());
+    live.addAll(unpublished);
     long cutoff = clock.millis() - grace.toMillis();
     int deleted = 0;
     if (deleteFromStore) {
@@ -160,8 +162,9 @@ final class Reclaimer {
   /** Drops this node's cached copies of files the repository's manifest no longer lists. */
   int evictLocal(Project.NameKey project) throws IOException {
     ManifestStore store = repositories.storage().manifestStore(project);
+    Set<String> unpublished = store.publisher().pendingFileNames();
     Set<String> live = new HashSet<>(ManifestStore.liveFileNames(store.current()));
-    live.addAll(store.publisher().pendingFileNames());
+    live.addAll(unpublished);
     return store.evictLocalFilesExcept(live);
   }
 

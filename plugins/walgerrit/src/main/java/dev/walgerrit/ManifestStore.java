@@ -460,7 +460,10 @@ final class ManifestStore {
         } catch (IOException verificationFailure) {
           ambiguous.addSuppressed(verificationFailure);
         }
-        throw ambiguous;
+        // Not seen in the chain, or the chain could not be read: a write whose response was lost
+        // may still land, so the caller must settle this transaction from the log before it
+        // retries anything the attempt carried.
+        throw new AmbiguousPublicationException(sequence, transactionId, ambiguous);
       }
     }
     throw new IOException("Manifest CAS did not converge after " + MAX_CAS_ATTEMPTS + " attempts");
@@ -738,7 +741,8 @@ final class ManifestStore {
    * passes through the attempt's transaction id at its sequence. No read when the attempt is the
    * head itself.
    */
-  private boolean transactionLanded(Manifest manifest, long sequence, String transactionId)
+  /** Whether the log chain behind {@code manifest} holds this transaction at this sequence. */
+  boolean transactionLanded(Manifest manifest, long sequence, String transactionId)
       throws IOException {
     if (manifest.getHeadSeq() < sequence) {
       return false;

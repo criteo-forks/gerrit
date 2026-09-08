@@ -129,6 +129,11 @@ final class GroupPublisher {
   private final Map<String, PackRef> pendingAdditions = new LinkedHashMap<>();
   /** Pending packs a publication in flight carries; still listed and protected until it resolves. */
   private final Map<String, PackRef> inFlightAdditions = new LinkedHashMap<>();
+  /** Publications whose outcome is unknown, with the packs they carried; settled from the log. */
+  private final List<Uncertain> uncertain = new ArrayList<>();
+
+  /** A lost-response publication: which transaction, and which pending packs rode in it. */
+  private record Uncertain(long sequence, String transactionId, Set<String> packNames) {}
   private boolean publishing;
   private long epoch;
   private long knownRefRevision = -1;
@@ -362,6 +367,14 @@ final class GroupPublisher {
     boolean refUpdate = false;
     try {
       ManifestStore store = group.get(0).store;
+      Set<String> published = settleUncertain(store);
+      if (!published.isEmpty()) {
+        // Carried by an earlier publication that did land after all: nothing to add, and whatever
+        // superseded them since is the manifest's business.
+        forget(published);
+        drained = drained.stream().filter(pack -> !published.contains(pack.getName())).toList();
+        additions.removeIf(pack -> published.contains(pack.getName()));
+      }
       Set<String> pendingNames = new HashSet<>();
       for (PackRef pack : drained) {
         pendingNames.add(pack.getName());
@@ -420,9 +433,12 @@ final class GroupPublisher {
       settle(drained, true);
       complete(accepted, updated, accepted.size() > 1 || !drained.isEmpty(), produced, null);
     } catch (IOException failure) {
-      // Whether the CAS landed is unknown when the response was lost; the packs go back to pending
-      // and the next publication skips whichever the manifest turns out to list already.
+      // The packs go back to pending. If the CAS may have landed, remember the transaction: the
+      // next publication settles it from the log before it would add the same packs again.
       settle(drained, false);
+      if (failure instanceof AmbiguousPublicationException unknown && !drained.isEmpty()) {
+        remember(unknown, drained);
+      }
       if (failure instanceof ManifestConflictException) {
         // The store answered with a manifest whose refs this node did not write.
         try {
@@ -436,6 +452,67 @@ final class GroupPublisher {
       settle(drained, false);
       complete(accepted, null, false, expectedRefRevision, new IOException("Publication failed", failure));
       throw failure;
+    }
+  }
+
+  private void remember(AmbiguousPublicationException unknown, List<PackRef> carried) {
+    Set<String> names = new HashSet<>();
+    for (PackRef pack : carried) {
+      names.add(pack.getName());
+    }
+    state.lock();
+    try {
+      uncertain.add(new Uncertain(unknown.sequence(), unknown.transactionId(), names));
+    } finally {
+      state.unlock();
+    }
+  }
+
+  /**
+   * Settles every publication with an unknown outcome against the log chain behind a fresh
+   * manifest, and returns the packs that turn out to be published. A transaction the chain does not
+   * show cannot land any more once its sequence is taken, and until then this publication's own
+   * CAS on the same version decides it; either way its packs are ordinary pending packs again.
+   * Pack presence is no substitute for this check: a published pack may already have been
+   * compacted away and reclaimed.
+   */
+  private Set<String> settleUncertain(ManifestStore store) throws IOException {
+    List<Uncertain> unsettled;
+    state.lock();
+    try {
+      if (uncertain.isEmpty()) {
+        return Set.of();
+      }
+      unsettled = new ArrayList<>(uncertain);
+    } finally {
+      state.unlock();
+    }
+    Manifest fresh = store.refresh();
+    Set<String> published = new HashSet<>();
+    for (Uncertain publication : unsettled) {
+      if (store.transactionLanded(fresh, publication.sequence(), publication.transactionId())) {
+        published.addAll(publication.packNames());
+      }
+    }
+    state.lock();
+    try {
+      uncertain.removeAll(unsettled);
+    } finally {
+      state.unlock();
+    }
+    return published;
+  }
+
+  /** Drops packs from every node-local list: they are in a manifest, past or present. */
+  private void forget(Set<String> names) {
+    state.lock();
+    try {
+      for (String name : names) {
+        pendingAdditions.remove(name);
+        inFlightAdditions.remove(name);
+      }
+    } finally {
+      state.unlock();
     }
   }
 
