@@ -1,96 +1,108 @@
 # Storage format
 
-The shared format mirrors the Continuity/WalGit layout while using JGit's native DFS files.
+The manifest names the live Git files. The log records how that inventory changed. Files outside
+the committed inventory do not publish refs merely by existing in the store.
 
 ```text
-<object-store-prefix>/manifests/<project>.git/
-  manifest.pb                  # the CAS-replaced linearization point
-
-<object-store-prefix>/repos/<project>.git/
-  log/<sequence>-<transaction>.pb
-  wal/<pack-id>.pack
-  wal/<pack-id>.idx
-  wal/<pack-id>.ref
+<store-prefix>/
+  manifests/<project>.git/manifest.pb
+  repos/<project>.git/
+    log/<sequence>-<transaction-id>.pb
+    wal/<pack-id>.pack
+    wal/<pack-id>.idx
+    wal/<pack-id>.ref
+  leases/<project>.git/compaction
+  leases/cluster/sweep
+  cluster/web-session-signing-key       # optional stateless sessions
 
 <storagePath>/repos/<project>.git/
   staging/
-  wal/                         # materialized immutable-file cache
+  wal/                                # local immutable-file cache
 
 <indexCursorPath>/repos/<project>.git.cursor
 <indexCursorPath>/READY
 ```
 
-Manifests live under their own prefix, apart from the pack, index, reftable and log objects. One
-paginated listing of `manifests/` therefore enumerates every repository together with the current
-version of its manifest, the ETag on S3, at a cost proportional to the number of repositories. That
-listing is how repositories are discovered and how the index-event sweep finds the manifests that
-changed without reading any of them.
+Pack families may also contain bitmap and reverse-index files. Large cached S3 packs can have a
+`.chunks` sidecar that records downloaded ranges. Staging files and cursors are node-local.
 
-The local backend maps the shared object-store prefix and cache onto the same filesystem tree and
-keeps its lock files under `.object-locks/`. The S3 backend keeps the shared objects in the bucket
-and the staging/cache tree on each node.
+The local backend maps the store and file cache onto the same filesystem tree, with conditional
+write locks under `.object-locks/`. The S3 backend keeps the shared objects beneath `s3Prefix` in
+the bucket and the cache beneath each node's `storagePath`.
 
-`manifest.pb` contains the repository identity, object format, head sequence and the head entry's
-transaction id, overall revision, ref revision, and the live DFS file-set inventory. Its size
-depends on the number of live files, never on the repository's age. The schemas are in
-`src/main/proto/walgerrit.proto`; the manifest format version is 3.
+## The manifest grows with live data, not history
+
+Format version 3 records the repository name, SHA-1 object format, head sequence and transaction
+ID, overall revision, ref revision, writer, timestamp and live pack families. Each family records
+its source, files and sizes, object/delta counts, reftable update indices and pack checksum.
+The schema is [walgerrit.proto](../src/main/proto/walgerrit.proto).
+
+`revision` advances on every publication. `ref_revision` advances only when the live reftable
+stack changes, including reftable compaction. The object store's version token is separate from
+both: it is the value used for conditional replacement.
+
+Manifests have a dedicated prefix. A paginated listing discovers repository names and manifest
+versions without enumerating packs or logs. On S3, the listed version is the ETag. An unchanged
+version lets the index tailer skip an already indexed repository.
 
 ## The log chain
 
-Every `log/<seq>-<transaction_id>.pb` object is one `LogEntry`: the additions and superseded files
-of one publication, a `transaction_id` unique to that publication attempt, and the transaction id of
-the entry before it. A `REF_UPDATE` entry also contains the complete logical ref transaction (ref
-name, old/new object IDs, and new symbolic target). Because each entry names its predecessor, the
-history of a repository is the chain reachable from the manifest's head: every key on it is known
-without a listing, and an entry written by a publication that lost its CAS is simply never
-referenced. Nothing is ever deleted from `log/`, so every transition ever published remains
-available for audit and for recovery from an earlier manifest version.
+Each entry names its sequence, unique transaction ID and predecessor's transaction ID. Starting
+from the manifest head, a reader derives each predecessor key without listing the log prefix.
+Only entries reachable through that chain belong to committed history. Losing CAS attempts can
+leave unreferenced log objects.
 
-A follower's cursor names the last entry it applied by sequence and transaction id. To replay, it
-walks the chain back from the head to its sequence, one object per entry behind, and the id the walk
-arrives at must be the one the cursor recorded. A cursor ahead of the head, one naming a transaction
-the chain does not, which happens after a manifest is restored to an older version and diverges, or
-one more than `walgerrit.indexReplayLimit` entries behind cannot or should not be replayed, and the
-follower rebuilds its derived state instead.
+| Kind | Contents |
+| --- | --- |
+| `PACK` | File additions without a logical ref transaction; also used for import and recovery fences. |
+| `REF_UPDATE` | File changes and the complete logical ref transaction. |
+| `COMPACT` | Replacement files and the names they supersede. |
+| `EVENT` | Serialized Gerrit notifications. |
 
-`indexCursorPath` is node-local and is not part of the shared object store. Its protobuf cursor
-identifies both the last applied sequence and the immutable log key at that sequence, which detects
-history replacement rather than trusting a sequence number alone. `READY` exists only while the
-daemon's most recently completed full index-event sweep was clean.
+A logical ref update records the ref name, old and new object IDs, and a new symbolic target when
+applicable. Several independent local batches can share one entry; their logical updates are
+concatenated in publication order.
+
+Log objects are not reclaimed. This preserves the recorded transitions, but does not retain all
+historical pack contents: superseded files can be deleted after the reclamation grace checks.
+Log retention alone therefore does not provide point-in-time data recovery.
+
+## A cursor identifies history, not just a position
+
+Each node stores the last applied sequence and transaction ID beside its own Lucene indexes.
+At a repository head, it also records the manifest version. A later listing of the same version
+confirms that no replay is needed, including after a restart.
+
+Replay walks backward from the head, validates the cursor's transaction ID, then applies entries
+forward. A cursor ahead of the head, on a different history, or more than `indexReplayLimit`
+entries behind requires a rebuild. Missing or malformed log entries stop replay. See
+[Index events](index-events.md).
+
+`READY` reports the outcome of the daemon's last completed full sweep. An orderly shutdown
+removes it; a hard kill can leave it behind. A probe must also check the local listener.
 
 ## Publication
 
-1. JGit writes a pack/index or reftable into `staging/`.
-2. WalGerrit publishes every completed file as an immutable `wal/` object and materializes it in
-   the node-local cache.
-3. WalGerrit writes and fsyncs a uniquely named immutable log entry.
-4. A ref transaction verifies the expected ref revision. Concurrent object-pack appends do not
-   invalidate that token; a concurrent reftable publication does. Maintenance verifies every file
-   it supersedes is still live.
-5. WalGerrit atomically replaces and fsyncs `manifest.pb` locally, or conditionally replaces it in
-   S3.
+1. Write pack/index or reftable files into local staging.
+2. Persist every completed file as an immutable `wal/` object.
+3. Write a uniquely named immutable log entry.
+4. Conditionally replace the manifest, checking ref revision and superseded inputs as required.
 
-Only step 5 makes a transaction visible. A process death before it can leave immutable orphan files
-or an orphan log entry, but cannot expose partial refs. Orphan files are reclaimed by the rule in
-[compaction.md](compaction.md#reclamation) once they are older than the grace period; log entries
-are never deleted.
+The local backend uses fsync and atomic replacement; S3 uses conditional object requests. Step 4
+is the commit point. Object packs may wait in the node's pending inventory until a ref transaction
+or handle close publishes them. Ref transactions publish their reftables and pending object packs
+together.
 
-`leases/<project>.git/compaction` holds the repository's compaction lease, a small protobuf with an
-owner and an expiry, kept apart from the manifests prefix so a listing of manifests stays a listing
-of repositories.
+Failure before the CAS can leave files or log entries behind without exposing partial ref
+updates. The [reclaimer](compaction.md#reclamation) removes eligible unreferenced `wal/` files;
+log objects remain. A lost CAS response requires [outcome recovery](consistency.md#ambiguous-outcomes-and-recovery).
 
-JGit represents a batch ref update as one reftable file, so all refs in that batch share one manifest
-publication. The object packs JGit committed ahead of the transaction (the received pack, an inserter
-flush) ride in the same entry, and concurrent transactions on one node that touch unrelated refs
-share an entry too, their ref transactions concatenated in order. Reftable compaction may supersede
-an earlier reftable in the same transaction.
+## Format boundaries
 
-## Deliberate limitations
+Only SHA-1 repositories and manifest format 3 are supported. There is no automatic conversion
+from earlier manifest versions, durable repository deletion, or native GCS backend. Import from
+bare repositories is available through [walgerrit-import](import.md).
 
-- SHA-1 repositories only, matching current Gerrit project storage.
-- No durable repository deletion or import workflow yet.
-- S3-compatible storage is implemented; GCS-native conditional requests are not.
-- With the local backend the node-local cache is the store, so it cannot be bounded; the object
-  store backends bound it with `walgerrit.cacheSizeLimit`.
-- Immutable file names are random DFS pack identifiers; Git pack checksums are recorded in the
-  manifest. The object-store milestone can use the checksum as the remote content key.
+New DFS file names use random pack identifiers; imported packs retain their original names.
+Pack checksums are metadata, not a universal object-store naming scheme. Multi-pack indexes are
+disabled because the manifest does not represent their coverage relationships.

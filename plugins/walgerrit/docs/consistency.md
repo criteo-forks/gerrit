@@ -1,172 +1,164 @@
 # Consistency contract
 
-Both storage backends provide the same publication contract. The local backend uses atomic
-filesystem moves and a locked manifest compare-and-swap. The S3 backend uses immutable puts and a
-conditional manifest request.
+A repository's manifest CAS is its commit point. Immutable files must exist before that CAS;
+local caches and search indexes may catch up afterward. There is no transaction spanning several
+repositories.
+
+The local backend uses locks, fsync and atomic filesystem replacement. The S3 backend uses
+immutable puts and conditional manifest writes. Both require storage semantics that preserve
+atomic publication and readable immutable dependencies.
 
 ## Publication order
 
-1. Upload every immutable pack and index required by the transaction.
-2. Persist the transaction-log entry.
-3. Atomically compare-and-swap the repository manifest.
-4. Acknowledge the Gerrit operation only after the winning manifest is readable by every serving
-   instance.
+1. Persist every immutable object pack, index and reftable needed by the transaction.
+2. Persist its immutable log entry.
+3. Compare-and-swap the manifest.
+4. Report success after the commit is known to have landed.
 
-Objects may exist before their refs. Refs must never point to unavailable objects.
+Acknowledgement depends on the store's visibility guarantees, not on polling every Gerrit node.
+Search indexes need not have converged before a Git write succeeds. Objects may precede their
+refs; refs must never precede their objects.
 
 ## Ref transactions
 
-Gerrit's `BatchRefUpdate` may update several refs atomically. The backend must validate every
-expected old object ID and publish either all requested ref changes or none of them.
+An atomic Gerrit `BatchRefUpdate` validates expected old values and publishes all accepted ref
+changes together. `ref_revision` identifies the reftable stack used for validation. Object-only
+publications leave it unchanged; any live reftable-stack change advances it.
 
-Within a node, every handle shares one publisher per repository. A ref transaction is admitted
-once no transaction in flight on the node touches a ref name that could interfere with its own (the
-same name, or one nested under the other); it then validates and writes its reftable under the node
-lock, releases it, and hands the publication to the publisher. Members admitted together validated
-against states this node itself produced, so their reftables land in one log entry with one CAS,
-together with every object pack JGit committed ahead of a transaction: a received pack or an
-inserter flush is uploaded at once but published by the next ref transaction on the node, or when
-the handle that committed it closes, so a push is one CAS rather than three. A pack stays listed on
-its node until the publication carrying it is known to have landed, and a publication whose
-response was lost is settled from the log chain before anything it carried is retried. A transaction
-the chain shows has published its packs, whatever compaction did to them since. A manifest that
-came back with more ref changes than the publication made ends the validation epoch of every
-transaction still queued. Readers and the reclaimer sample pending packs before the manifest and
-resolve their publication identities against that manifest, as described below. Across nodes the
-manifest compare-and-swap is the only fence. A group that loses it to another node's ref change
-fails as a whole, and every member is re-run from scratch against the reloaded manifest,
-expected-value checks included, up to five times; independent updates to different refs therefore
-all land, as they do on Gerrit's file-based backends. A real ref conflict is reported to Gerrit as
-a lock failure; it must not be silently overwritten. The reftable a lost attempt already uploaded
-stays in the store unreferenced, like any other immutable file a failed publication leaves behind.
+All handles for a repository on one node share a `GroupPublisher`. Admission prevents concurrent
+local transactions from touching the same ref or conflicting parent/child ref names. JGit
+validation and table construction use the node lock; publication can batch independent prepared
+transactions into one log entry and one manifest CAS.
 
-The manifest carries a separate ref revision. Appending unreachable object packs is safe before ref
-publication and therefore does not invalidate a ref transaction. Only a change to the live
-reftable stack advances the ref revision.
+Object inserters and received-pack parsers upload files before ref publication. Their packs remain
+pending on the node until a ref transaction carries them or the originating handle closes and
+flushes them. Local readers can see these pending objects. Other nodes see them only after
+manifest publication.
+
+Across nodes, manifest CAS is the publication fence. If another node changes the ref revision,
+a losing ref batch refreshes, validates again and rebuilds its table, for at most five total
+attempts. A changed expected value, exhausted retries or publication failure can surface as a
+JGit lock failure. Retrying never silently overwrites a conflicting ref.
+
+A returned manifest can include later ref changes beyond the publishing group's own work. That
+ends the validation epoch of queued transactions. A transaction whose folded table was replaced
+by compaction must also rebuild. Uploaded tables from losing attempts remain unreferenced.
 
 ## Ambiguous outcomes and recovery
 
-A conditional-write error does not by itself tell the caller whether a publication committed.
-This includes a precondition failure: an SDK retry can receive it after an earlier request succeeded.
-Every CAS error, including an unchecked SDK exception, is verified using the attempted sequence and
-transaction ID. A failed manifest or log read preserves that identity for recovery.
+A write error does not prove that a CAS failed. Even a precondition error may be an SDK retry of
+a request that already succeeded. WalGerrit verifies every CAS error against the attempted
+sequence and transaction ID, including unchecked SDK failures.
 
-Recovery has three outcomes:
-
-| Evidence from the manifest's log chain | Action |
+| Evidence in committed history | Meaning |
 | --- | --- |
-| The attempted transaction occupies its sequence | Forget its pending packs; never add them again, even if compaction removed them from the manifest. |
-| Another transaction occupies that sequence | The old CAS can no longer land. Its pending packs may be carried by a new publication. |
-| The head has not reached that sequence, or verification fails | Keep the attempt unresolved. An older manifest is not proof that a delayed request failed. |
+| The attempt occupies its sequence. | It committed. Never publish its pending packs again, even if compaction has since removed them. |
+| A different transaction occupies that sequence. | The old CAS can no longer land. Uncommitted pending packs may enter a new publication. |
+| The head has not reached that sequence, or verification fails. | The outcome remains unresolved. Preserve the attempt's identity. |
 
-When the head is still behind the attempt, recovery appends an empty `PACK` entry using the normal
-conditional manifest write. This fences the version the old request could still replace. The empty
-entry changes the log head and manifest revision, but no refs, ref revision, or packs. If the old
-request wins the race, the fence follows that history on retry. Either result lets recovery settle
-the original identity from the chain. If the fence or its verification fails, recovery retains the
-original record. The fence never carries pending packs and is never mistaken for their publication.
-No fence or additional store request is added to healthy publication.
+Recovery resolves uncertainty before moving pending packs into another publication. If the head
+is still behind the attempt, it appends an empty `PACK` entry using the normal conditional write.
+This fences the version the delayed request could still replace. If the old request wins first,
+the fence follows that history. Either outcome lets recovery determine which transaction occupies
+the original sequence.
 
-Settlement finishes before pending packs are moved into a new group. Each dequeued request gets a
-terminal result even when recovery or preparation fails before group acceptance. A waiter interrupted
-before it is taken is removed; one interrupted after it is taken waits for the group's result and
-then retains its interrupt flag. Ref transactions whose folded table was replaced by compaction
-revalidate and rebuild, just like transactions whose ref revision changed.
+The empty entry changes the log head and manifest revision but no files, refs or ref revision.
+It carries no pending packs. If fencing or verification fails, the original attempt stays
+unresolved. Healthy publication needs no such fence.
 
-Read snapshots also need publication identity. A pack's shared pending record receives the attempted
-sequence and transaction ID **before** the CAS is sent. A reader samples those records first, then
-the manifest, then the attempt identities. Records already sampled survive removal from the node's
-inventory. A transaction found in that manifest's chain is excluded from the unpublished view:
-its pack is either still in the manifest or has been superseded. This also covers a committed write
-whose response is still in flight, and a write that commits and is compacted between the two
-snapshot reads. Readers never fence or mutate the inventory. A chain walk is necessary only when
-an attempted publication trails the sampled head; packs carried by one attempt share the lookup.
+Every dequeued request receives a terminal result, including when recovery fails before the group
+is accepted. A waiter interrupted before dequeue is removed. One interrupted afterward waits for
+the group's result and preserves its interrupt flag.
 
-The manifest CAS is the commit point. Maintenance notification or local JGit cache failures after
-it must not report a durable ref update as failed. Failed local cache updates invalidate the cache
-so a later read rebuilds it from the manifest.
+### Readers must not resurrect retired packs
 
-All pending records and uncertainty are node memory only. A restart forgets both, so it cannot
-re-add a forgotten pack. Its files are already represented by committed history or become orphans
-that reclamation can remove. Recovery assumes linearizable conditional writes, immutable log entries
-retained for the recovery interval, and a manifest history that does not roll back or reuse versions.
-Reclamation waits a separate grace interval after first observing an eligible file as absent;
-file age alone cannot protect a reader of the previous manifest. Upload-to-publication latency and
-old reader lifetimes must each fit the configured grace period; see [compaction.md](compaction.md#reclamation).
-This protocol does not add distributed publication or reader leases.
+A pending pack record receives the attempted sequence and transaction ID before the CAS is sent.
+Readers sample pending records first, then the manifest, then the attempt identities. The sampled
+records remain valid even if publication removes them from the node's pending inventory.
+
+If the sampled manifest's chain contains the attempt, its packs are excluded from the unpublished
+view. They are either still live in the manifest or have been superseded. This covers a committed
+write whose response is in flight, including one already followed by compaction. Readers resolve
+identity without fencing or changing pending state; packs from one attempt share the history check.
+
+Pending records and unresolved outcomes exist only in node memory. A restart forgets them and
+cannot re-add them. Their files are either covered by committed history or left for reclamation.
+
+### A local failure cannot undo a commit
+
+Once a CAS is known to have landed, maintenance-notification or JGit-cache failure must not turn
+it into a reported Git failure. Cache invalidation lets a later read reconstruct the local view.
+If the outcome cannot yet be verified, it remains unknown; the client must not infer failure from
+a timeout alone.
+
+Recovery assumes linearizable conditional writes, immutable log entries retained throughout
+recovery, and manifest history that does not roll back or reuse versions. Restoring an older
+manifest while writers are active violates those assumptions. Index cursor mismatch detection is
+not a live Git rollback protocol.
 
 ## Freshness
 
-Local disk and JGit memory state are caches; the manifest in the object store is the authority. A
-handle establishes freshness with one conditional read of the manifest, using the newest version
-this node has observed as the `If-None-Match` token, at these points:
+The store's manifest is authoritative. A handle revalidates it:
 
-1. when `GitRepositoryManager` opens or creates the repository (with
-   `walgerrit.manifestRevalidateOnOpen = false`, an open reuses the node's view when it was
-   validated less than `manifestRevalidateInterval` ago; see the README for when that is safe);
-2. when a ref transaction begins, before JGit validates expected old values;
-3. when a caller asks for `scanForRepoChanges`;
-4. at most once per `walgerrit.manifestRevalidateInterval` within a long-lived handle (`0`
-   disables this periodic check).
+1. On repository open, by default.
+2. At the start of each ref-transaction attempt, before expected-value validation.
+3. On `scanForRepoChanges`.
+4. During active reads when `manifestRevalidateInterval` has elapsed, `1 sec` by default.
 
-Between those points every object and ref lookup is served from JGit's in-memory pack list and
-reftable stack, which mirror the newest manifest the node has observed. A manifest observed by any
-handle on the node, including the index-event tailer's sweep, is adopted by every other handle on
-its next lookup without a further read. A handle's own publications update the node's view
-directly from the CAS response.
+The periodic check is demand-driven, not a background timer. Setting the interval to `0` disables
+it; opens, ref transactions and explicit scans still revalidate. Conditional reads use the node's
+latest known version, with `If-None-Match` on S3.
 
-This gives the same guarantee Cursor describes: a write acknowledged anywhere is visible to every
-request that starts afterwards on any node, and a ref transaction never validates against a view
-older than its own start. Within one request, reads are a consistent snapshot rather than a live
-feed of other nodes' writes.
+A manifest observed by any handle or the index tailer becomes available to other handles on that
+node. Their next lookup can adopt it without another manifest request. This means an open handle
+is **not a fixed request-wide snapshot**: later lookups may observe a newer committed state.
+JGit's individual read operations still use their own in-memory structures.
+
+With `manifestRevalidateOnOpen = true` and the required store semantics, an open sees writes
+acknowledged before its revalidation. Setting it to `false` permits reuse of a node view validated
+less than `manifestRevalidateInterval` ago, giving up that per-open guarantee. This can reduce
+I/O for an offline reindex against a quiescent store. A nonpositive interval never qualifies a
+cached view as recently validated for this optimization.
+
+A tailer listing can confirm an unchanged manifest version and refresh the node's validation
+time. Polling delays, sweep duration and failures therefore matter when reasoning about observed
+staleness; configured intervals are not universal end-to-end latency bounds.
 
 ## Local disk is a cache
 
-Every immutable file a node reads lives in the store; the local copy is a cache the node may lose at
-any time. Whole files are materialised atomically (temporary file, fsync, rename). A pack fetched
-in chunks is a sparse file at its final name plus a `<name>.chunks` sidecar; the data of a chunk is
-written and forced before the sidecar records it, and the sidecar is removed only after the last
-chunk, so a file without a sidecar is complete and a crash can lose no more than the chunk in
-flight. Eviction and trimming treat the pair as one file and never remove the sidecar first.
+With S3, whole immutable files are materialized by temporary write, fsync and rename. A chunked
+pack uses a sparse file plus a `.chunks` sidecar. Chunk data is forced before the sidecar records
+it; the sidecar disappears only when every chunk is present. Eviction removes the data file
+before its sidecar so a partial file cannot be mistaken for a complete one.
+
+With the local backend, these same file paths are authoritative store data and cannot be evicted
+as a cache. See [Storage format](storage-format.md).
 
 ## Compaction
 
-Compaction changes how a repository is stored, never what it contains. A compacted pack holds the
-same objects as the packs it supersedes and a compacted reftable the same refs as the stack it
-replaces, and both enter the live set through the same manifest CAS as a write, with the added
-check that every superseded file is still live. A reader therefore sees either the old files or the
-new ones, both complete, and a writer racing a compaction on another node either lands first, in
-which case the compaction's manifest update merges the writer's additions, or lands second and
-re-runs against the compacted manifest. On the same node a reftable compaction goes through the
-repository's publisher like a ref transaction, so it queues behind a publication already in flight.
-A ref transaction still uploading its folded table may be overtaken by compaction; if so, it rebuilds
-against the new stack. Superseded files stay in the store for the reclamation grace period, which
-bounds how long a reader may keep using a manifest it read earlier. See
-[compaction.md](compaction.md).
+Compaction preserves Git objects and current refs while replacing their files. Publication
+requires all superseded inputs to remain live and preserves concurrent additions. Reftable
+compaction advances `ref_revision`; affected ref writers revalidate rather than reuse a stale
+table. Superseded files remain available until reclamation's grace checks allow deletion.
+
+Reader lifetimes and upload-to-publication latency must each fit within the configured grace
+period. The backend does not enforce those bounds with distributed reader or publication leases.
+See [Compaction and reclamation](compaction.md#reclamation).
 
 ## Derived state
 
-Lucene indexes and caches are not part of the Git transaction. They are updated after publication
-and remain rebuildable from Git/NoteDb. The complete logical ref transaction is stored in the
-immutable WAL entry before the manifest CAS. A node processes entries in repository sequence order
-and atomically advances its node-local cursor only after the synchronous index applications return.
-Delivery is at least once because Gerrit index replacements and deletions are idempotent.
+The ref transaction's logical payload is durable in the same publication as its reftable. Each
+node applies it to Lucene in repository sequence order and saves a cursor after synchronous
+index writes. Replaying an entry after a crash is safe because index replacement and deletion
+are idempotent. This requires Lucene and `commitWithin = 0` for accounts, both change sub-indexes,
+groups and projects.
 
-The cursor is safe across hard crashes only when every affected Lucene index commits each write to
-stable storage. WalGerrit therefore requires `commitWithin = 0` for accounts, both change
-sub-indexes, groups, and projects. A missing payload, sequence gap or index failure leaves the
-cursor unacknowledged and stops progress for that repository instead of silently skipping data. A
-cursor that can no longer be replayed at all, because it names a transaction the chain does not
-or is further behind than the replay limit, makes the node rebuild its indexes from repository
-state and reseed every cursor before it serves again.
+A malformed payload, log gap or index failure stops progress for that repository. A stale or
+divergent cursor can trigger a full index rebuild. Startup completes a clean sweep before
+listeners open; a failed background sweep revokes readiness. Readiness reports the last sweep,
+not a cross-repository snapshot or a barrier against later writes.
 
-Before Gerrit's serving listeners start, a daemon must complete a clean sweep of every repository.
-Only then does it publish its node-local readiness marker and gauge. A failed background sweep
-revokes readiness while still attempting every repository, and a later clean sweep restores it.
-This is a consumer-health signal for the most recently completed sweep, not a cross-repository
-snapshot or a barrier against writes committed just afterward.
-
-Repository WAL streams have no global order. When an All-Users draft/star event depends on a change
-whose project stream has not yet been indexed, the event is retried rather than acknowledged.
-
-See [WAL-driven index events](index-events.md) for mappings and operational limitations.
+Repository streams have no global order. An All-Users draft or star update that depends on a
+change not yet discoverable in its project is retried. See [Index events](index-events.md).
+Separate public `EVENT` notifications are [best effort](events.md), with possible loss and
+duplication; they do not inherit the ref payload's durability guarantee.

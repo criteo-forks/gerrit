@@ -1,16 +1,19 @@
 # WalGerrit
 
-This repository is a fork of Gerrit Code Review `v3.14.2` that adds the narrow initialization seam
-required by the WalGerrit immutable-pack and manifest-CAS storage backend. The backend lives in
-[`plugins/walgerrit`](plugins/walgerrit); its
-[`JGit/CAS audit`](plugins/walgerrit/docs/jgit-cas-deep-dive.md) defines the correctness contract.
-The fork does not modify or fork JGit.
+This is the Gerrit Code Review 3.14.2 fork for WalGerrit. The backend stores Git data in immutable
+packs and reftables, publishes transactions through manifest compare-and-swap, and uses the same
+log to update each node's local search indexes. It does not require a JGit fork.
 
-WalGerrit development is kept on the `walgerrit-3.14` branch. The root
-[`walgerrit-build`](.github/workflows/walgerrit-build.yml) workflow builds and smoke-tests a
-deployable bundle containing `gerrit.war`, `walgerrit.jar`, installation notes, and checksums.
+Start with the [WalGerrit guide](plugins/walgerrit/README.md). The
+[architecture](plugins/walgerrit/docs/architecture.md) explains the fork boundary; the
+[consistency contract](plugins/walgerrit/docs/consistency.md) defines publication and recovery.
 
-The remainder of this README is the upstream Gerrit introduction and build documentation.
+Development uses `walgerrit-3.14`. The [build workflow](.github/workflows/walgerrit-build.yml)
+produces a tested [deployment bundle](plugins/walgerrit/docs/artifact-bundle.md) containing the
+matching WAR and library, installation notes and checksums.
+
+The upstream Gerrit introduction follows. Its packaging instructions describe upstream Gerrit;
+use the WalGerrit guide and bundle for this backend.
 
 # Gerrit Code Review
 

@@ -1,261 +1,153 @@
 # JGit and manifest-CAS correctness audit
 
-## Conclusion
+JGit supplies the immutable-file and atomic-ref primitives WalGerrit needs. WalGerrit supplies
+distributed publication, freshness and recovery around them. The storage engine does not require
+a JGit fork.
 
-JGit has the right core semantics for WalGerrit. Do not fork JGit for the storage engine.
-
-`DfsObjDatabase` gives one publication hook for immutable pack/index/reftable files, and
-`DfsReftableDatabase` turns a Gerrit `BatchRefUpdate` into one immutable reftable. The backend can
-therefore make one manifest compare-and-swap the linearization point for every Git ref transaction.
-
-Two boundaries remain:
-
-1. WalGerrit must supply stronger distributed publication and freshness behavior than JGit's
-   process-local caches and locks provide. This belongs in the DFS backend and its
-   `DfsReftableBatchRefUpdate` subclass.
-2. Gerrit 3.14.2 initialization contained direct `FileRepository` access that bypassed
-   `GitRepositoryManager`. This repository carries the small Gerrit fork patch that switches init
-   helpers to the configured manager. It is not a reason to fork JGit.
-
-The audit baseline is Gerrit `v3.14.2` and its pinned JGit revision
+This audit targets Gerrit 3.14.2 and its pinned JGit revision,
 [`38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/).
-The storage rules come from Cursor's
-[`Git at scale`](https://cursor.com/blog/git-at-any-scale) and the executable design in
-[`tobi/walgit`](https://github.com/tobi/walgit), inspected at
-[`6d8fa54ba0f83072a1a50317bb6c8c1afa5a3cd1`](https://github.com/tobi/walgit/commit/6d8fa54ba0f83072a1a50317bb6c8c1afa5a3cd1).
+The [consistency contract](consistency.md) defines the protocol; this document connects that
+contract to the APIs and test sources.
 
-The 3.14.2 re-audit confirms that JGit 7.7 retains `commitPack(newPacks, replacements)`,
-`DfsPackCompactor.getNewPacks()`, and `getSourcePacks()`. Its new compactor pre-commit hook can add
-pack descriptions to the same call but does not weaken that transaction boundary. JGit 7.7 also
-adds optional multi-pack-index descriptions; WalGerrit explicitly disables them because the
-current manifest records independent pack families rather than MIDX coverage. Adding MIDX later
-requires an explicit storage-format extension and fault tests, not an implicit JGit config change.
+## One publication hook covers the Git files
 
-## Reference invariants
+`DfsObjDatabase.commitPack(newPacks, replacements)` gives the backend both additions and
+superseded inputs. `DfsReftableBatchRefUpdate` writes an atomic ref batch into an immutable
+reftable. WalGerrit can therefore upload the dependencies and make one manifest CAS the commit
+point for the entire ref batch.
 
-The backend must preserve these properties:
+JGit's process-local locks do not provide distributed exclusion. WalGerrit must check the
+manifest's store version, validate the ref generation and resolve uncertain writes itself.
 
-1. Pack, index, reftable, and log objects are immutable after publication.
-2. All immutable dependencies land before the manifest changes.
-3. The manifest CAS is the only commit point. Files that are not named by a committed manifest are
-   harmless orphans.
-4. Objects may become available before their refs. A ref may never become visible before all of its
-   objects are available.
-5. Each repository handle revalidates the manifest with a conditional read when it is opened, when
-   it starts a ref transaction, and at most once per configured interval in between. Local disk and
-   JGit memory state are caches, not authority, and they mirror the newest manifest the node has
-   observed. Revalidating on every JGit lookup instead is not the contract: JGit consults the pack
-   list once per inserted, received and looked-up object, so that would turn every object into an
-   object-store round trip.
-6. A ref transaction validates all expected old values and publishes all accepted commands in one
-   CAS, or publishes none of them.
-7. Once the manifest CAS lands, the operation is committed even if the response is lost or the
-   writer's local-cache update fails.
-8. Compaction changes representation, not Git state. It must never discard a concurrently published
-   pack or ref update.
+## Two tokens protect different state
 
-## The two CAS tokens
+The **store version** is an opaque token, an ETag on S3. Conditional replacement against it
+prevents lost manifest updates. The local backend provides equivalent exclusion through JVM and
+OS file locks beneath `.object-locks/`, followed by atomic replacement.
 
-There are two related but different tokens:
+The manifest's **`ref_revision`** identifies the live reftable stack. It advances on ref updates
+and reftable compaction, but not on object-only additions. This lets an object flush coexist with
+a prepared ref transaction without invalidating its ref checks.
 
-- The **physical manifest version** is the object store's opaque ETag/generation. Every remote
-  manifest write uses it in a conditional request. It prevents lost updates to any manifest field.
-- `ref_revision` is the **semantic reftable-stack generation** stored inside the manifest. It changes
-  whenever the live reftable stack changes, including representation-only reftable compaction.
-
-The local backend obtains the physical exclusion with `manifest.lock` plus an OS file lock and then
-atomically replaces `manifest.pb`. An S3/GCS backend must instead use the opaque object version and a
-CAS retry loop; comparing the protobuf `revision` field alone is not sufficient.
-
-Separating `ref_revision` from the overall manifest `revision` matters because Gerrit deliberately
-flushes objects before executing its `BatchRefUpdate`. Those object-pack publications are safe to
-merge into the manifest and must not invalidate an otherwise current ref transaction. A changed
-reftable stack, on the other hand, invalidates the transaction's JGit update index and expected-ref
-snapshot.
-
-The remote CAS loop is therefore:
-
-1. Read manifest `M` with opaque version `V`.
-2. Validate the operation's semantic preconditions against `M`.
-3. Build `M'` by merging the operation with `M`.
-4. Conditionally write `M'` using `V`.
-5. On a precondition failure, read the winner. If `ref_revision` is unchanged, merge concurrent
-   object-only work and retry. If it changed, fail with a JGit lock conflict unless the entire ref
-   transaction is revalidated and its reftable is rewritten with a new update index.
-
-Writer affinity and batching reduce contention, but correctness never depends on a primary writer.
+A publication merges its changes into the current inventory and conditionally replaces the
+manifest. A store-version conflict with an unchanged ref revision can retry the merge. A changed
+ref revision requires fresh JGit validation and a new table. Comparing the protobuf `revision`
+field without a conditional store write would not prevent lost updates.
 
 ## JGit path-by-path audit
 
-| Operation | Pinned JGit path | Required WalGerrit behavior | Verdict |
-|---|---|---|---|
-| Programmatic object insertion | `DfsInserter.flush` writes pack and index, then calls `commitPack` | Publish files, log, then manifest; an orphan object pack is safe | Fits cleanly |
-| Received Git pack | `DfsPackParser.parse` writes pack/index and calls `commitPack` | Same as insertion; thin-pack resolution finishes before publication | Fits cleanly |
-| Atomic batch refs | `ReftableBatchRefUpdate.execute` validates objects, fast-forwards, expected old IDs, and namespace conflicts; `DfsReftableBatchRefUpdate` writes one `.ref` and calls `commitPack` | Capture a fresh ref generation before validation; one manifest CAS publishes the whole `.ref` | Fits cleanly |
-| Single ref update/delete/link | `DfsRefUpdate` delegates to `DfsReftableDatabase.compareAndPut/Remove`, which creates a batch update | Use the same distributed ref transaction path | Fits cleanly |
-| Ref conflict reporting | `ReftableBatchRefUpdate` maps an `IOException` to `LOCK_FAILURE` and aborts the remaining commands; Gerrit's `RefUpdateUtil` converts a fully aborted atomic batch to `LockFailureException` | Surface manifest/ref-generation conflicts as lock failures | Fits, though the original exception is lossy |
-| Reftable ordering | `ReftableDatabase.nextUpdateIndex` returns current max + 1; `DfsPackDescription.reftableComparator` orders the stack by source and update index | Persist min/max update indices and prevent two publications based on the same ref generation | Fits if the manifest CAS is enforced |
-| Reftable compaction during a ref update | `DfsReftableBatchRefUpdate` may fold the top table and pass it as `replaces` | Addition and superseded table are one manifest transaction | Fits cleanly |
-| Leased pack compaction | `DfsPackCompactor` supplies new descriptions and the source descriptions it replaces | WalGerrit owns the lease, stale-input check, manifest CAS, propagation, and retention | Correct production maintenance model |
-| Full DFS garbage collection | `DfsGarbageCollector` snapshots refs and packs, then commits several outputs and removals together | It is not the production maintenance path | Gerrit GC is disabled and the backend rejects its `GC`, `GC_REST`, and `UNREACHABLE_GARBAGE` publications |
-| MIDX | Optional `DfsMidxWriter`; covered-pack relationships live in `DfsPackDescription` | Persist the MIDX base and covered-pack graph before enabling it | Keep disabled until the manifest schema supports it |
-| Ref rename | `DfsRefRename` creates the destination and deletes the source as two updates; JGit contains a TODO to batch them | Provide an atomic WalGerrit override before exposing rename to plugins | Gerrit core does not currently call it, but it is not acceptable as a general API |
-| Cache refresh | `DfsRepository.scanForRepoChanges` clears ref and object caches; `DfsReader` and `DfsInserter` consult `getPackList()` for every object | A newly opened handle starts from one conditional manifest read; ref transactions force another; `getPackList()` serves JGit's in-memory list and only adopts a newer manifest the node has already observed or one fetched after the revalidation interval | Fits; the handle is the request boundary, mirroring Cursor's one conditional GET per request |
+| Operation | JGit path | WalGerrit responsibility |
+| --- | --- | --- |
+| Object insertion | `DfsInserter.flush` calls `commitPack`. | Upload files; retain pending packs until a ref publication or handle close. |
+| Received pack | `DfsPackParser.parse` completes the pack and calls `commitPack`. | Apply the same pending-pack protocol after thin-pack resolution. |
+| Atomic ref batch | `ReftableBatchRefUpdate.execute` validates commands; `DfsReftableBatchRefUpdate` writes the table. | Revalidate first, then publish all accepted commands with their logical WAL payload. |
+| Single update, delete or symbolic link | `DfsRefUpdate` delegates to reftable compare-and-put/remove operations. | Use the same ref-generation checks. |
+| Ref conflict | JGit maps I/O failure to `LOCK_FAILURE`; Gerrit interprets an aborted atomic batch. | Retry storage conflicts with full validation; preserve real expected-value conflicts. |
+| Reftable ordering | Update indices and `DfsPackDescription.reftableComparator` order the stack. | Persist source, ordering metadata and update indices; reject stale ref generations. |
+| Commit-time table folding | `DfsReftableBatchRefUpdate` can replace the top table. | Publish the new table and removal together; rebuild if that input was superseded. |
+| Pack and table compaction | `DfsPackCompactor` supplies outputs and source descriptions. | Lease the work, check live inputs, CAS the result and retain old files for the grace checks. |
+| Full DFS GC | `DfsGarbageCollector` commits reachability-based outputs and removals. | Disable Gerrit GC and reject `GC`, `GC_REST` and `UNREACHABLE_GARBAGE` sources. |
+| Multi-pack index | MIDX descriptions include covered-pack relationships. | Keep disabled until the manifest can represent those relationships. |
+| Ref rename | `DfsRefRename` creates the destination, then deletes the source separately. | Do not claim atomic rename; no WalGerrit override supplies it. |
+| Cache refresh | DFS readers consult the pack list; refs have a separate stack cache. | Adopt the node's newest manifest and revalidate at defined boundaries, without promising a fixed request snapshot. |
 
-The relevant JGit sources are
-[`DfsObjDatabase`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsObjDatabase.java),
-[`DfsReftableDatabase`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsReftableDatabase.java),
-[`DfsReftableBatchRefUpdate`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsReftableBatchRefUpdate.java), and
-[`ReftableBatchRefUpdate`](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/reftable/ReftableBatchRefUpdate.java).
+JGit's compactor pre-commit hook can add descriptions to the same `commitPack` call. It does not
+remove the backend's responsibility to validate the complete replacement set. WalGerrit's
+compactor uses `DfsPackCompactor`; it does not invoke command-line Git for runtime maintenance.
 
-## Logical ref transaction
+Relevant pinned sources:
+[DfsObjDatabase](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsObjDatabase.java),
+[DfsReftableBatchRefUpdate](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsReftableBatchRefUpdate.java),
+[ReftableBatchRefUpdate](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/reftable/ReftableBatchRefUpdate.java),
+[DfsPackCompactor](https://eclipse.googlesource.com/jgit/jgit/+/38da6c1f8f8bc2ec7a19f4115fcea7c94a5875fa/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/dfs/DfsPackCompactor.java).
 
-For a Gerrit batch, the target algorithm is:
+## Ref retries rebuild the transaction
 
-1. Read the current manifest and remember `ref_revision`.
-2. Clear JGit's object and ref caches, so expected-value checks use that generation or a newer one.
-3. Let JGit validate object existence, fast-forward policy, every old object ID/symbolic target, and
-   ref namespace conflicts.
-4. Let JGit write one reftable containing every accepted command and its reflog records. Its update
-   index is the prior stack maximum plus one.
-5. Publish the immutable reftable.
-6. Under the physical manifest CAS, require the remembered `ref_revision`, append a log entry, add
-   the new table, and remove any table folded by commit-time compaction.
-7. Only after the manifest is committed, refresh/add to the local JGit cache and report `OK`.
+`LocalWalGitRefDatabase` revalidates at the start of each attempt. `GroupPublisher` admits
+nonconflicting local ref names, and the node lock protects validation and table construction.
+Independent prepared batches can share a publication, together with pending object packs.
 
-If another ref writer wins after step 1, the CAS fails. The current implementation reports
-`LOCK_FAILURE`. A future transparent retry may refresh and re-run all of steps 3-6; it must not just
-reuse the old reftable, because its update index and namespace checks are based on stale state.
+When another node changes the ref generation, the losing batch reruns expected-value,
+namespace and object checks against fresh state. It has at most five total attempts. Reusing the
+old table would reuse its stale update index and validation assumptions. A local folded table
+replaced by compaction requires the same rebuild.
 
-## Object publication
+The manifest CAS is authoritative. Once success is established, a cache-update or maintenance
+notification failure cannot turn the committed ref update into a failure. Invalidate the cache
+and rebuild it on a later read.
 
-JGit object inserters and received-pack parsers publish their pack before the later ref update. This
-is compatible with the reference design: unreachable objects are harmless, while publishing a ref
-without its objects is corruption.
+## Outcome recovery follows history
 
-An object-only publication does not carry a ref semantic precondition. Under the physical CAS it
-merges with the latest live pack set. If Gerrit dies before the ref transaction, maintenance later
-reclaims the unreachable pack.
+Every CAS attempt has a sequence and transaction ID. After any CAS error, including a
+precondition error from an SDK retry, `ManifestStore` checks whether that identity is on the
+committed chain. Checking only the current head is insufficient: later writes or compactions
+may already have advanced it.
 
-For each JGit `DfsPackDescription`, the manifest must preserve at least:
+An attempt present at its sequence committed. A different transaction at that sequence proves
+the old CAS cannot land. A head below the attempted sequence proves neither outcome. Recovery
+can append an empty `PACK` entry to fence that older version, then resolve the original attempt.
+Failed verification preserves uncertainty.
 
-- stable pack identity and source;
-- every file extension and exact size/block size;
-- object/delta counts;
-- reftable min/max update indices;
-- creation/last-modified ordering metadata;
-- pack checksum.
+Pending-pack readers also consult publication identity. A pack already committed and then
+compacted must not reappear as an unpublished addition. See the
+[full recovery protocol](consistency.md#ambiguous-outcomes-and-recovery) and its retention
+assumptions.
 
-Readers enumerate only the manifest inventory, never the object-store prefix. Immutable files can
-be materialized into a bounded local cache and served through `ReadableChannel`.
+## Compaction preserves the input objects
 
-## Ambiguous outcomes and acknowledgements
+WalGerrit's `Compactor`, `CompactionPolicy`, `StoreLease` and `Reclaimer` divide the work:
 
-A timeout or connection loss after a conditional manifest write is not evidence that the write
-failed. Each attempted publication has a unique immutable log key. After a non-precondition error,
-the writer re-reads the manifest:
+1. Acquire the repository lease and select live input files.
+2. Let JGit rewrite them and upload every output.
+3. Publish additions and superseded names together, checking that each input is still live.
+4. Preserve concurrent additions and let other nodes adopt the result through manifest reads.
+5. Reclaim retired files only after the file-age and observed-absence intervals.
 
-- if the manifest names that log key, the transaction committed and must be reported as success;
-- if it does not, the log/file objects remain harmless orphans and the operation failed;
-- if the re-read also fails, the result is unknown and the writer must not destructively clean up
-  anything that could be committed.
+Object and reftable compaction are separate publications. There is no reachability-based object
+pruning, retained-snapshot registry or distributed reader lease. Reclamation depends on bounded
+writer and reader lifetimes; see [Compaction](compaction.md#reclamation).
 
-Likewise, once the CAS lands, a failure to update this process's JGit pack/ref cache cannot change
-the Git result. The operation is acknowledged and the local cache is invalidated so the next read
-repairs it. Reporting an error after a landed CAS would tell the caller a durable Git update failed.
+## Gerrit remains responsible for NoteDb semantics
 
-The local implementation verifies exact manifest bytes after an error following atomic rename. The
-future object-store implementation must verify the unique log key, matching WalGit's `cas_landed`
-behavior.
+Gerrit flushes new objects before executing its atomic ref batch and performs secondary-index
+work afterward. WalGerrit's pending-pack and manifest protocol preserves that ordering. Atomicity
+is per repository; an operation spanning projects does not become globally atomic.
 
-## Normative compaction model
+The index tailer supports local Lucene with synchronous commits. Public event notifications use
+separate best-effort entries and cannot be treated as the durable index payload.
 
-Ordinary Gerrit nodes never run JGit GC independently. `canPerformGC()` remains `false`, and the
-publication hook rejects all `DfsGarbageCollector` pack sources as defense in depth.
+For initialization, `GitRepositoryManagerOnInit` retains the local fallback until the system
+injector is ready. `SitePathInitializer.postRun` then installs the configured manager. Init-only
+account, group, external-ID and versioned-metadata helpers use that switching manager, avoiding a
+shadow local `All-Users`. The fork also contains import/seeding commands, test integration and
+optional stateless sessions; the initialization seam is not its only change.
 
-This model is implemented by `Compactor`, `CompactionPolicy`, `CompactionLease` and `Reclaimer`;
-[compaction.md](compaction.md) describes the shipped behaviour. The compactor does the following:
+## Verification
 
-1. Acquire a per-repository compaction lease. The lease prevents duplicate expensive work; it is not
-   the correctness mechanism.
-2. Read a manifest snapshot and materialize the input packs into its local cache.
-3. Run JGit's `DfsPackCompactor` (or Git repack where measured better) exactly once as the repacking
-   engine. JGit supplies the new `DfsPackDescription` values and the descriptions they replace.
-4. Upload every immutable output and its side files.
-5. Ask WalGerrit to publish one precise add-and-supersede transaction. At the physical manifest CAS,
-   every item in `supersedes` must still be live. If any input is stale, leave the output orphaned
-   and restart from a fresh snapshot.
-6. Merge concurrent push packs not named by `supersedes`, publish one COMPACT log entry, and CAS the
-   manifest.
-7. Let every Gerrit node consume the result by manifest/WAL revalidation.
-8. Remove superseded files from the live inventory only. Physical reclamation waits until no
-   retained manifest/checkpoint and no reader holding an older generation can use them.
+The repository contains tests for these properties. This inventory describes coverage, not the
+result of a particular execution.
 
-This is exactly the division of responsibility: JGit/Git supplies the repacking engine; WalGerrit
-supplies distributed publication, leases, stale-input handling, propagation, and retention.
+| Property | Test sources in `src/test/java/dev/walgerrit/` |
+| --- | --- |
+| Atomic refs, expected values and concurrent writers | `LocalWalGitTransactionTest`, `ConcurrentWritersTest`, `GroupCommitTest` |
+| Lost responses, delayed CAS, failed verification and recovery fencing | `PublicationFaultTest`, `PublicationRecoveryTest`, `RecoveryFaultTest` |
+| Queued/interrupted publishers and pending-pack snapshots | `GroupPublisherFailureTest` |
+| Manifest freshness and request counts | `ManifestFreshnessTest`, `ManifestCacheTest`, `ManifestReadCountTest` |
+| S3 conditional writes, listings, range reads and multipart upload | `S3ObjectStoreContractTest` |
+| Compaction, lease contention and grace intervals | `CompactorTest`, `StoreLeaseTest`, `SweepLeaseTest`, `ReclaimerRetentionTest` |
+| Index replay, cursor seeding and readiness | `IndexEventTailerTest`, `IndexCursorSeederTest` |
+| Import and source preservation | `RepositoryImporterTest` |
 
-Reftable maintenance is either a separate transaction or an explicitly included input/output set.
-It must not be accidentally coupled to object repacking, because a reftable-stack change has its own
-generation and ref-reader implications.
+Run `./mvnw verify` in `plugins/walgerrit`. S3 contract tests require
+`WALGERRIT_S3_TEST_ENDPOINT` and credentials; they are skipped without an endpoint. The
+[build workflow](../../../.github/workflows/walgerrit-build.yml) supplies MinIO before verification.
 
-## Gerrit semantics above JGit
+The [smoke script](../scripts/smoke-test.sh) runs the actual WAR/library pair through init,
+reindex, daemon startup, readiness, restart, maintenance, index rebuilding and import. The
+[acceptance script](../scripts/acceptance-tests.sh) runs Gerrit's tests against the local backend.
+See the [README](../README.md#verify-the-integration) for commands and instrumentation caveats.
 
-Gerrit NoteDb requires `RefDatabase.performsAtomicTransactions()`. Its update manager flushes newly
-created objects first, builds one `BatchRefUpdate`, calls `setAtomic(true)`, and only starts secondary
-index work after the ref batch succeeds. This matches the publication ordering above.
-
-The Lucene/Elasticsearch secondary indexes are derived state, not part of the Git CAS. Gerrit writes
-pending index intents around NoteDb mutation and can rebuild indexes from Git. Events and other side
-effects must likewise happen after publication and be replayable from the WAL.
-
-Gerrit's atomicity is per repository. Operations spanning multiple projects are not made globally
-atomic by a per-repository manifest; this is existing Gerrit behavior, not a JGit storage regression.
-
-## Gerrit fork seam
-
-The stock 3.14.2 server loads `installDbModule` and creates the complete `All-Projects` and
-`All-Users` NoteDb schema through WalGerrit. Unmodified init then fails because later init-only code
-opens repositories below `$site/git` directly.
-
-Direct filesystem assumptions exist in:
-
-- `AccountsOnInitNoteDbImpl`;
-- `GroupsOnInit`;
-- `ExternalIdsOnInit`;
-- `VersionedMetaDataOnInit`, used by project config and initial authorized keys;
-- `GitRepositoryManagerOnInit`.
-
-The fork now makes `GitRepositoryManagerOnInit` a switching manager. It preserves the filesystem
-fallback while init gathers configuration, then `SitePathInitializer.postRun` installs the system
-injector's configured `GitRepositoryManager` before any post-init step. All affected helpers use
-that switching manager. A missing pre-schema fallback repository remains an ordinary
-`RepositoryNotFoundException`, preserving upstream's empty-state behavior.
-
-The fresh-site smoke test completes init and reindex with no repository under `gerrit.basePath` and
-with both system projects present in the WalGerrit manifest store.
-
-This is a narrow Gerrit integration seam. Runtime NoteDb, fetch, push, and schema creation already
-operate through the repository manager and JGit APIs.
-
-## Test gates before an object-store backend is production-ready
-
-1. Two concurrent ref batches from the same generation: exactly one CAS winner.
-2. Concurrent object append and ref update: both survive, with one ref transaction.
-3. Two disjoint ref batches: conflict is safe; a retry revalidates and succeeds.
-4. Expected-old mismatch, including symbolic refs: no manifest change.
-5. Namespace race (`refs/heads/a` versus `refs/heads/a/b`): no invalid ref set.
-6. Process death after each immutable-file move, log write, and manifest CAS.
-7. CAS success with lost response: caller receives success after outcome verification.
-8. CAS success followed by local-cache failure: caller receives success and the next read repairs.
-9. Reftable commit-time compaction racing a ref update.
-10. Leased object compaction racing object insertion and ref publication.
-11. A cold second instance observes the new refs and can read all pointed-to objects immediately
-    after the first instance acknowledges.
-12. Full Gerrit init, reindex, daemon start, project creation, push, review mutation, submit, and
-    restart against the backend.
-
-The local milestone covers gates 1-3, the object-ID part of gate 4, gate 5, gate 7, the core
-add-and-supersede/retention behavior in gate 10, basic batch atomicity, and reopen/recovery. Gate 12
-currently covers fresh init and reindex. Symbolic expected-old races, crash injection beyond lost
-post-rename acknowledgement, lease orchestration, two-node visibility, daemon/push/review/submit,
-and restart remain release blockers rather than optional polish.
+Production qualification also needs results from the target storage service and deployment:
+concurrent nodes, process failure at publication boundaries, cold-node reads after acknowledged
+writes, full review/submit workflows and migration recovery. Source-level tests and historical
+success reports do not replace those results.

@@ -1,49 +1,90 @@
 # WalGerrit deployment bundle
 
-This bundle targets Gerrit 3.14.2 and contains two inseparable runtime artifacts:
+Deploy `gerrit.war` and `walgerrit.jar` from the same bundle. The WAR is the Gerrit 3.14.2 fork;
+the JAR supplies its WalGerrit storage and index modules.
 
-- `gerrit.war`: the WalGerrit Gerrit fork;
-- `walgerrit.jar`: the shaded storage and index module library.
+The build workflow tests the exact pair before uploading it. Its smoke test covers fresh init,
+reindex, daemon readiness, shutdown, compaction, restart, index rebuilding and import.
+`SOURCE_COMMIT` identifies the source revision, `GERRIT_VERSION` records `3.14.2`, and
+`SHA256SUMS` covers the WAR and JAR.
 
-`gerrit.war` is the WalGerrit fork, not an upstream release WAR. CI runs that exact uploaded WAR
-with the exact uploaded `walgerrit.jar`: it initializes a fresh site, reindexes it, starts the
-daemon, waits for WalGerrit's catch-up readiness marker, and verifies shutdown removes readiness.
-`SOURCE_COMMIT`, `GERRIT_VERSION`, and `SHA256SUMS` bind the payload to its source and contents.
+## Verify and install
 
-For an image using `/home/gerrit/gerrit.war` and a Gerrit site at
-`/home/gerrit/gerrit_site`, copy the files as follows:
+From the extracted bundle directory:
+
+```sh
+sha256sum --check SHA256SUMS
+```
+
+For an image with the WAR at `/home/gerrit/gerrit.war` and the site at
+`/home/gerrit/gerrit_site`:
 
 ```dockerfile
 COPY gerrit.war /home/gerrit/gerrit.war
 COPY walgerrit.jar /home/gerrit/gerrit_site/lib/walgerrit.jar
 ```
 
-An image that mounts the Gerrit site from a volume hides a library copied into the site at build
-time; stage `walgerrit.jar` outside the site and copy it into `lib/` at start-up instead. Pin the
-URLs and SHA-256 sums of both files in the image build rather than downloading a CI artifact, which
-is authenticated and expires.
+If a volume mounts over the site, it hides files copied there during the image build. Stage the
+JAR outside the site and copy it into the mounted site's `lib/` directory at startup.
 
-The site must configure both modules:
+## Configure before initialization
+
+The site needs both modules and synchronous Lucene commits:
 
 ```ini
 [gerrit]
   installDbModule = dev.walgerrit.WalGitModule
   installModule = dev.walgerrit.WalGitIndexModule
+
+[index "accounts"]
+  commitWithin = 0
+[index "changes_open"]
+  commitWithin = 0
+[index "changes_closed"]
+  commitWithin = 0
+[index "groups"]
+  commitWithin = 0
+[index "projects"]
+  commitWithin = 0
 ```
 
-Configure the `[walgerrit]` S3 backend and zero `commitWithin` values documented in the main
-WalGerrit README before initialization. Credentials come from the standard AWS SDK provider chain.
+For S3, configure the shared store and node-local paths:
 
-Plugins built for an earlier Gerrit must be rebuilt for 3.14 or omitted. The image build's
-throwaway `init`/`reindex` smoke test must use the final WAR, library and selected plugins. Prefer
-an exec readiness probe for
-`/home/gerrit/gerrit_site/data/walgerrit-index-events/READY`; an HTTP version response only proves
-that Gerrit's web server is running, not that the local Lucene indexes have caught up.
+```ini
+[walgerrit]
+  backend = s3
+  s3Bucket = gerrit-git
+  s3Region = eu-west-3
+  s3Prefix = production
+  storagePath = data/walgerrit-cache
+  indexCursorPath = data/walgerrit-index-events
+```
 
-Use a new site volume, S3 prefix, and node-local index cursor for the first deployment. Sites and
-plugins from an earlier Gerrit must be upgraded separately; do not place this bundle over an existing
-site without a tested backup, migration, reindex, and rollback procedure.
+Use the deployment's bucket, region and prefix. Credentials come from the AWS SDK's default
+provider chain. A custom endpoint may also need `s3Endpoint` and `s3PathStyle = true`.
 
-GitHub Actions artifacts are a temporary handoff. Publish the verified payload to an artifact
-repository under an immutable version or commit path and pin its URLs and both checksums in the
-image build. Site-specific packaging belongs with the operator, not in this repository.
+Rebuild older plugins against the target Gerrit version or omit them. Test the final image's
+WAR, library and selected plugins together with `init`, `reindex` and daemon startup.
+
+## Readiness requires the index marker and a listener
+
+With the paths above and HTTP listening on port 8080, an exec probe can use:
+
+```sh
+test -f /home/gerrit/gerrit_site/data/walgerrit-index-events/READY &&
+  curl -fsS http://127.0.0.1:8080/ >/dev/null
+```
+
+The marker means the last full index sweep succeeded. HTTP alone does not prove index health;
+the marker alone can survive a hard kill. Adjust the URL for the actual listener.
+
+## Pin the tested payload
+
+Branch builds upload temporary GitHub Actions artifacts with 30-day retention. Tags matching
+`walgerrit-3.14.2-*` also publish the tested payload as a GitHub prerelease. Pin the selected WAR
+and JAR URLs and verify both checksums in the image build. A release label alone is not a
+content-integrity check.
+
+Use a fresh destination store or prefix for migration, and a separate local cursor directory on
+each node. Follow the source revision's WalGerrit import guide before serving existing data;
+installing the bundle does not migrate a previous site's repositories, indexes or plugins.

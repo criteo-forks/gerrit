@@ -1,152 +1,137 @@
 # Compaction and reclamation
 
-Every NoteDb write leaves one object pack, one pack index and, unless JGit folds it into the top of
-the stack at commit time, one reftable. Without compaction a repository accumulates thousands of
-tiny files: every object lookup consults every pack index, the reftable stack deepens, the manifest
-grows, and the block cache fills with indexes. Compaction rewrites those files into fewer, larger
-ones and reclamation deletes what nothing references any more. Neither changes a single object or
-ref: compaction is representation only, and everything it publishes goes through the same manifest
-compare-and-swap as a write.
-
-This follows Cursor's design for Continuity: compaction is a WAL event that replicas follow by
-downloading the compacted result rather than repacking themselves, the policy is geometric, and an
-idle local copy is disposable. The two deliberate differences are that Gerrit nodes are symmetric,
-so a lease stands in for Cursor's per-repository primary, and that superseded files are deleted
-after a grace period rather than kept forever; the log of every push and every compaction is kept.
+Writes accumulate small packs and reftables. Compaction combines them into fewer files without
+changing the stored Git objects or current refs. Reclamation later deletes unreferenced files.
+These are separate operations: replacing a file in the manifest does not immediately delete it.
 
 ## What is rewritten
 
-The policy is a function of the manifest's pack list alone, so it costs no round trip and runs on
-the write path after a publication.
+`CompactionPolicy` plans from the manifest inventory without storage I/O.
 
-**Object packs** follow Git's geometric repacking rule (`git repack --geometric`). Sorted by size,
-every pack should be at least `walgerrit.compactGeometricFactor` (default 2) times as large as all
-smaller packs combined. The smallest packs that break the progression, extended upward until it
-holds again, roll up into one `COMPACT` pack, but only once `walgerrit.compactMinPacks` (default 8)
-of them have accumulated, so a repository is not rewritten after every write. Packs above
-`walgerrit.compactMaxPackSize` (default 8g) are never rewritten. In steady state a repository holds
-a few large packs in geometric progression and a short tail of recent small ones, and the amount of
-data rewritten per byte written is logarithmic in the repository's size.
+**Object packs use a geometric policy.** Candidates are sorted by size. The policy finds a break
+in the progression between neighboring packs, then extends the selected prefix while its combined
+size would crowd the next pack. It merges that prefix only when at least `compactMinPacks`
+(default `8`) qualify. `compactGeometricFactor` defaults to `2`; input packs larger than
+`compactMaxPackSize` (default `8g`) are excluded. This is an input threshold, not an output-size
+limit or a promise that every pack exceeds the sum of all smaller packs by the factor.
 
-**Reftables** are merged from the top of the stack down. Every table a ref transaction wrote is
-merged, deletions included, together with the compacted tables directly beneath it that are no
-larger than `walgerrit.compactSmallReftableSize` (default 8 MiB), once
-`walgerrit.compactMinReftables` (default 8) tables qualify. Larger compacted tables stay as bases
-until the whole stack is `walgerrit.compactMaxReftables` (default 32) deep, when everything is
-merged. That respects the order JGit derives from the pack source and the update index, in which
-compacted tables always sort below transaction tables, and keeps a large repository from rewriting
-its whole ref history every few pushes. JGit still folds a small new table into the top of the stack
-at commit time when the transaction is alone on its node; under contention it extends the stack
-instead.
+**Reftables merge from the top down.** Transaction tables and the small compacted tables directly
+beneath them qualify once `compactMinReftables` (default `8`) accumulate. A compacted table larger
+than `compactSmallReftableSize` (default `8m`) remains a base until the whole stack reaches
+`compactMaxReftables` (default `32`), when all tables merge. Deletions must survive the merge so
+older values cannot reappear.
 
-JGit's `DfsPackCompactor` is the repacking engine for both. Object compaction and reftable compaction
-are separate manifest transactions, because a reftable change advances the ref revision and a ref
-transaction in flight on another node must notice it. On the compacting node itself a reftable
-compaction goes through the repository's publisher, the queue ref transactions publish through, so
-it lands after the group in flight and before the next one. A writer still uploading a folded
-table can be overtaken; it rebuilds and revalidates if compaction replaced that table. Object compaction needs no such care: it leaves the
-ref revision alone, and a writer whose CAS it pre-empts merely retries the CAS on the merged
-manifest without rewriting anything.
+JGit may also fold a small ref update into the top table during commit. WalGerrit allows that
+only while the transaction is alone on its node; concurrent transactions extend the stack.
+
+## Publication preserves concurrent work
+
+`DfsPackCompactor` performs the rewrite. WalGerrit uploads its outputs and publishes an exact set
+of additions and superseded inputs through manifest CAS. Every superseded input must still be
+live. Concurrent additions remain in the resulting manifest; stale compaction outputs remain
+unreferenced and can be reclaimed.
+
+Object-pack and reftable compaction publish separately. Only the latter changes `ref_revision`.
+A ref writer racing that change must revalidate and rebuild its table. On the same node,
+reftable compaction uses the repository publisher queue. Writers do not wait for the repacking
+work itself, but publication can queue or retry; bounded retries can still be exhausted.
 
 ## Who compacts, and when
 
-**The node that writes compacts.** After every publication the writer evaluates the policy on the
-manifest it just produced. If anything is due, the repository is queued on the node's single
-compaction thread, one compaction per repository at a time. The compactor then:
+After publication, a daemon evaluates the policy and queues due repositories on one maintenance
+thread. For each repository it:
 
-1. takes the repository's lease (below), or skips the repository if another node holds it;
-2. opens a fresh handle, which reads the newest manifest, and plans against it;
-3. rolls the planned packs up, then the reftable stack if due, publishing each result as one
-   add-and-supersede transaction; the CAS refuses the result if any input is no longer live;
-4. repeats from step 2, up to four passes, until the policy is satisfied;
-5. evicts superseded files from its own cache and releases the lease.
+1. Acquires `leases/<project>.git/compaction`, or skips work if another node holds it.
+2. Opens a handle and plans from its manifest view.
+3. Compacts the selected object packs and reftables in separate publications.
+4. Renews the lease after each rewrite and repeats, for at most four passes.
+5. Evicts eligible superseded cache files and releases the lease.
 
-A compaction that loses its inputs to another node's compaction re-plans on the fresh manifest; its
-output, which nothing references, is removed by reclamation like any other leftover. Concurrent writes are merged into the
-compaction's manifest update, so a push or a ref update never waits for a compaction and never
-fails because of one: a ref transaction whose CAS is lost to a reftable compaction re-runs itself
-against the new stack, as [consistency.md](consistency.md#ref-transactions) describes.
+With the default freshness settings, each new handle revalidates the manifest. Regardless of
+freshness settings, publication checks reject superseded inputs that are no longer live.
 
-**A sweep at start and every `walgerrit.reclaimInterval` (default 6h)** lists every repository,
-reads each manifest once, and queues the ones that fell due without this node writing to them:
-repositories imported or written by a batch program, or written while compaction was off. Batch
-programs such as `init` and `reindex` never compact.
+A startup sweep and later sweeps queue repositories that became due without a local write,
+including imports and batch-program writes. The default delay between sweeps is six hours
+(`reclaimInterval`); work on the shared executor can delay them. Batch programs do not run this
+background maintenance.
 
-**The lease** is a small object at `leases/<project>.git/compaction` holding an owner and an
-expiry (`walgerrit.compactionLeaseDuration`, default 30 minutes, renewed between passes). It is
-acquired by creating the object or by replacing an expired one through a CAS on its version, and
-released by writing an expiry of zero. The lease only prevents two nodes repacking the same
-repository at once; correctness comes from the manifest CAS and its live-supersedes check. A lease
-lost or expired mid-compaction wastes an upload, never data.
+The compaction lease defaults to 30 minutes and is acquired or renewed by conditional write.
+It avoids duplicate work. Correctness comes from the manifest CAS and input checks, so a lost
+lease cannot authorize dropping another writer's data.
 
 ## Reclamation
 
-Reclamation uses two grace intervals, each `walgerrit.reclaimGrace` (default 24h):
+Reclamation applies two intervals, each `reclaimGrace` (default `24 h`):
 
-1. A file beneath `wal/` must first be older than the grace period and absent from both the current
-   manifest and this node's unpublished view. This protects uploads awaiting publication.
-2. The reclaimer records when it first observed that eligible file as absent. Only a later sweep,
-   at least another grace period afterwards, may delete the same file version if it is still absent.
-   This protects readers of a manifest that referenced a recently retired file. Upload age alone
-   cannot provide that protection: a years-old pack may have been compacted a moment ago.
+1. A `wal/` file must be old enough and absent from both the manifest and this node's unpublished
+   pack view before the reclaimer starts tracking its absence.
+2. A later sweep may delete it only after another full grace interval, while it remains absent
+   with the same observed version and modification time.
 
-Observation records live in the reclaiming node's memory. A restart starts observation again and postpones
-deletion; a sweep as a follower also drops that node's records. Seeing a file live, young, missing, or replaced resets its
-record. The records are bounded by the eligible leftovers awaiting deletion, and the procedure adds
-no object-store reads to the existing manifest read and file listing per sweep.
+The second interval protects readers of a recently retired manifest. A years-old pack may have
+been compacted seconds ago; upload age alone says nothing about when readers stopped using it.
 
-This contract requires the upload-to-publication interval (including deferred packs and delayed
-conditional requests) and the lifetime of old reader snapshots each to fit within the configured
-grace period. A file eligible for observation can no longer be awaiting its first publication;
-publication recovery never re-adds an already committed pack. These conditions make absence final.
-Arbitrarily stalled writers or readers require distributed publication/reader leases or disabling
-reclamation; periodic revalidation alone does not enforce their maximum lifetime.
+Observation records are node memory. A restart or a follower sweep drops them and postpones
+deletion. Seeing a file live, young, missing or replaced resets its record. Log objects are never
+reclaimed.
 
-On a versioned bucket a deleted file remains recoverable as a non-current version for the bucket's
-lifecycle window, which is the real knob for how far back object data can be rewound. Log objects
-are never deleted; they remain the complete history of every ref change and every compaction.
+This relies on two operational bounds: upload-to-publication latency, including delayed requests
+and deferred packs, and the lifetime of an old reader view must each fit within the grace period.
+The implementation has no distributed writer or reader leases to enforce those bounds. Disable
+reclamation when those assumptions cannot be met. Manifest revalidation alone does not bound the
+lifetime of every in-flight reader.
 
-Reclamation is on by default and `walgerrit.reclaimEnabled = false` turns it off; compaction then
-keeps publishing and files accumulate until it is turned back on.
+Only the sweep-lease holder is selected to delete shared files. Its lease coordinates work but
+does not provide hard exclusion; see [Sweep lease](events.md#the-sweep-lease-coordinates-housekeeping).
+Bucket versioning and lifecycle retention, if configured, determine whether deleted object
+versions remain recoverable. Keeping the log does not by itself keep historical Git data.
+
+`reclaimEnabled = false` disables shared-file deletion. It also skips periodic cache eviction and
+size trimming in the current implementation, though successful compactions still evict eligible
+local files. `compactionEnabled = false` disables the maintenance executor, including its sweep.
 
 ## The node-local cache
 
-With an object store backend the files beneath `storagePath` are a cache. After a compaction the
-compacting node evicts superseded files from its own cache, and every sweep evicts files the manifest
-no longer lists. Files written in the last ten minutes are never evicted, since they may be uploads
-whose publication has not landed. `walgerrit.cacheSizeLimit` (default `0`, unbounded) sets a size
-above which the sweep deletes the oldest cached files first; a handle that needs an evicted file
-fetches it again from the store. With the local backend the cache directory *is* the store, so
-nothing is ever evicted there and the size limit is ignored; reclamation's grace rule is the only
-deletion.
+With S3, superseded cached files can be evicted after compaction or during reclamation sweeps.
+Files less than ten minutes old are protected from eviction. Pending files are included in the
+live set for superseded-file eviction.
 
-JGit's process-wide block cache, which holds pack blocks and pack indexes for every open repository,
-is sized to a tenth of the heap at startup unless `core.dfs.blockLimit` is set in `gerrit.config`.
-JGit's own default of 32 MB suits a laptop, not a server holding thousands of repositories.
+`cacheSizeLimit` defaults to `0` (unbounded). When enabled, a reclamation sweep trims the oldest
+eligible cached files by modification time. This is a periodic target, not a hard disk quota:
+young files, staging data and writes between sweeps can exceed it. Sparse packs are counted by
+logical file size. A later read fetches an evicted file again.
+
+With the local backend, the cache is the store. Cache eviction and the size limit are disabled;
+only reclamation may delete files.
+
+JGit's process-wide block cache uses the larger of its default and one tenth of the JVM's
+maximum heap, rounded down to a block boundary, unless `core.dfs.blockLimit` is configured. It
+is separate from the disk cache.
 
 ## Configuration
 
+All keys below belong to `[walgerrit]` except `core.dfs.blockLimit`.
+
 | Key | Default | Meaning |
-|---|---|---|
-| `walgerrit.compactionEnabled` | `true` | Run the compactor and the sweep on this node. |
-| `walgerrit.compactMinPacks` | `8` | Smallest run of undersized packs worth rolling up. |
-| `walgerrit.compactGeometricFactor` | `2` | Each pack should be this many times all smaller packs combined. |
-| `walgerrit.compactMaxPackSize` | `8g` | Packs above this size are never rewritten. |
-| `walgerrit.compactMinReftables` | `8` | Transaction tables (plus small compacted ones) that trigger a reftable merge. |
-| `walgerrit.compactSmallReftableSize` | `8m` | Compacted tables up to this size are merged with the tables above them. |
-| `walgerrit.compactMaxReftables` | `32` | Stack depth at which the large base tables are merged too. |
-| `walgerrit.compactionLeaseDuration` | `30 min` | Lease lifetime without renewal. |
-| `walgerrit.reclaimEnabled` | `true` | Delete unreferenced store files past the grace period. |
-| `walgerrit.reclaimGrace` | `24 h` | Minimum file age before absence is tracked, and minimum observation interval before deletion. |
-| `walgerrit.reclaimInterval` | `6 h` | Period of the sweep that reclaims and queues overdue repositories. |
-| `walgerrit.cacheSizeLimit` | `0` | Node-local cache size above which the oldest cached files are dropped. |
-| `core.dfs.blockLimit` | a tenth of the heap | JGit block cache size in bytes. |
+| --- | --- | --- |
+| `compactionEnabled` | `true` | Run this node's background maintenance. |
+| `compactMinPacks` | `8` | Minimum selected object packs to merge. |
+| `compactGeometricFactor` | `2` | Factor used to select a geometric pack prefix. |
+| `compactMaxPackSize` | `8g` | Maximum individual input pack size. |
+| `compactMinReftables` | `8` | Minimum qualifying tables for a top-stack merge. |
+| `compactSmallReftableSize` | `8m` | Largest compacted table included in a top-stack merge. |
+| `compactMaxReftables` | `32` | Depth that triggers a whole-stack merge. |
+| `compactionLeaseDuration` | `30 min` | Repository lease lifetime without renewal. |
+| `sweepLeaseDuration` | `60 sec` | Shared reclamation lease lifetime without renewal. |
+| `reclaimEnabled` | `true` | Run reclamation and periodic cache cleanup. |
+| `reclaimGrace` | `24 h` | Minimum file age and subsequent absence-observation interval. |
+| `reclaimInterval` | `6 h` | Scheduled delay between maintenance sweeps. |
+| `cacheSizeLimit` | `0` | Periodic disk-cache size target; `0` disables trimming. |
+| `core.dfs.blockLimit` | heap-based, with JGit default as a floor | Process-wide JGit block-cache size. |
 
-## What is deliberately not done
+## Deliberate limits
 
-- No reachability-based garbage collection: objects are only ever re-packed, never dropped.
-  Gerrit repositories keep almost everything reachable through change refs, and skipping GC keeps
-  "the store never loses anything" trivially true.
-- No multi-pack index yet. JGit's DFS layer supports one; written alongside a compacted pack it
-  would cut per-lookup index scans further between compactions.
-- No bitmaps or delta re-compression tuning; JGit's compactor reuses existing deltas.
+Compaction does not perform reachability-based garbage collection: it preserves objects in its
+inputs, including unreachable ones. Reclamation removes unreferenced files, including failed
+uploads, rather than individual unreachable objects from live packs. Multi-pack indexes and
+bitmap generation are not part of the maintenance path; the compactor reuses existing deltas.

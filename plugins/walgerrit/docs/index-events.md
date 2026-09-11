@@ -1,72 +1,56 @@
 # WAL-driven search-index convergence
 
-WalGerrit uses the committed Git WAL as the durable source of secondary-index work. This follows
-the event bridge described by [WalGit](https://github.com/tobi/walgit/blob/main/docs/EVENTS.md): the
-transaction is recorded with the write, followers use durable per-repository cursors, delivery is
-at least once, and a periodic sweep is the correctness backstop. It also follows Cursor's
-[Git at any scale](https://cursor.com/blog/git-at-any-scale) split: the object store is truth while
-notifications or gossip are only latency optimizations.
+Each node derives its Lucene indexes from committed ref transactions. The logical ref payload
+and its Git files share one manifest publication, so an acknowledged ref update cannot lose its
+indexing intent. Search catches up asynchronously; it is not part of the Git transaction.
 
 ## Write and replay protocol
 
-1. Gerrit gives JGit a `BatchRefUpdate` containing the complete logical ref transaction.
-2. JGit emits the immutable pack/index/reftable files.
-3. WalGerrit writes a WAL entry containing those files and every logical ref update.
-4. The manifest CAS publishes the files, refs, and index event together.
-5. Before Gerrit's SSH or HTTP listeners start, each daemon reads a fresh manifest for every
-   repository and synchronously replays unseen entries in sequence order.
-6. After all synchronous index work for an entry succeeds, the daemon atomically writes its
-   node-local cursor with the entry's sequence and transaction id.
-7. Only after a complete clean sweep does the daemon publish readiness and start periodic sweeps.
+1. JGit prepares an atomic ref batch and its immutable files.
+2. WalGerrit records the files and complete logical ref updates in a WAL entry.
+3. Manifest CAS publishes the entry and refs together.
+4. Each node reads unseen entries in repository sequence order and applies their index work.
+5. After an entry's synchronous work succeeds, the node persists its cursor.
 
-If index work or the cursor write fails, the entry is retried. A crash after indexing but before the
-cursor write also replays the entry, which is safe because the operations are idempotent. A
-successful manifest CAS cannot acknowledge a Git write without also making its event durable.
+A crash between index application and cursor persistence causes replay. Index replacements and
+deletions are idempotent, so delivery can be at least once. A failed index or cursor write leaves
+the entry unacknowledged.
 
-EVENT entries share the log. They carry the Gerrit events the writing node fired, as JSON, and the
-tailer hands them to this node's event dispatcher when the writer host is another node; its own
-entries are skipped because those events were fired here already. See [events](events.md). The
-cursor advances over EVENT entries like any other.
+`EVENT` entries share the log and cursor but carry best-effort Gerrit notifications. The tailer
+replays foreign-host entries and skips its own host's notifications. Their failures and rebuild
+behavior differ from index intents; see [Events](events.md).
 
 ## Ref-to-index mapping
 
-| Durable ref update | Node-local action |
+| Ref update | Node-local action |
 | --- | --- |
-| `refs/changes/*/meta` and `refs/changes/*/robot-comments` | Replace or delete the change document |
-| All-Users `refs/draft-comments/*` and `refs/starred-changes/*` | Replace the owning change document |
-| All-Users `refs/users/*` | Replace or delete the account document |
-| All-Users `refs/groups/*` | Replace or delete the group document |
-| `refs/meta/config` | Evict project configuration, replace/delete the project document, and reindex its open changes |
-| `refs/heads/*` | Reindex open changes targeting the branch for branch-derived fields |
+| `refs/changes/*/meta` and `refs/changes/*/robot-comments` | Replace or delete the change document. |
+| All-Users `refs/draft-comments/*` and `refs/starred-changes/*` | Reindex the owning change. |
+| All-Users `refs/users/*` | Replace or delete the account document. |
+| All-Users `refs/groups/*` | Replace or delete the group document. |
+| `refs/meta/config` | Evict project configuration, update the project document and reindex open changes. |
+| `refs/heads/*` | Reindex open changes targeting the branch. |
 
-Object-only pack entries and compaction entries advance the cursor without index work. The tailer
-does not synthesize Gerrit's public `GitReferenceUpdated` stream events, avoiding a second external
-event stream for the same committed write.
+Object-only and compaction entries advance the cursor without index work. The tailer does not
+synthesize public ref events from the logical payload; those travel as separate `EVENT` entries.
+An imported repository's initial files also lack a logical ref payload, so import requires an
+[offline baseline reindex](import.md#after-the-import).
 
-## Caches evicted on replay
+## Replay also evicts derived caches
 
-Replaying a ref transaction also evicts the Gerrit caches that the writing node evicted itself and
-that are not keyed by the ref they derive from. Most caches need nothing: accounts, external ids,
-change notes, project configs and default preferences are keyed by the tip of their ref, and the
-indexers the tailer drives evict the group and project caches themselves. Two are keyed by
-something else:
+Many Gerrit caches use a ref tip as part of their key. Group and project indexing also evicts
+associated caches. `ReplicatedCacheEvictions` handles two additional cases:
 
-- `sshkeys` is keyed by username and derived from the user's `refs/users/` ref. A replayed change
-  to that ref evicts the entry for the account's username.
-- The group membership caches (`groups_bymember`, `groups_bysubgroup`, `groups_byname`, `groups`)
-  are keyed by member, subgroup, name and legacy id and derived from `refs/groups/` refs. A replayed
-  change loads the group at both the old and the new revision and evicts the union of their
-  members, subgroups, names and ids, so a removal is forgotten as well as an addition.
+- A user-ref update evicts the account's username from `sshkeys`.
+- A group-ref update reads the old and new group revisions and evicts affected members,
+  subgroups, names and legacy IDs from the membership caches. Both revisions matter for removals.
 
-This is what the multi-site plugin's cache-eviction topic does; here the WAL entry is the trigger,
-so no broker is involved and the eviction lands in the same sweep as the index update.
+These evictions run with the ref transaction's replay and need no separate broker.
 
 ## Durability requirement
 
-Gerrit's normal Lucene default may make a write visible before committing it to stable storage. If
-WalGerrit fsynced its cursor during that window, a hard crash could preserve the cursor but lose the
-index write. Until WalGerrit has a batched Lucene commit/checkpoint API, every affected index must
-commit each write:
+A replay cursor must never reach disk before the index writes it acknowledges. The current tailer
+requires Lucene and synchronous commits for all affected indexes:
 
 ```ini
 [index "accounts"]
@@ -81,51 +65,42 @@ commit each write:
   commitWithin = 0
 ```
 
-The daemon validates this configuration before starting the tailer. This is correct but potentially
-expensive; replacing per-write commits with explicit batched index checkpoints is a production
-performance milestone.
+The daemon validates these settings at startup. Committing every write has a performance cost;
+batched durable checkpoints remain future work.
 
 ## Ordering and failure behavior
 
-Ordering is exact within one repository and undefined across repositories. An All-Users star or
-draft update can therefore arrive locally before the owning project's change event. A live update
-whose change cannot yet be resolved fails without advancing the All-Users cursor and is retried on
-the next sweep. Deletion of an All-Users ref may safely observe an already-deleted change.
+Order is per repository. An All-Users draft or star update can arrive before its project's change
+is indexed. A live update whose change cannot yet be resolved fails and retries on a later sweep;
+a deletion can safely encounter an already deleted change.
 
-The tailer also fails closed for:
+A missing or malformed `REF_UPDATE` payload, missing log entry, sequence error, index failure or
+cursor-write failure stops replay for that repository. Other repositories are still attempted.
+A failed startup sweep prevents startup; a failed background sweep revokes readiness. A later
+clean sweep restores it.
 
-- a `REF_UPDATE` entry without its logical transaction payload;
-- a missing or out-of-order WAL sequence;
-- a cursor ahead of the manifest;
-- a cursor whose saved log key no longer matches manifest history; or
-- any synchronous Gerrit index failure.
-
-One repository's failure is logged and does not stop the same sweep from converging other
-repositories. It does, however, fail the initial startup catch-up or revoke readiness during a
-background sweep. A later complete clean sweep restores readiness.
+Cursors that are ahead of the head, on another history, or beyond the replay limit take the
+rebuild path when enabled. They are not silently advanced past unknown index work.
 
 ## Startup and readiness
 
-The index lifecycle listener belongs to Gerrit's system injector, which starts before the SSH and
-HTTP injectors. Its first sweep is deliberately synchronous. If repository listing, WAL replay,
-index application, cursor persistence, or readiness publication fails, Gerrit startup fails rather
-than briefly serving with a stale local index.
+The system-injector lifecycle starts the tailer before Gerrit's serving listeners. Its first sweep
+is synchronous. The sweep lists current manifest versions, reuses valid cursor/version matches,
+and catches up changed repositories. It need not fetch every manifest body.
 
-A ready node exposes the Gerrit callback gauge `walgerrit/index_events/ready = true` and atomically
-creates `<indexCursorPath>/READY`. Both remain false/absent until a full sweep succeeds and are
-revoked on a failed later sweep or orderly shutdown. The file is node-local, just like the cursors.
-
-For a Kubernetes `exec` readiness probe, combine the marker with a request to the node itself so a
-marker left by a hard-killed prior process cannot make the new container ready before Java starts:
+After a clean sweep, the daemon sets `walgerrit/index_events/ready = true` and creates
+`<indexCursorPath>/READY`. Startup, a failed later sweep, and orderly shutdown clear readiness.
+A hard kill can leave the file behind, so a probe must also check the local listener:
 
 ```sh
 test -f /var/gerrit/data/walgerrit-index-events/READY &&
   curl -fsS http://127.0.0.1:8080/ >/dev/null
 ```
 
-Adjust the site path and listener URL for the image. The signal means that the last full sweep was
-clean; it is not a global linearizable barrier against a ref transaction committed immediately
-after that sweep.
+Adjust the paths and URL for the deployment. Readiness describes the most recently completed
+sweep. It does not promise that every write committed afterward has been indexed. Revoking
+readiness during a background rebuild does not close listeners; traffic routing must honor the
+signal.
 
 ## Configuration
 
@@ -142,72 +117,61 @@ after that sweep.
   indexRebuildOnStaleCursor = true
 ```
 
-`indexCursorPath` must be on node-local durable storage beside that node's Lucene indexes. Sharing
-it lets one node acknowledge work for another node and is invalid.
+The shown values are defaults. Keep the cursor directory on durable node-local storage with the
+indexes it acknowledges. Sharing it between nodes lets one node acknowledge another's work.
+Restoring indexes and cursors independently can also skip required work; rebuild and reseed them
+as a pair when their correspondence is uncertain.
 
 ## Discovery and change detection
 
-Each sweep is one paginated listing of the `manifests/` prefix. Because every manifest lives under
-that prefix and nothing else does, the listing enumerates every repository together with the
-current version of its manifest, which on S3 is the object's ETag and is returned by the listing
-itself. The tailer remembers the version at which it last brought each repository's cursor to head
-and replays a repository only when the listed version differs, taking the manifest from the node
-cache when another handle already fetched that version and reading it conditionally otherwise. An
-unchanged repository therefore costs nothing beyond its share of the listing: a sweep over 4300
-repositories is five requests when nothing changed, plus one manifest read and its new log entries
-per repository that did.
+One paginated listing of `manifests/` discovers repositories and their manifest versions. A
+repository whose version matches the tailer's caught-up version needs no replay. On restart,
+the version saved in its cursor provides the same shortcut.
 
-This is the only mechanism by which a node learns about other nodes' writes, so
-`indexPollInterval` is the cross-node search convergence latency. S3 lists are strongly consistent,
-so a manifest published anywhere appears in the next listing. Each cursor also records the version
-of the manifest whose head it reached, so a restarted node's first sweep reads only the manifests
-whose listed version differs from what its cursors name: one listing for a quiet site, rather than
-one conditional read per repository (which took about eight minutes for 4,400 repositories from a
-cluster 100 ms away from its bucket).
+For changed repositories, the tailer uses the node's cached manifest if it matches the listed
+version, otherwise a conditional read. Replay reads the intervening log entries. A quiet S3
+site therefore pays primarily for listing pages, rather than one read per repository. This
+requires a store whose listing and conditional-write semantics satisfy the backend contract.
 
-Cursor's design adds gossip between replicas as a latency optimization on top of the same kind of
-conditional check. WalGerrit does not need it while a sweep costs a handful of requests; if
-sub-interval convergence is ever required, a peer wake-up can be added on the publication path
-without changing this contract.
+`indexPollInterval` is the scheduled delay after a sweep, not a maximum search-convergence time.
+Sweep duration, log backlog, index work and retries add latency. Repository opens and ref
+transactions also discover new manifests, but do not replace the tailer's index work.
 
 ## Replay
 
-The log is a chain: each entry names the transaction id of the one before it, and the manifest
-names the head. Catching up reads the entries between the head and the cursor by walking that
-chain, one small object per entry, with every key known in advance, and validates the cursor by
-the transaction id the walk arrives at; see [storage format](storage-format.md#the-log-chain). The
-common case is one or two entries per sweep. A node more than `walgerrit.indexReplayLimit` entries
-behind, 10,000 by default, rebuilds instead, which is cheaper than that many reads.
+The manifest names the log head; each entry names its predecessor. The tailer walks backward to
+the cursor, validates its transaction ID, then applies the entries forward. Catch-up reads one
+log object per intervening entry. See [Storage format](storage-format.md#the-log-chain).
+
+`indexReplayLimit` counts all publications, including object, compaction and notification entries.
+If any repository exceeds the limit, the configured automatic rebuild covers all four logical
+indexes, not just that repository.
 
 ## Rebuilding instead of replaying
 
-A cursor too far behind the head, ahead of it, or naming a transaction the chain does not cannot
-or should not be advanced by replay. A brand-new node with an empty volume is the common case:
-every repository with more entries than the replay limit is too far behind. Rather than replaying a
-long history one entry at a time, the node rebuilds all four indexes from current repository state,
-the way the offline `reindex` program does, emptying each index first so documents for deleted
-changes cannot survive:
+A stale cursor triggers this sequence:
 
-1. Record every repository's current head sequence and transaction id.
-2. Mark each index not ready, empty it, refill it with Gerrit's site indexer, mark it ready.
-3. Seed every cursor from the heads recorded in step one, then replay the tail published meanwhile.
-4. Publish readiness.
+1. Capture every repository's current head sequence, transaction ID and manifest version.
+2. Mark each index not ready, empty it, refill it with Gerrit's site indexer, then mark it ready.
+3. Seed cursors at the captured heads.
+4. Sweep again to replay writes published during the rebuild.
+5. Publish readiness after the clean sweep.
 
-At startup this runs before Gerrit opens its listeners, so the node serves nothing while an index
-is empty; a background sweep that detects the condition revokes readiness for the duration. The
-rebuild takes as long as an offline reindex of the site. With the default limit only a node that
-missed ten thousand publications of one repository, or one with a fresh volume, ever takes this
-path; a node down for an hour replays its tail in seconds.
+At startup this finishes before listeners open. During a background rebuild readiness is revoked.
+The work can be as expensive as a full offline reindex. A fresh node may need it, but a fresh
+volume alone is not the trigger: the log distance and history checks determine whether to rebuild.
 
-`walgerrit.indexRebuildOnStaleCursor = false` disables the automatic rebuild; the daemon then refuses
-to become ready and names the repositories and the cursor directory in its error, and the remedy is
-the offline `reindex` followed by removing the cursors. If a rebuild is interrupted, Gerrit refuses
-to start until the offline `reindex` has run, because the index was marked not ready. To force a
-rebuild deliberately, stop the node, set `walgerrit.indexReplayLimit` below the repositories' head
-sequences or remove its cursor directory on a busy site, and start it again.
+With `indexRebuildOnStaleCursor = false`, stale cursors prevent readiness. For manual recovery,
+stop all destination writers, complete an offline `reindex`, then run `walgerrit-mark-indexed`
+for the affected node before restarting it. Removing cursors alone can immediately trigger the
+same replay-limit failure. See [Import: after the import](import.md#after-the-import) for why
+seeding requires a quiescent store.
 
-## Rollout and recovery boundary
+An interrupted rebuild can leave an index marked not ready. Complete an offline reindex before
+restarting in that case. Automatic rebuilds recover index state, not historical public events:
+notifications before the captured heads are skipped.
 
-Manifest format version 3 is not readable by earlier WalGerrit builds and does not read their data;
-no deployment holds data in the earlier layout. A `REF_UPDATE` entry without its logical
-transaction payload is a corruption and stops replay for that repository.
+## Format boundary
+
+The backend accepts manifest format 3. Older layouts have no automatic migration. Missing log
+objects or logical ref payloads are errors; they must not be treated as empty transactions.

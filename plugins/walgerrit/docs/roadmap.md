@@ -1,60 +1,38 @@
 # Roadmap
 
-## Milestone 0: extension boundary
+WalGerrit implements the storage and convergence paths below. It remains experimental: an
+implemented feature and a passing test are evidence for a specific contract, not a production
+qualification for every deployment.
 
-- [x] Load a library module in stock Gerrit 3.14.2.
-- [x] Route daemon and batch repository access through `WalGitRepositoryManager`.
-- [x] Delegate to local repositories as a behavioral control.
-- [x] Run unit tests and prove stock Gerrit schema creation uses the module.
-- [x] Patch Gerrit's init-only direct `FileRepository` helpers to switch to the configured
-  `GitRepositoryManager` after the system injector is available.
+## Implemented
 
-## Milestone 1: local WalGit format
+| Area | Capabilities | Details |
+| --- | --- | --- |
+| Gerrit integration | Library modules; daemon and batch repository access; init helpers; acceptance-test adapter. | [Architecture](architecture.md) |
+| Storage | Local and S3-compatible backends; immutable files; format-3 manifest CAS; bounded retries and ambiguous-outcome recovery. | [Consistency](consistency.md) |
+| Reads | Shared manifest cache; conditional revalidation; ranged S3 pack reads; configurable cache trimming. | [README](../README.md) |
+| Indexes | Durable ref payloads; node-local replay cursors; startup catch-up; readiness; automatic rebuild for stale cursors. | [Index events](index-events.md) |
+| Maintenance | Geometric object compaction; tiered reftable merging; leases; grace-based reclamation; heap-sized JGit block cache. | [Compaction](compaction.md) |
+| Import | Bare-repository import; optional staging, repack and connectivity checks; ref verification; offline cursor seeding. | [Import](import.md) |
+| Notifications | Best-effort cross-node forwarding through separate WAL entries. | [Events](events.md) |
+| Sessions | Optional signed cookies and a shared signing key. | [Web sessions](web-sessions.md) |
+| Packaging | Matched WAR/JAR bundles, checksums, smoke testing and tagged prereleases. | [Deployment bundle](artifact-bundle.md) |
 
-- [x] Store immutable packs, indexes, and reftables in a local object-store directory.
-- [x] Store a protobuf manifest and immutable transaction log as local files.
-- [x] Implement atomic manifest compare-and-swap and stale-writer rejection.
-- [x] Pass repository create/open/list and JGit object/ref/batch transaction tests.
+The [JGit audit](jgit-cas-deep-dive.md#verification) maps the correctness properties to test
+sources and runnable checks. Use results from the exact revision and environment being deployed.
 
-## Milestone 2: S3-compatible storage
+## Remaining work
 
-- [x] Replace local object operations with conditional S3 requests.
-- [x] Materialize immutable packs into a node-local cache on demand.
-- [x] Exercise concurrent writers, CAS conflicts, and ambiguous-success fault points against MinIO.
-- [x] Revalidate manifests with conditional reads once per repository handle and ref transaction
-  instead of on every JGit lookup; pin the round-trip budget in tests.
-- [ ] Add a size bound and eviction policy to the local pack cache.
+- Batched Lucene checkpoints to replace the cost of committing every replayed index write.
+- Replay lag/error metrics and operational alerts beyond the readiness gauge and logs.
+- Durable repository deletion, snapshots and ongoing integrity checking.
+- A tested end-to-end cutover and rollback procedure, including writes accepted after cutover.
+- Explicit bounds or distributed protection for writers and readers that outlive reclamation's
+  grace period.
+- An atomic ref-rename implementation before exposing that JGit API as a general guarantee.
 
-## Milestone 3: Gerrit workflows
+## Optional extensions
 
-- [x] Initialize and reindex `All-Projects` and `All-Users` through WalGerrit.
-- [x] Push `refs/for/*`, comment, vote, and submit.
-- [x] Run Gerrit's acceptance suite on the backend (`scripts/acceptance-tests.sh`); every case
-      passes except ten that assert on in-memory-manager-only instrumentation (see README).
-- [x] Run two Gerrit instances against one S3-compatible backend with independent local Lucene
-  indexes, including restart.
-- [x] Persist exact ref transactions in the WAL and replay them at least once into accounts,
-  changes, groups, and projects indexes from node-local cursors.
-- [x] Block daemon startup on a full initial catch-up and publish node-local replay readiness.
-- [x] Discover repositories and changed manifests with one listing of the flat `manifests/`
-  prefix per sweep; read only manifests whose version changed.
-- [ ] Optional peer wake-ups if cross-node index convergence must be faster than the sweep
-  interval.
-- [x] Chain log entries through their predecessors' transaction ids so the manifest names only the
-  head and never grows with history, and rebuild a node's indexes from repository state when its
-  cursor cannot be replayed or is further behind than `walgerrit.indexReplayLimit`.
-
-## Milestone 4: migration and operations
-
-- [x] Import a tree of bare repositories as they are, one manifest each, with ref verification and
-      an optional object-closure walk (`walgerrit-import`, see [import.md](import.md)).
-- Add snapshots and integrity checks.
-- [x] Publish `DfsPackCompactor` output as one exact add-and-supersede manifest transaction while
-  retaining old files.
-- [x] Compact on the writing node with a geometric pack policy and whole-stack reftable compaction,
-  fenced by a per-repository lease, with a startup and periodic sweep for overdue repositories
-  (see [compaction.md](compaction.md)).
-- [x] Reclaim unreferenced files after a grace period, evict superseded files from the node-local
-  cache, bound the cache, and size JGit's block cache from the heap.
-- Add index replay lag/error metrics and operational alerts.
-- Document cutover and rollback.
+Peer wake-ups could reduce index latency below the polling delay. Multi-pack indexes could reduce
+pack-index scans, but require a storage-format extension for coverage relationships. Native GCS
+conditional requests and per-session revocation are not implemented.

@@ -1,113 +1,140 @@
 # Importing repositories
 
-`walgerrit-import` moves an existing Gerrit site's repositories into WalGerrit without rewriting
-them. It reads a tree of bare repositories laid out like `gerrit.basePath`, uploads each
-repository's pack files as they are, writes its refs into one reftable, and publishes the whole
-repository with one manifest transaction. The result is exactly what a compaction would have
-produced: a few large packs and one table, so the compactor has nothing to do afterwards.
+`walgerrit-import` copies a tree of bare Gerrit repositories into the configured WalGerrit store.
+It uploads pack files, writes the refs into one reftable, and publishes the data with one
+manifest transaction per repository. It does not import Lucene indexes, reflogs or site settings.
 
 ```bash
-java -jar gerrit.war walgerrit-import -d "$site" --source /backup/git --stage /scratch \
-    [--prune-dangling-refs] [--threads N] [--project NAME]... [--verify-closure]
+java -jar gerrit.war walgerrit-import -d "$site" \
+  --source /backup/git --stage /scratch --threads 4
 ```
 
-The site is the WalGerrit site that will serve the data: its `gerrit.config` names the bucket or
-local store, installs `dev.walgerrit.WalGitModule`, and carries the WalGerrit library in `lib/`.
-Nothing is written anywhere but the configured store, and the daemon need not be stopped; the
-imported repositories are invisible until a site is pointed at their prefix.
+Use the matching fork WAR and library. The destination site's `gerrit.config` must install
+`dev.walgerrit.WalGitModule` and select the destination backend; the library belongs in `lib/`.
 
-## Survey first
+## Isolate the destination and freeze the source
 
-`scripts/survey-repositories.sh BASE_PATH` reads the tree without writing to it and prints the
-numbers the import depends on: repository count and total size, the largest repositories and the
-largest single pack, which repositories still hold loose objects, ref counts, and the NoteDb schema
-version in All-Projects. The largest repository sizes the staging space; the largest pack says
-whether the 5 GiB single-upload limit, above which parts are used, is exercised on day one.
+Use a consistent backup or a quiescent source tree. Copying a live repository is not a snapshot
+and may combine refs and objects from different moments.
 
-## Prepare the source
+Import into a fresh store or prefix with no daemon serving it. The importer creates an empty
+manifest before uploading, so a repository name can be discoverable before its data is ready.
+Once the data is published, any daemon using that prefix can see it. A prefix is isolated only
+while no serving node points at it.
 
-The source is never written to. Repositories must hold no loose objects when they are uploaded, and
-there are two ways to get there.
+The importer reads the source without changing it. It writes shared store data, local staging
+and temporary files, and may populate the local cache during verification. Do not run concurrent
+imports of the same project or share a staging directory between importer processes.
 
-**Staged, the default for a real site.** With `--stage DIR` the importer copies each repository
-into that directory, runs `git repack -a -d`, `git prune --expire=now` and `git fsck
---connectivity-only` on the copy, imports the copy and deletes it. The source can be a read-only
-mount of the backup, and the scratch space needed is the largest repository times `--threads`, not
-the whole site. `git` must be on the PATH. Bitmaps and reverse indexes written by the repack are
-imported alongside the packs and speed up clones.
+## Survey the backup
 
-Staging expects what a backup of a serving Gerrit looks like. git's derived indexes, the
-commit-graph and the multi-pack-index, are not copied: the importer does not ship them, and they
-are routinely stale in a backup because JGit prunes commits and deletes packs without updating them,
-which `git fsck` would report as corruption. A `HEAD` that names `refs/meta/config`, as Gerrit sets
-up `All-Projects` and `All-Users`, is kept although `git fsck` objects to it. A ref that points at
-an object the backup lacks, which a backup taken while the server writes can hold (`refs/multi-site/
-version` and freshly written change refs are the usual cases), fails the repository with the list
-of such refs; with `--prune-dangling-refs` they are deleted from the copy instead, and listed in the
-output as `pruned N dangling refs from PROJECT: ...`, so the operator can fetch them from the
-primary afterwards. The source is never changed either way.
+From `plugins/walgerrit`, run:
 
-**Pre-repacked.** Without `--stage`, run `git repack -a -d` and `git fsck --connectivity-only` in
-every repository of a scratch copy yourself, then import the copy. The importer refuses a
-repository that still has loose objects and says so.
+```bash
+scripts/survey-repositories.sh /backup/git /scratch/survey
+```
 
-Either way:
+The script leaves the backup unchanged and writes `repositories.tsv` and `packs.tsv` into the
+report directory. It reports counts and sizes, the largest repositories and packs, loose objects,
+refs and the `All-Projects` NoteDb schema version. Size scratch space for the repositories imported
+concurrently, with extra room for repack output. A copy and its replacement packs can coexist.
+S3 uploads use multipart transfer for files above 64 MiB.
 
-3. **Set the server id.** NoteDb stores every identity as `accountId@serverId`, and Gerrit resolves
-   it to an account only when the id matches its own `gerrit.serverId`. Before starting a daemon on
-   imported data, set the WalGerrit site's `gerrit.serverId` to the source server's; a fresh
-   `instanceId` per node is fine. Skipping this turns every owner, reviewer and comment author into
-   an unknown account.
+## Prepare packs on a copy
 
-Reflogs are not imported; reftables carry the refs themselves. `refs/cache-automerge/*` may be
-deleted from the copy first, they are regenerated on demand.
+With `--stage DIR`, the importer copies each repository into `DIR`, then runs `git repack -a -d`,
+`git prune --expire=now` and `git fsck --connectivity-only` on that copy. It removes the copy after
+success or failure. Use a dedicated scratch directory: the importer replaces
+`DIR/<project>.git` before staging. Git must be on `PATH`.
 
-## What one run does
+Staging omits commit-graph and multi-pack-index files. It preserves a symbolic `HEAD` outside
+`refs/heads/`, as used by Gerrit's system projects. Existing bitmap and reverse-index side files
+are uploaded with their packs when present; staging does not guarantee that a bitmap is created.
 
-For every repository, in `--threads` repositories at a time (default 4):
+Without `--stage`, the importer requires packed objects and rejects repositories containing loose
+objects. Prepare and check a scratch copy yourself, including pruning loose unreachable objects
+if needed. Staging is optional and is not the command's default.
 
-- with `--stage`, the repository is copied, repacked, pruned and checked first, and the copy is
-  removed afterwards even if the import fails;
-- every pack, index, bitmap and reverse index is uploaded under its original name, so a rerun
-  recognises an already uploaded file by name and content and skips it; files above 64 MiB use a
-  multipart upload;
-- `HEAD` and every ref, including `refs/changes/*`, `refs/meta/*`, `refs/users/*` and
-  `refs/groups/*`, become one reftable named after a digest of the refs, so a rerun reuses it;
-- one manifest publication adds all of them, and only then does the repository exist;
-- a handle is opened through WalGerrit and every source ref is compared with what it serves;
-  `--verify-closure` additionally walks every object the refs reach, which reads every pack back
-  through WalGerrit and is the expensive option.
+### Missing objects require an explicit choice
 
-Every step is idempotent, so a run that died is resumed by running it again: repositories with a
-published manifest are only verified, a repository whose manifest exists but is empty is published,
-and the rest proceed. The exit status is non-zero if any repository failed, and each failure is
-printed with its cause. `--project` limits a run to the named projects, which is how a failed
-repository is retried after its source was fixed.
+A ref whose tip or peeled tag target is missing fails staging. `--prune-dangling-refs` deletes
+such refs from the staged copy and prints their names. This changes the imported ref set; it does
+not repair the missing history. Missing objects deeper in the reachable graph can still fail the
+connectivity check.
+
+Keep the list of removed refs for reconciliation with the source. A later rerun against an
+already published repository verifies the original source directly, without staging or pruning;
+it will fail if that source still contains the removed refs. The importer does not incrementally
+update a published repository.
+
+## Preserve the Gerrit server ID
+
+Set the destination's `gerrit.serverId` to the source server's ID before serving imported NoteDb.
+Gerrit uses that ID in account identities stored in NoteDb; a mismatch can make owners, reviewers
+and comment authors appear as unknown accounts. Each node may have its own `gerrit.instanceId`.
+
+Reflogs are not imported. The source copy may omit `refs/cache-automerge/*`, which Gerrit can
+regenerate, but any such pruning must be deliberate and reflected in verification.
+
+## Publication and verification
+
+For each repository, the importer:
+
+1. Creates or resumes its empty destination manifest.
+2. Optionally stages and checks the source copy.
+3. Uploads packs and supported side files under their original names.
+4. Writes `HEAD` and all refs into a deterministically named reftable.
+5. Publishes all additions in one manifest transaction.
+6. Opens the result through WalGerrit and compares all ref names and targets.
+
+Already uploaded files are checked by name and content. A nonempty destination is verified
+instead of overwritten. Rerunning therefore resumes an interrupted import when the source ref
+set is unchanged, subject to the pruning caveat above. It is not a synchronization tool.
+
+| Option | Effect |
+| --- | --- |
+| `--threads N` | Import repositories concurrently; default `4`. |
+| `--project NAME` | Limit import to a project; repeat for several projects. |
+| `--verify-closure` | Also walk reachable commits, trees and object connectivity through WalGerrit. |
+| `--prune-dangling-refs` | With staging, remove refs whose tip or peeled tag target is missing. |
+
+Closure verification is more expensive than ref comparison. It is not a full byte-by-byte audit
+of every stored pack or unreachable object. A run exits nonzero if any repository fails and
+prints the failure cause. Verification happens after publication, so failure does not imply
+that nothing was published.
 
 ## After the import
 
-Run an offline `reindex` against the site before any daemon starts, then
+Keep **all writers to the destination stopped** through initialization or schema migration,
+offline reindexing and cursor seeding. For each node's local indexes, finish reindexing and then
+run:
 
 ```bash
+java -jar gerrit.war reindex -d "$site"
 java -jar gerrit.war walgerrit-mark-indexed -d "$site"
 ```
 
-which records on that node that its indexes reflect the current head of every repository. Without
-it the daemon treats a repository without a cursor as never indexed; the import publishes no ref
-transaction, so as soon as anything has been written to an imported repository (the schema
-migration `init` runs on All-Projects and All-Users is enough) its log cannot be replayed from the
-start, and the daemon rebuilds every index on startup with one thread per index and its own
-configuration. For a large site, run the reindex with a generous heap, a relaxed `commitWithin`,
-`walgerrit.manifestRevalidateOnOpen = false` and Gerrit's persistent caches on scratch space
-(`cache.directory`); computing every change's diffs fills them by tens of gigabytes, and they are
-never pruned outside the daemon. Set `commitWithin = 0` back before starting daemons, which is
-when the index-event tailer checks it. Then point the deployment at the prefix, log in, clone,
-search, review, submit and restart.
+`walgerrit-mark-indexed` records the current repository heads. It does not inspect the indexes or
+recover the heads observed by the preceding reindex. A write between those two operations could
+be marked indexed without being indexed; stopping only this node is insufficient if other nodes
+can still write to the destination.
 
-## Sizing
+An import entry contains files and refs but no logical ref-update payload for the index tailer.
+Do not rely on replay to index the imported baseline. Seed cursors only after the offline reindex
+succeeds. Subsequent publications are then replayed by the daemon.
 
-The import moves every byte of the source over the network once; plan for that bandwidth. Staging
-adds one local copy and one repack per repository, in `--threads` repositories at a time. A node
-that later serves the data materializes packs into its local cache on first use, so with an object
-store backend the runtime volume should hold the working set, and with a full reindex that is
-everything.
+For a large offline reindex, a larger heap, relaxed `commitWithin` and
+`manifestRevalidateOnOpen = false` can reduce cost. Budget disk space for persistent caches and
+pack reads. Restore all five `commitWithin = 0` settings and the intended manifest-freshness
+settings before starting daemons. Require index readiness, then verify login, clone, search,
+review, submit and restart before directing users to the new deployment.
+
+## Capacity and rollback
+
+Budget network transfer for the imported packs, additional reads for verification and reindexing,
+and scratch space for concurrent copies plus repack output. With S3, each node's file cache grows
+with its working set; a full reindex can read much of the repository data.
+
+Keep the source backup and destination isolated during validation. Once the new deployment
+accepts writes, pointing users back at the old site does not preserve those writes. A reverse
+migration and reconciliation procedure remains deployment work; the importer supplies neither.

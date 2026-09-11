@@ -1,41 +1,37 @@
 # WalGerrit
 
-WalGerrit is a storage integration that makes Gerrit Code Review use a WalGit-style immutable-pack
-and manifest transaction model without changing Gerrit's NoteDb, permissions, transport or search
-layers.
+WalGerrit stores Gerrit's Git data in immutable files and publishes each ref transaction by
+atomically replacing a manifest. Nodes share the store; each node keeps its own Lucene indexes
+and follows the transaction log to update them. No separate index-event broker is required.
 
-The project currently contains local-filesystem and S3-compatible WAL backends. It loads through
-Gerrit's supported library-module hooks and stores JGit DFS packs, indexes, and reftables as
-immutable objects. A protobuf manifest CAS publishes each transaction. The same committed WAL also
-drives every node's local Gerrit search indexes, so a separate Kafka index-event broker is not
-required for the implemented workflow.
-
-## Requirements
-
-- Java 21
-- Maven 3.9 or newer
-- Gerrit 3.14.2
-
-The Java runtime is pinned in `.tool-versions`.
+This is an experimental backend for the Gerrit 3.14.2 fork on `walgerrit-3.14`. It supports a
+local filesystem and S3-compatible storage. It uses JGit's DFS and reftable APIs without a JGit
+fork. See the [architecture](docs/architecture.md) for the integration boundary and the
+[roadmap](docs/roadmap.md) for remaining work.
 
 ## Build
+
+Use Java 21. The runtime is pinned in [.tool-versions](.tool-versions); the Maven wrapper supplies
+Maven 3.9.11.
 
 ```bash
 cd plugins/walgerrit
 ./mvnw verify
 ```
 
-The deployable library is written to `target/walgerrit-0.1.0-SNAPSHOT.jar`.
+The library is `target/walgerrit-0.1.0-SNAPSHOT.jar`. Deploy it with the matching fork WAR; the
+[deployment bundle](docs/artifact-bundle.md) contains both.
 
 ## Install
 
-Copy the JAR into Gerrit's primary classpath:
+Copy the library onto Gerrit's primary classpath before initializing the site:
 
 ```bash
+mkdir -p "$GERRIT_SITE/lib"
 cp target/walgerrit-0.1.0-SNAPSHOT.jar "$GERRIT_SITE/lib/walgerrit.jar"
 ```
 
-Add the following to `etc/gerrit.config`:
+Configure `etc/gerrit.config`:
 
 ```ini
 [gerrit]
@@ -46,8 +42,6 @@ Add the following to `etc/gerrit.config`:
   backend = local
   storagePath = data/walgerrit
   indexCursorPath = data/walgerrit-index-events
-  # A node further behind than this many log entries rebuilds its indexes instead of replaying.
-  indexReplayLimit = 10000
 
 [index "accounts"]
   commitWithin = 0
@@ -61,59 +55,20 @@ Add the following to `etc/gerrit.config`:
   commitWithin = 0
 ```
 
-`storagePath` is relative to the Gerrit site unless it is absolute. Restart Gerrit. Manifests are
-now stored below `data/walgerrit/manifests/` and immutable pack, reftable and log objects below
-`data/walgerrit/repos/`; `gerrit.basePath` is not used by this backend. `indexCursorPath` must be
-node-local even when the WAL storage is shared.
+Paths are relative to the site unless absolute. The local backend stores manifests under
+`data/walgerrit/manifests/` and immutable files under `data/walgerrit/repos/`; it does not use
+`gerrit.basePath`. The cursor directory must remain node-local, beside that node's Lucene indexes.
 
-Manifest freshness follows the Continuity model: a repository handle revalidates the manifest with
-one conditional read (`If-None-Match` on the manifest ETag) when Gerrit opens it and again when it
-starts a ref transaction. Between those points, JGit's in-memory pack list and reftable stack serve
-every lookup. `walgerrit.manifestRevalidateInterval` (default `1 sec`) bounds how long a long-lived
-handle may serve reads without another conditional read; `0` disables the periodic check so only
-opens, ref transactions and `scanForRepoChanges` revalidate. All handles on a node share the newest
-manifest any of them observed, including the index-event tailer, so a handle adopts a newer
-manifest as soon as its node has seen one. See [Consistency](docs/consistency.md#freshness).
-`walgerrit.manifestRevalidateOnOpen` (default `true`) is what makes every open pay that conditional
-read, and so what lets a request that starts on any node see every write acknowledged before it.
-Set to `false`, an open reuses the node's view when it was validated less than
-`manifestRevalidateInterval` ago, one round trip less per open at the price of that guarantee;
-meant for offline programs such as `reindex`, which open a repository several times per change,
-and for single-node sites, whose own writes keep the view current. On a daemon the index-event
-tailer's sweep confirms every manifest's version against a listing each `indexPollInterval`, which
-counts as a validation, so with the setting off a node's view is at most one poll interval plus one
-revalidation interval behind another node's write.
+The index tailer requires Lucene and all five `commitWithin = 0` settings. It saves a replay
+cursor only after synchronous index writes. Deferred Lucene commits could preserve the cursor
+while losing the indexed data after a crash, so the daemon rejects that configuration.
 
-Daemon startup synchronously catches every node-local index cursor up to a freshly read manifest
-before Gerrit's SSH and HTTP listeners start. After an offline `reindex`, `walgerrit-mark-indexed`
-seeds those cursors at the current heads so the daemon replays only what is published afterwards
-instead of rebuilding every index (see [Import](docs/import.md#after-the-import)). A successful full sweep publishes the gauge
-`walgerrit/index_events/ready` and creates `<indexCursorPath>/READY`; a later failed sweep or orderly
-shutdown revokes both. A Kubernetes readiness probe should require that marker and a successful
-request to the local Gerrit listener, so a marker left by a hard kill cannot make an early-starting
-container ready. See [WAL-driven index events](docs/index-events.md#startup-and-readiness).
+For existing data, follow [Importing repositories](docs/import.md) before starting a daemon.
+Changing the backend does not migrate repositories from `gerrit.basePath`.
 
-The zero `commitWithin` values are currently mandatory. WalGerrit advances a durable replay cursor
-only after synchronous Lucene writes; allowing Lucene to defer its disk commit could otherwise lose
-an acknowledged index event after a hard crash. The daemon refuses to start the tailer without
-these settings. A later batched index-checkpoint implementation can remove this performance cost.
+## Share storage through S3
 
-Compaction runs on every node: after a write, the node rolls undersized packs up geometrically and
-merges a deep reftable stack, publishing each result through the manifest CAS, and a sweep every
-`walgerrit.reclaimInterval` (default `6h`) deletes files the manifest no longer references once they
-are older than `walgerrit.reclaimGrace` (default `24h`). The defaults suit production; the keys
-`compactMinPacks`, `compactGeometricFactor`, `compactMaxPackSize`, `compactMinReftables`,
-`compactSmallReftableSize`, `compactMaxReftables`,
-Only the node holding the sweep lease (`sweepLeaseDuration`, default `60 s`, under
-`leases/cluster/sweep`) deletes from the store; every node trims its own cache.
-`compactionLeaseDuration`, `reclaimEnabled`, `cacheSizeLimit` and JGit's `core.dfs.blockLimit` tune
-it. See [Compaction and reclamation](docs/compaction.md).
-
-For S3-compatible storage, use a node-local cache as `storagePath` and configure the shared bucket.
-The client pools connections (`walgerrit.s3MaxConnections`, default 64), fails a connect after
-`walgerrit.s3ConnectTimeout` (2 s) and a stalled transfer after `walgerrit.s3SocketTimeout` (30 s),
-and retries throttling, server errors and connection failures with the SDK's standard backoff up to
-`walgerrit.s3MaxAttempts` (4) times; a retried write that had already landed is recognised as such:
+Keep the modules and index settings above. Replace the `[walgerrit]` section with:
 
 ```ini
 [walgerrit]
@@ -123,119 +78,110 @@ and retries throttling, server errors and connection failures with the SDK's sta
   s3Bucket = gerrit-git
   s3Region = eu-west-3
   s3Prefix = production
-  # Set these for MinIO or another non-AWS endpoint.
-  s3Endpoint = http://127.0.0.1:9000
-  s3PathStyle = true
 ```
 
-Credentials come from the standard AWS SDK provider chain (environment, workload identity, shared
-AWS profile, container credentials, or instance role); they are not stored in `gerrit.config`.
+For MinIO or another custom endpoint, also set `s3Endpoint` and, if required, `s3PathStyle = true`.
+Credentials come from the AWS SDK's default provider chain. Keep `storagePath` node-local: it is
+a disposable file cache in S3 mode.
 
-Existing repositories are brought in with the `walgerrit-import` program, which uploads a tree of
-bare repositories as they are, one manifest per repository, and verifies every ref afterwards:
+| S3 setting | Default | Meaning |
+| --- | --- | --- |
+| `s3MaxConnections` | `64` | HTTP connection-pool size. |
+| `s3ConnectTimeout` | `2 sec` | Connection timeout. |
+| `s3SocketTimeout` | `30 sec` | Timeout for a stalled connection and for acquiring a pooled connection. |
+| `s3MaxAttempts` | `4` | Maximum attempts per SDK call, including the first. |
+
+These keys belong to `[walgerrit]`. Retried conditional writes may have succeeded already;
+WalGerrit resolves their outcome from committed history. See the
+[consistency contract](docs/consistency.md#ambiguous-outcomes-and-recovery).
+
+## Git reads and search have different freshness rules
+
+By default, opening a repository and starting a ref transaction each revalidate its manifest.
+Long-lived handles also check periodically. All handles adopt newer manifests observed on the
+same node, so a handle is not a fixed snapshot for the duration of a request.
+
+Search catches up through the WAL. Startup completes a full index sweep before opening Gerrit's
+listeners. A clean sweep creates `<indexCursorPath>/READY` and sets
+`walgerrit/index_events/ready`; a failed sweep or orderly shutdown revokes both. A readiness probe
+must require both the marker and a successful request to the local listener. See
+[index startup and readiness](docs/index-events.md#startup-and-readiness).
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `manifestRevalidateOnOpen` | `true` | Revalidate on every repository open. |
+| `manifestRevalidateInterval` | `1 sec` | Interval checked by active handles; `0` disables periodic checks. |
+| `indexPollInterval` | `5 sec` | Delay between index sweeps. |
+| `indexReplayLimit` | `10000` | Maximum log entries to replay per repository before rebuilding indexes. |
+
+Setting `manifestRevalidateOnOpen = false` allows an open to reuse a recently validated node
+view. This reduces reads during offline reindexing but gives up freshness at every open. Ref
+transactions still revalidate. See [Freshness](docs/consistency.md#freshness).
+
+## Cold reads fetch only the needed pack chunks
+
+The S3 backend fetches indexes, bitmaps and reftables whole. Packs larger than
+`packFetchChunkSize` (default `8m`) are fetched in chunks as JGit reads them. Smaller packs are
+fetched whole. A sparse pack's `.chunks` sidecar records which chunks are present; without that
+sidecar, the cached file is complete.
+
+Set `rangedPackReads = false` to fetch all packs whole. The local backend always reads complete
+files because its cache is the store.
+
+## Maintenance preserves Git state
+
+Daemon nodes compact small packs and merge reftables after publication. A per-repository lease
+avoids duplicate repacking; the manifest CAS rejects stale inputs. A periodic sweep also queues
+repositories that need maintenance.
+
+Reclamation requires two grace checks: a file must be old enough and then remain unreferenced
+for another grace period. Only the sweep-lease holder deletes shared files. Cache trimming is
+node-local. Read [Compaction and reclamation](docs/compaction.md) before changing retention or
+cache limits.
+
+## Verify the integration
+
+From the repository root, initialize the pinned submodules and build the WAR:
 
 ```bash
-java -jar gerrit.war walgerrit-import -d "$site" --source /backup/git --stage /scratch --threads 8
-```
-
-With `--stage` each repository is copied, repacked and checked with git before it is uploaded, so
-the source may be a read-only mount and scratch space is needed for a few repositories at a time,
-not the whole site. See [Importing repositories](docs/import.md) for the survey script, the source
-server's `gerrit.serverId`, and how a run resumes.
-
-Build the fork WAR from the repository root, then run the fresh-site integration test:
-
-```bash
-npx @bazel/bazelisk build --config=java21 release
+git submodule update --init --recursive
+npx --yes @bazel/bazelisk build --config=java21 release
 GERRIT_WAR="$PWD/bazel-bin/release.war" plugins/walgerrit/scripts/smoke-test.sh
 ```
 
-The test builds the backend, initializes a fresh Gerrit site, verifies the `All-Projects` and
-`All-Users` manifests, and reindexes entirely through WalGerrit. The same module is loaded by daemon
-and batch programs; configuring a separate batch module would bind `GitRepositoryManager` twice.
+The smoke script exercises initialization, reindexing, daemon readiness, compaction, restart,
+index rebuilding and import. The same database module serves daemon and batch programs; adding a
+separate batch database module would bind `GitRepositoryManager` twice.
 
-Gerrit's own acceptance suite can run on the WalGerrit backend. The in-memory test server binds
-`GitRepositoryManager` to WalGerrit's local backend whenever `GERRIT_WALGERRIT_JAR` names the built
-library, loading it at runtime so the test framework needs no build dependency on it:
+Run Gerrit's acceptance tests on the local WalGerrit backend with:
 
 ```bash
-plugins/walgerrit/scripts/acceptance-tests.sh                       # everything
+plugins/walgerrit/scripts/acceptance-tests.sh
 plugins/walgerrit/scripts/acceptance-tests.sh //javatests/com/google/gerrit/acceptance/api/change:api_change
 ```
 
-`GERRIT_WALGERRIT_STORAGE` may point the repositories at a tmpfs, and
-`GERRIT_WALGERRIT_COMPACTION=aggressive` makes every test server compact after two writes so the
-whole suite races real compactions. Tests annotated `@UseLocalDisk`
-keep running on the filesystem backend they ask for. The script passes
-`--define=acceptance_heap=large`, which lifts the groups' 256 MB test heap to 512 MB: a test JVM
-keeps every server it started reachable, and WalGerrit's per-server footprint is larger than the
-in-memory manager's, so the biggest groups (`rest_account`) run out of heap otherwise.
+The script builds the library, passes it as `GERRIT_WALGERRIT_JAR`, and uses a 512 MiB test heap.
+`WALGERRIT_ACCEPTANCE_TMP` selects its scratch directory. To exercise aggressive compaction:
 
-Ten cases in four groups fail by design on any backend other than the in-memory manager, because
-they assert on instrumentation that only `InMemoryRepositoryManager` provides: the four
-`GitRepositoryReferenceCountingManagerIT` cases in `acceptance_framework_tests` (open-handle
-reference counting) and the six `RefUpdateContext` cases in `git:DirectPushRefUpdateContextIT`,
-`git:HttpSubmitOnPushIT` and `git:SshSubmitOnPushIT` (the `RefUpdateContextCollector`). Everything
-else in the suite passes on WalGerrit.
+```bash
+BAZEL_TEST_FLAGS='--test_env=GERRIT_WALGERRIT_COMPACTION=aggressive' \
+  plugins/walgerrit/scripts/acceptance-tests.sh
+```
 
-## Reading packs on a cold node
+`@UseLocalDisk` tests retain their requested filesystem backend. Tests that assert on
+`InMemoryRepositoryManager` instrumentation need separate interpretation: these include
+`GitRepositoryReferenceCountingManagerIT` and the ref-context tests in
+`DirectPushRefUpdateContextIT`, `HttpSubmitOnPushIT` and `SshSubmitOnPushIT`. Consult the actual test
+results for the revision being deployed.
 
-A pack is fetched from the store the first time a node reads it. Packs no larger than
-`walgerrit.packFetchChunkSize` (default `8m`), and every index, bitmap and reftable, are downloaded
-whole. A larger pack is fetched in chunks of that size as JGit reads it, into a sparse local file
-with its final name plus a `.chunks` sidecar naming the chunks present; the sidecar disappears with
-the last chunk, and a file without one is complete by contract. A cold node opening a change in a
-multi-gigabyte repository therefore pays for the index and the few chunks the change touches, not
-for the pack, and a clone's sequential read turns JGit's read-ahead into one request per run of
-chunks. Anything that needs a whole pack, such as compaction, completes it first.
-`walgerrit.rangedPackReads = false` fetches every pack whole, as the local backend (whose cache is
-the store) always does.
+## Read further
 
-## Storage model
-
-For every repository, WalGerrit writes:
-
-- `manifest.pb`: the CAS-replaced linearization point;
-- `log/*.pb`: immutable transaction entries;
-- `wal/*`: immutable JGit pack, index, and reftable files;
-- `staging/*`: unpublished files that are safe to discard after failure.
-
-Publication order is immutable files, immutable log entry, then manifest replacement. A stale ref
-writer receives a JGit lock failure and must refresh before retrying. See the
-[storage format](docs/storage-format.md), [consistency contract](docs/consistency.md),
-[web sessions without a session store](docs/web-sessions.md),
-[events in the WAL](docs/events.md), and
-[JGit/CAS audit](docs/jgit-cas-deep-dive.md). See [WAL-driven index events](docs/index-events.md)
-for the local-Lucene convergence and recovery contract.
-
-## Fork boundary
-
-The storage engine does not require a JGit fork. Gerrit's runtime Git paths and schema creation use
-`GitRepositoryManager`, so the engine remains a separate module inside this Gerrit fork. The fork
-changes Gerrit 3.14.2's init-only account, group, external-ID, authorized-key, and project-config
-helpers to use a switching init repository manager. Before the system injector exists it preserves
-Gerrit's local fallback; afterwards it delegates to the configured WalGerrit manager. No shadow
-local `All-Users` repository is created.
-
-The design follows Cursor's
-[Git at any scale](https://cursor.com/blog/git-at-any-scale) and uses
-[tobi/walgit](https://github.com/tobi/walgit) as its concrete WAL/object-store reference.
-
-See [the architecture](docs/architecture.md), [CAS audit](docs/jgit-cas-deep-dive.md), and
-[roadmap](docs/roadmap.md).
-
-## Status
-
-Experimental. Local and S3-compatible manifest CAS, cache materialization, durable ref-event
-payloads, synchronous startup catch-up, node-local replay cursors and readiness, and the Gerrit
-init/reindex path are implemented and tested. A two-node MinIO test passes project creation,
-`refs/for/*` push, cross-node review/vote, submit, search convergence, and restart without manual
-reindexing. The S3 object-store fault suite also passes.
-
-A node whose index cursors cannot be replayed, including a new node with an empty volume on a busy
-site, rebuilds its indexes from current repository state before it becomes ready. See [WAL-driven index events](docs/index-events.md#rebuilding-instead-of-replaying).
-
-Compaction, reclamation and cache bounds are implemented and exercised by the unit suite, the smoke
-test and an acceptance-suite run with aggressive thresholds. Still open before production: import
-and migration tooling, durable repository deletion, replay-lag metrics, integrity checking, and a
-pooled HTTP client for S3.
+| Topic | Guide |
+| --- | --- |
+| Components and fork boundary | [Architecture](docs/architecture.md) |
+| Files, manifests and log entries | [Storage format](docs/storage-format.md) |
+| Publication, recovery and freshness | [Consistency](docs/consistency.md) |
+| JGit integration and test coverage | [JGit/CAS audit](docs/jgit-cas-deep-dive.md) |
+| Local search and recovery | [Index events](docs/index-events.md) |
+| Cross-node notifications | [Events in the WAL](docs/events.md) |
+| Shared login cookies | [Web sessions](docs/web-sessions.md) |
