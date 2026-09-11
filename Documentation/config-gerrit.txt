@@ -2822,6 +2822,12 @@ local repositories while collecting configuration, before that manager
 is available. Init steps that read or write repository data should do so
 in `postRun` through `GitRepositoryManagerOnInit`.
 +
+When a database module is configured, `init` cannot infer that the site
+has no repositories from an empty local Git directory. It leaves index
+readiness unchanged during configuration. The normal post-init reindex
+builds missing indexes. If that reindex is disabled, run `reindex` before
+starting Gerrit.
++
 By default unset.
 
 [[gerrit.installIndexModule]]gerrit.installIndexModule::

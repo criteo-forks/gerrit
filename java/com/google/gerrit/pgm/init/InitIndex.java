@@ -56,7 +56,11 @@ class InitIndex implements InitStep {
         new IndexType(
             index.select("Type", "type", IndexType.getDefault(), IndexType.getKnownTypes()));
 
-    if ((site.isNew || isEmptySite()) && type.isLucene()) {
+    // A database module may store repositories outside basePath. Until the configured repository
+    // manager is available, an empty local directory cannot establish that its indexes are empty.
+    boolean hasDbModules =
+        initFlags.cfg.getStringList("gerrit", null, "installDbModule").length > 0;
+    if (!hasDbModules && (site.isNew || isEmptySite()) && type.isLucene()) {
       for (SchemaDefinitions<?> def : IndexModule.ALL_SCHEMA_DEFS) {
         IndexUtils.setReady(site, def.getName(), def.getLatest().getVersion(), true);
       }
