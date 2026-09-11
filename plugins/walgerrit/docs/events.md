@@ -64,8 +64,8 @@ or implement deduplication. The sweep lease alone is not an exactly-once deliver
   eventJournalEnabled = true
 ```
 
-Setting this to `false` stops this node from journaling local events and reindexed documents. It does **not** disable
-foreign-event replay in the current tailer. Disabling `indexTailerEnabled` stops both index
+Setting this to `false` stops this node from journaling local events and reindexed documents;
+the tailer still replays foreign entries. Disabling `indexTailerEnabled` stops both index
 catch-up and event replay, so it also removes cross-node search convergence on that node.
 
 ## The sweep lease coordinates housekeeping
@@ -75,6 +75,6 @@ Its default term is 60 seconds (`sweepLeaseDuration`); renewal is scheduled ever
 term, with a one-second minimum delay.
 
 Renewal shares the maintenance executor with compaction and reclamation. Long work can delay a
-renewal, and the holder flag changes only when lease code runs. Treat the lease as coordination
-that reduces duplicate work, not as a hard exclusion or bounded failover guarantee. Manifest CAS
+renewal, and the holder flag changes only when lease code runs. The lease reduces duplicate
+work; it is neither a hard exclusion nor a bounded failover guarantee. Manifest CAS
 and the [reclamation rules](compaction.md#reclamation) remain responsible for data safety.

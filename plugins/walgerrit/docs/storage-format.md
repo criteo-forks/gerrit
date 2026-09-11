@@ -67,7 +67,7 @@ Log objects are not reclaimed. This preserves the recorded transitions, but does
 historical pack contents: superseded files can be deleted after the reclamation grace checks.
 Log retention alone therefore does not provide point-in-time data recovery.
 
-## A cursor identifies history, not just a position
+## A cursor names its history as well as its position
 
 Each node stores the last applied sequence and transaction ID beside its own Lucene indexes.
 At a repository head, it also records the manifest version. A later listing of the same version

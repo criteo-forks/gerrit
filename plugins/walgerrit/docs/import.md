@@ -105,7 +105,7 @@ that nothing was published.
 
 ## After the import
 
-Keep **all writers to the destination stopped** through initialization or schema migration,
+Keep every writer to the destination stopped through initialization or schema migration,
 offline reindexing and cursor seeding. For each node's local indexes, finish reindexing and then
 run:
 

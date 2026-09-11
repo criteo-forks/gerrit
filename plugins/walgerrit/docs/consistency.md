@@ -105,13 +105,13 @@ The store's manifest is authoritative. A handle revalidates it:
 3. On `scanForRepoChanges`.
 4. During active reads when `manifestRevalidateInterval` has elapsed, `1 sec` by default.
 
-The periodic check is demand-driven, not a background timer. Setting the interval to `0` disables
-it; opens, ref transactions and explicit scans still revalidate. Conditional reads use the node's
-latest known version, with `If-None-Match` on S3.
+A read triggers the periodic check; there is no background timer. Setting the interval to `0`
+disables it; opens, ref transactions and explicit scans still revalidate. Conditional reads use
+the node's latest known version, with `If-None-Match` on S3.
 
 A manifest observed by any handle or the index tailer becomes available to other handles on that
-node. Their next lookup can adopt it without another manifest request. This means an open handle
-is **not a fixed request-wide snapshot**: later lookups may observe a newer committed state.
+node. Their next lookup can adopt it without another manifest request. An open handle is
+therefore not a fixed request-wide snapshot; later lookups may observe a newer committed state.
 JGit's individual read operations still use their own in-memory structures.
 
 With `manifestRevalidateOnOpen = true` and the required store semantics, an open sees writes
@@ -121,8 +121,8 @@ I/O for an offline reindex against a quiescent store. A nonpositive interval nev
 cached view as recently validated for this optimization.
 
 A tailer listing can confirm an unchanged manifest version and refresh the node's validation
-time. Polling delays, sweep duration and failures therefore matter when reasoning about observed
-staleness; configured intervals are not universal end-to-end latency bounds.
+time. Polling delay, sweep duration and failures add to the staleness a node can observe; the
+configured intervals are not end-to-end bounds.
 
 ## Local disk is a cache
 

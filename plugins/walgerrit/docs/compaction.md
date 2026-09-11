@@ -12,8 +12,8 @@ These are separate operations: replacing a file in the manifest does not immedia
 in the progression between neighboring packs, then extends the selected prefix while its combined
 size would crowd the next pack. It merges that prefix only when at least `compactMinPacks`
 (default `8`) qualify. `compactGeometricFactor` defaults to `2`; input packs larger than
-`compactMaxPackSize` (default `8g`) are excluded. This is an input threshold, not an output-size
-limit or a promise that every pack exceeds the sum of all smaller packs by the factor.
+`compactMaxPackSize` (default `8g`) are excluded. That cap applies to inputs only; the merged
+pack may be larger, and the result need not satisfy the factor at every step.
 
 **Reftables merge from the top down.** Transaction tables and the small compacted tables directly
 beneath them qualify once `compactMinReftables` (default `8`) accumulate. A compacted table larger
@@ -97,8 +97,8 @@ Files less than ten minutes old are protected from eviction. Pending files are i
 live set for superseded-file eviction.
 
 `cacheSizeLimit` defaults to `0` (unbounded). When enabled, a reclamation sweep trims the oldest
-eligible cached files by modification time. This is a periodic target, not a hard disk quota:
-young files, staging data and writes between sweeps can exceed it. Sparse packs are counted by
+eligible cached files by modification time. Sweeps enforce it periodically, so young files,
+staging data and writes between sweeps can exceed it. Sparse packs are counted by
 logical file size. A later read fetches an evicted file again.
 
 With the local backend, the cache is the store. Cache eviction and the size limit are disabled;

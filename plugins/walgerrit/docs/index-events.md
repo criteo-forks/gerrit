@@ -147,7 +147,7 @@ log object per intervening entry. See [Storage format](storage-format.md#the-log
 
 `indexReplayLimit` counts all publications, including object, compaction and notification entries.
 If any repository exceeds the limit, the configured automatic rebuild covers all four logical
-indexes, not just that repository.
+indexes, whichever repository triggered it.
 
 ## Rebuilding instead of replaying
 
@@ -160,8 +160,8 @@ A stale cursor triggers this sequence:
 5. Publish readiness after the clean sweep.
 
 At startup this finishes before listeners open. During a background rebuild readiness is revoked.
-The work can be as expensive as a full offline reindex. A fresh node may need it, but a fresh
-volume alone is not the trigger: the log distance and history checks determine whether to rebuild.
+The work can be as expensive as a full offline reindex. A fresh node may need it, but the trigger
+is the log-distance and history check, whether or not the volume is new.
 
 With `indexRebuildOnStaleCursor = false`, stale cursors prevent readiness. For manual recovery,
 stop all destination writers, complete an offline `reindex`, then run `walgerrit-mark-indexed`
