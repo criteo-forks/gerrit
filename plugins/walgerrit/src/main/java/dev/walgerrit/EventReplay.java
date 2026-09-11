@@ -11,23 +11,36 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package dev.walgerrit;
 
+import java.util.concurrent.atomic.AtomicInteger;
 
-/** Marks the thread that is delivering events replayed from another node's WAL entry. */
+/**
+ * Marks work this node does on another node's behalf, delivering its events or repeating its
+ * index writes, which {@link WalJournal} must not record again.
+ */
 final class EventReplay {
   private static final ThreadLocal<Boolean> REPLAYING = ThreadLocal.withInitial(() -> false);
+  private static final AtomicInteger EVERYWHERE = new AtomicInteger();
 
   private EventReplay() {}
 
-  /** True while this thread dispatches events another node fired; the journal must not re-log them. */
+  /** True while this thread, or the whole process, repeats another node's work. */
   static boolean isReplaying() {
-    return REPLAYING.get();
+    return REPLAYING.get() || EVERYWHERE.get() > 0;
   }
 
+  /** Marks the calling thread until the scope closes. */
   static Scope enter() {
     REPLAYING.set(true);
     return () -> REPLAYING.set(false);
+  }
+
+  /** Marks every thread until the scope closes, for work that fans out over a pool. */
+  static Scope enterEverywhere() {
+    EVERYWHERE.incrementAndGet();
+    return EVERYWHERE::decrementAndGet;
   }
 
   interface Scope extends AutoCloseable {

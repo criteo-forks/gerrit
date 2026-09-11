@@ -45,8 +45,11 @@ final class GerritIndexRebuilder implements IndexRebuilder {
 
   @Override
   public void rebuildAll() throws IOException {
-    for (IndexDefinition<?, ?, ?> definition : definitions) {
-      rebuild(definition);
+    // The site indexers fan out over their own threads; nothing they write is journaled.
+    try (EventReplay.Scope ignored = EventReplay.enterEverywhere()) {
+      for (IndexDefinition<?, ?, ?> definition : definitions) {
+        rebuild(definition);
+      }
     }
   }
 

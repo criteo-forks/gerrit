@@ -55,8 +55,12 @@ message LogEntry {
     REF_UPDATE = 2;
     COMPACT = 3;
     // Gerrit events fired on the writing node, carried as JSON for every other
-    // node to deliver to its own stream-events subscribers and plugins.
+    // node to deliver to its own stream-events subscribers and plugins. May
+    // also carry index_update.
     EVENT = 4;
+    // Documents the writing node reindexed without a ref update behind them,
+    // for every other node to reindex in its own index.
+    INDEX = 5;
   }
 
   uint64 seq = 1;
@@ -82,6 +86,21 @@ message LogEntry {
   // Present for EVENT: the Gerrit events, one JSON document each, in the order
   // they were fired. Replayed by every node whose writer host differs.
   repeated string event_json = 11;
+  // Present for INDEX, and for an EVENT entry whose batch also reindexed
+  // documents. Replayed by every node whose writer host differs.
+  IndexUpdate index_update = 12;
+}
+
+// Documents one node reindexed with no ref update behind them: an explicit
+// reindex, a mergeability recomputation. Ref-driven index work needs no
+// journal; every node derives it from REF_UPDATE entries. Changes are numbers
+// of the entry's repository; accounts and groups are journaled in All-Users,
+// projects in All-Projects.
+message IndexUpdate {
+  repeated int32 changes = 1;
+  repeated int32 accounts = 2;
+  repeated string groups = 3;
+  repeated string projects = 4;
 }
 
 message RefUpdate {

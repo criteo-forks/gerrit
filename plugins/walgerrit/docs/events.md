@@ -1,4 +1,4 @@
-# Events in the WAL
+# Events and index updates in the WAL
 
 WalGerrit forwards Gerrit notifications between nodes through the WAL. These notifications are
 best effort. The logical ref updates used to maintain search indexes have a stronger guarantee:
@@ -6,7 +6,7 @@ they commit with the ref transaction itself. See [Index events](index-events.md)
 
 ## Notifications follow the write
 
-`WalEventJournal` listens for local Gerrit events and serializes them with Gerrit's event Gson.
+`WalJournal` listens for local Gerrit events and serializes them with Gerrit's event Gson.
 It buffers events by project; events without a project go to `All-Projects`. A background worker
 flushes every 200 ms. Reaching 100 buffered events for one project schedules an earlier flush.
 Each batch becomes an `EVENT` entry containing `event_json`.
@@ -32,6 +32,19 @@ Replay failures are logged and skipped, allowing the cursor to advance. A crash 
 but before cursor persistence can cause duplicate delivery. A full index rebuild seeds cursors
 at captured heads and skips older notifications; it does not reconstruct them from Git.
 
+## Reindexed documents ride in the same journal
+
+A node also reindexes documents with no ref update behind them: the mergeable endpoint,
+`gerrit index changes`, `POST /changes/{id}/index`, `autoReindexIfStale`. `WalJournal` listens for
+indexed changes, accounts, groups and projects and adds their ids to the batch (`index_update`).
+A batch with no events becomes an `INDEX` entry. Changes are journaled in their repository,
+accounts and groups in `All-Users`, projects in `All-Projects`.
+
+The tailer reindexes those documents on foreign nodes, skipping a change that a ref transaction in
+the same sweep reindexes anyway: a local write journals both, and followers index the change once.
+A batch whose publication fails keeps its index update for the next batch, unlike its events.
+Replay and index rebuilds run under `EventReplay`, so a reindex is never journaled back.
+
 ## Consumers must tolerate loss and duplication
 
 A committed notification normally reaches foreign nodes on a later sweep, after preceding ref
@@ -51,7 +64,7 @@ or implement deduplication. The sweep lease alone is not an exactly-once deliver
   eventJournalEnabled = true
 ```
 
-Setting this to `false` stops this node from journaling local events. It does **not** disable
+Setting this to `false` stops this node from journaling local events and reindexed documents. It does **not** disable
 foreign-event replay in the current tailer. Disabling `indexTailerEnabled` stops both index
 catch-up and event replay, so it also removes cross-node search convergence on that node.
 

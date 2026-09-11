@@ -16,9 +16,11 @@ A crash between index application and cursor persistence causes replay. Index re
 deletions are idempotent, so delivery can be at least once. A failed index or cursor write leaves
 the entry unacknowledged.
 
-`EVENT` entries share the log and cursor but carry best-effort Gerrit notifications. The tailer
-replays foreign-host entries and skips its own host's notifications. Their failures and rebuild
-behavior differ from index intents; see [Events](events.md).
+`EVENT` and `INDEX` entries share the log and cursor. `EVENT` entries carry best-effort Gerrit
+notifications; both may carry the documents the writing node reindexed without a ref update, which
+the tailer reindexes here, minus changes a ref transaction in the same sweep covers. The tailer
+replays foreign-host entries and skips its own host's. Their failures and rebuild behavior differ
+from index intents; see [Events](events.md).
 
 ## Ref-to-index mapping
 

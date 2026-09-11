@@ -14,8 +14,10 @@
 
 package dev.walgerrit;
 
+import com.google.gerrit.common.Nullable;
 import dev.walgerrit.ManifestCache.VersionedManifest;
 import dev.walgerrit.ObjectStore.ConditionalRead;
+import dev.walgerrit.proto.StorageProto.IndexUpdate;
 import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
@@ -339,7 +341,12 @@ final class ManifestStore {
       RefTransaction refTransaction)
       throws IOException {
     return publish(
-        expectedRefRevision, additions, supersedes, requireExactRefRevision, refTransaction, List.of());
+        expectedRefRevision,
+        additions,
+        supersedes,
+        requireExactRefRevision,
+        refTransaction,
+        (sequence, transactionId) -> {});
   }
 
   /** Registers each attempt before its CAS so local read snapshots can resolve in-flight packs. */
@@ -358,40 +365,29 @@ final class ManifestStore {
         requireExactRefRevision,
         refTransaction,
         List.of(),
+        null,
         false,
         beforeCas);
   }
 
-  /**
-   * Appends an EVENT entry carrying Gerrit events fired on this node, so every other node can
-   * deliver them to its own listeners. Nothing else in the manifest changes: no pack, no ref
-   * revision. The entry lands after the ref update that caused the events, because that update
-   * was published before Gerrit fired them.
-   */
   Manifest publishEvents(List<String> eventJson) throws IOException {
-    if (eventJson.isEmpty()) {
-      return current();
-    }
-    return publish(0, List.of(), List.of(), false, null, eventJson);
+    return publishJournal(eventJson, null);
   }
 
-  private Manifest publish(
-      long expectedRefRevision,
-      Collection<PackRef> additions,
-      Collection<String> supersedes,
-      boolean requireExactRefRevision,
-      RefTransaction refTransaction,
-      List<String> eventJson)
+  /**
+   * Appends a journal entry: the Gerrit events fired on this node, for every other node to deliver
+   * to its own listeners, and the documents this node reindexed with no ref update behind them,
+   * for every other node to reindex. Nothing else in the manifest changes: no pack, no ref
+   * revision. The entry lands after the ref update that caused the events, because that update was
+   * published before Gerrit fired them. The kind is EVENT when there are events, INDEX otherwise.
+   */
+  Manifest publishJournal(List<String> eventJson, @Nullable IndexUpdate indexUpdate)
       throws IOException {
+    if (eventJson.isEmpty() && indexUpdate == null) {
+      return current();
+    }
     return publish(
-        expectedRefRevision,
-        additions,
-        supersedes,
-        requireExactRefRevision,
-        refTransaction,
-        eventJson,
-        false,
-        (sequence, transactionId) -> {});
+        0, List.of(), List.of(), false, null, eventJson, indexUpdate, false, (s, id) -> {});
   }
 
   private Manifest publish(
@@ -401,6 +397,7 @@ final class ManifestStore {
       boolean requireExactRefRevision,
       RefTransaction refTransaction,
       List<String> eventJson,
+      @Nullable IndexUpdate indexUpdate,
       boolean fence,
       BiConsumer<Long, String> beforeCas)
       throws IOException {
@@ -433,17 +430,15 @@ final class ManifestStore {
           && additions.isEmpty()
           && supersedes.isEmpty()
           && refTransaction == null
-          && eventJson.isEmpty()) {
+          && eventJson.isEmpty()
+          && indexUpdate == null) {
         return current;
       }
       boolean changesRefs = changesRefs(additions, supersedes, current);
       LogEntry.Builder entry =
           LogEntry.newBuilder()
               .setSeq(sequence)
-              .setKind(
-                  eventJson.isEmpty()
-                      ? entryKind(supersedes, requireExactRefRevision)
-                      : LogEntry.Kind.EVENT)
+              .setKind(entryKind(supersedes, requireExactRefRevision, eventJson, indexUpdate))
               .addAllSupersedes(supersedes)
               .addAllEventJson(eventJson)
               .setCreatedAtEpochMillis(now)
@@ -453,6 +448,9 @@ final class ManifestStore {
               .setPreviousTransactionId(current.getHeadTransactionId());
       if (refTransaction != null) {
         entry.setRefTransaction(refTransaction);
+      }
+      if (indexUpdate != null) {
+        entry.setIndexUpdate(indexUpdate);
       }
       for (PackRef addition : additions) {
         PackRef published = addition.toBuilder().setSeq(sequence).build();
@@ -528,7 +526,7 @@ final class ManifestStore {
       // Absence from an earlier snapshot is not failure: the timed-out request may still run.
       // A data-free WAL entry fences its version. If the original wins first, the fence's CAS
       // retry follows that history instead. Neither outcome changes refs or adds any pack.
-      fresh = publish(0, List.of(), List.of(), false, null, List.of(), true, (seq, id) -> {});
+      fresh = publish(0, List.of(), List.of(), false, null, List.of(), null, true, (seq, id) -> {});
     }
     if (fresh.getHeadSeq() < sequence) {
       throw new IOException("Manifest history precedes unresolved publication " + transactionId);
@@ -831,7 +829,16 @@ final class ManifestStore {
   }
 
   private static LogEntry.Kind entryKind(
-      Collection<String> supersedes, boolean logicalRefUpdate) {
+      Collection<String> supersedes,
+      boolean logicalRefUpdate,
+      List<String> eventJson,
+      @Nullable IndexUpdate indexUpdate) {
+    if (!eventJson.isEmpty()) {
+      return LogEntry.Kind.EVENT;
+    }
+    if (indexUpdate != null) {
+      return LogEntry.Kind.INDEX;
+    }
     if (logicalRefUpdate) {
       return LogEntry.Kind.REF_UPDATE;
     }

@@ -14,18 +14,26 @@
 
 package dev.walgerrit;
 
+import com.google.gerrit.extensions.events.AccountIndexedListener;
+import com.google.gerrit.extensions.events.ChangeIndexedListener;
+import com.google.gerrit.extensions.events.GroupIndexedListener;
+import com.google.gerrit.extensions.events.ProjectIndexedListener;
 import com.google.gerrit.extensions.registration.DynamicSet;
-import com.google.gerrit.server.events.EventListener;
-
 import com.google.gerrit.lifecycle.LifecycleModule;
+import com.google.gerrit.server.events.EventListener;
 
 /** Installs WAL-driven secondary-index convergence in Gerrit's system injector. */
 public final class WalGitIndexModule extends LifecycleModule {
   @Override
   protected void configure() {
     listener().to(IndexEventTailer.class);
-    // Events this node fires travel in the WAL to the other nodes' tailers.
-    DynamicSet.bind(binder(), EventListener.class).to(WalEventJournal.class);
-    listener().to(WalEventJournal.class);
+    // What this node does travels in the WAL to the other nodes' tailers: the events it fires and
+    // the documents it reindexes with no ref update behind them.
+    DynamicSet.bind(binder(), EventListener.class).to(WalJournal.class);
+    DynamicSet.bind(binder(), ChangeIndexedListener.class).to(WalJournal.class);
+    DynamicSet.bind(binder(), AccountIndexedListener.class).to(WalJournal.class);
+    DynamicSet.bind(binder(), GroupIndexedListener.class).to(WalJournal.class);
+    DynamicSet.bind(binder(), ProjectIndexedListener.class).to(WalJournal.class);
+    listener().to(WalJournal.class);
   }
 }

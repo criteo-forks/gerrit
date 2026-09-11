@@ -14,7 +14,7 @@ qualification for every deployment.
 | Indexes | Durable ref payloads; node-local replay cursors; startup catch-up; readiness; automatic rebuild for stale cursors. | [Index events](index-events.md) |
 | Maintenance | Geometric object compaction; tiered reftable merging; leases; grace-based reclamation; heap-sized JGit block cache. | [Compaction](compaction.md) |
 | Import | Bare-repository import; optional staging, repack and connectivity checks; ref verification; offline cursor seeding. | [Import](import.md) |
-| Notifications | Best-effort cross-node forwarding through separate WAL entries. | [Events](events.md) |
+| Notifications | Best-effort cross-node event forwarding; reindexed documents journaled so every node's index follows. | [Events](events.md) |
 | Sessions | Optional signed cookies and a shared signing key. | [Web sessions](web-sessions.md) |
 | Packaging | Matched WAR/JAR bundles, checksums, smoke testing and tagged prereleases. | [Deployment bundle](artifact-bundle.md) |
 

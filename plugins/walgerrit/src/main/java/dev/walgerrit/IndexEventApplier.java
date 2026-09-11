@@ -15,9 +15,17 @@
 package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
+import dev.walgerrit.proto.StorageProto.IndexUpdate;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
+import java.util.Set;
 
-/** Consumer boundary for idempotently applying committed ref transactions to derived state. */
+/** Consumer boundary for idempotently applying committed WAL entries to derived state. */
 interface IndexEventApplier {
   void apply(Project.NameKey project, RefTransaction transaction);
+
+  /**
+   * Reindexes documents another node reindexed with no ref update behind them. Changes in {@code
+   * alreadyReindexed} were reindexed from ref transactions of the same sweep and are skipped.
+   */
+  default void reindex(Project.NameKey project, IndexUpdate update, Set<Integer> alreadyReindexed) {}
 }

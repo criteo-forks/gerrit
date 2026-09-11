@@ -35,6 +35,7 @@ import com.google.gerrit.server.util.OneOffRequestContext;
 import com.google.inject.Inject;
 import com.google.inject.Provider;
 import com.google.inject.Singleton;
+import dev.walgerrit.proto.StorageProto.IndexUpdate;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
 import dev.walgerrit.proto.StorageProto.RefUpdate;
 import java.util.LinkedHashMap;
@@ -85,8 +86,30 @@ final class GerritIndexEventApplier implements IndexEventApplier {
 
   @Override
   public void apply(Project.NameKey project, RefTransaction transaction) {
-    try (ManualRequestContext ignored = requestContext.open()) {
+    try (ManualRequestContext ignored = requestContext.open();
+        EventReplay.Scope replaying = EventReplay.enter()) {
       applyInContext(project, transaction);
+    }
+  }
+
+  @Override
+  public void reindex(Project.NameKey project, IndexUpdate update, Set<Integer> alreadyReindexed) {
+    try (ManualRequestContext ignored = requestContext.open();
+        EventReplay.Scope replaying = EventReplay.enter()) {
+      for (int number : update.getChangesList()) {
+        if (!alreadyReindexed.contains(number)) {
+          changeIndexer.index(project, Change.id(number));
+        }
+      }
+      for (int id : update.getAccountsList()) {
+        accountIndexer.index(Account.id(id));
+      }
+      for (String uuid : update.getGroupsList()) {
+        groupIndexer.index(AccountGroup.uuid(uuid));
+      }
+      for (String name : update.getProjectsList()) {
+        projectIndexer.index(Project.nameKey(name));
+      }
     }
   }
 

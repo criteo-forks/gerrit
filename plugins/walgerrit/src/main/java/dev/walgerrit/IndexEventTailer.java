@@ -14,6 +14,7 @@
 
 package dev.walgerrit;
 
+import com.google.gerrit.entities.Change;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.extensions.events.LifecycleListener;
 import com.google.gerrit.index.IndexConfig;
@@ -26,11 +27,14 @@ import dev.walgerrit.ManifestCache.VersionedManifest;
 import dev.walgerrit.proto.StorageProto.IndexCursor;
 import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.Manifest;
+import dev.walgerrit.proto.StorageProto.RefUpdate;
 import java.io.IOException;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -293,15 +297,13 @@ final class IndexEventTailer implements LifecycleListener {
             cursor.getTransactionId(),
             manifest,
             repositories.configuration().indexReplayLimit());
+    Set<Integer> reindexedByRefs = changesTouched(entries);
     int applied = 0;
     int replayed = 0;
+    int reindexed = 0;
     for (LogEntry entry : entries) {
-      if (entry.getKind() == LogEntry.Kind.EVENT) {
-        if (foreignWriter.test(entry.getWriter())) {
-          replayer.replay(project, entry);
-          replayed++;
-        }
-      } else if (entry.getKind() == LogEntry.Kind.REF_UPDATE) {
+      boolean foreign = foreignWriter.test(entry.getWriter());
+      if (entry.getKind() == LogEntry.Kind.REF_UPDATE) {
         if (!entry.hasRefTransaction()) {
           throw new IOException(
               "REF_UPDATE WAL entry "
@@ -313,17 +315,26 @@ final class IndexEventTailer implements LifecycleListener {
         applier.apply(project, entry.getRefTransaction());
         applied++;
       }
+      if (foreign && entry.getEventJsonCount() > 0) {
+        replayer.replay(project, entry);
+        replayed++;
+      }
+      if (foreign && entry.hasIndexUpdate()) {
+        applier.reindex(project, entry.getIndexUpdate(), reindexedByRefs);
+        reindexed++;
+      }
       cursorStore.write(entry.getSeq(), entry.getTransactionId());
     }
     if (!entries.isEmpty()) {
       logger.info(
-          "WalGerrit index-event replay advanced {} from {} to {} ({} ref transactions, {} event"
-              + " entries from other nodes)",
+          "WalGerrit index-event replay advanced {} from {} to {} ({} ref transactions; {} event"
+              + " entries and {} index updates from other nodes)",
           project.get(),
           cursor.getSequence(),
           manifest.getHeadSeq(),
           applied,
-          replayed);
+          replayed,
+          reindexed);
     }
     if (!entries.isEmpty() || !versioned.version().equals(cursor.getManifestVersion())) {
       // At the head now; remember which manifest version that is.
@@ -335,6 +346,29 @@ final class IndexEventTailer implements LifecycleListener {
     // applied.
     caughtUpVersions.put(project, versioned.version());
     return applied;
+  }
+
+  /**
+   * The changes the ref transactions among {@code entries} reindex on every node. An index update
+   * naming them in the same sweep is redundant.
+   */
+  private static Set<Integer> changesTouched(List<LogEntry> entries) {
+    Set<Integer> changes = new HashSet<>();
+    for (LogEntry entry : entries) {
+      if (entry.getKind() != LogEntry.Kind.REF_UPDATE) {
+        continue;
+      }
+      for (RefUpdate update : entry.getRefTransaction().getUpdatesList()) {
+        Change.Id id = Change.Id.fromRef(update.getName());
+        if (id == null) {
+          id = Change.Id.fromAllUsersRef(update.getName());
+        }
+        if (id != null) {
+          changes.add(id.get());
+        }
+      }
+    }
+    return changes;
   }
 
   /**
