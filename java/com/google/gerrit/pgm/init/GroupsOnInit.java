@@ -14,17 +14,15 @@
 
 package com.google.gerrit.pgm.init;
 
-import static com.google.common.base.Preconditions.checkArgument;
-
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
-import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.entities.AccountGroup;
 import com.google.gerrit.entities.GroupReference;
 import com.google.gerrit.entities.InternalGroup;
 import com.google.gerrit.exceptions.NoSuchGroupException;
 import com.google.gerrit.pgm.init.api.AllUsersNameOnInitProvider;
+import com.google.gerrit.pgm.init.api.GitRepositoryManagerOnInit;
 import com.google.gerrit.pgm.init.api.InitFlags;
 import com.google.gerrit.server.GerritPersonIdentProvider;
 import com.google.gerrit.server.config.AllUsersName;
@@ -37,17 +35,13 @@ import com.google.gerrit.server.group.db.GroupConfig;
 import com.google.gerrit.server.group.db.GroupDelta;
 import com.google.gerrit.server.group.db.GroupNameNotes;
 import com.google.inject.Inject;
-import java.io.File;
 import java.io.IOException;
-import java.nio.file.Path;
 import java.time.Instant;
 import java.util.stream.Stream;
 import org.eclipse.jgit.errors.ConfigInvalidException;
-import org.eclipse.jgit.internal.storage.file.FileRepository;
+import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Repository;
-import org.eclipse.jgit.lib.RepositoryCache;
-import org.eclipse.jgit.util.FS;
 
 /**
  * A database accessor for calls related to groups.
@@ -62,12 +56,18 @@ public class GroupsOnInit {
   private final InitFlags flags;
   private final SitePaths site;
   private final AllUsersName allUsers;
+  private final GitRepositoryManagerOnInit repositoryManager;
 
   @Inject
-  public GroupsOnInit(InitFlags flags, SitePaths site, AllUsersNameOnInitProvider allUsers) {
+  public GroupsOnInit(
+      InitFlags flags,
+      SitePaths site,
+      AllUsersNameOnInitProvider allUsers,
+      GitRepositoryManagerOnInit repositoryManager) {
     this.flags = flags;
     this.site = site;
     this.allUsers = new AllUsersName(allUsers.get());
+    this.repositoryManager = repositoryManager;
   }
 
   /**
@@ -81,17 +81,15 @@ public class GroupsOnInit {
    */
   public InternalGroup getExistingGroup(GroupReference groupReference)
       throws NoSuchGroupException, IOException, ConfigInvalidException {
-    File allUsersRepoPath = getPathToAllUsersRepository();
-    if (allUsersRepoPath != null) {
-      try (Repository allUsersRepo = new FileRepository(allUsersRepoPath)) {
-        AccountGroup.UUID groupUuid = groupReference.getUUID();
-        GroupConfig groupConfig = GroupConfig.loadForGroup(allUsers, allUsersRepo, groupUuid);
-        return groupConfig
-            .getLoadedGroup()
-            .orElseThrow(() -> new NoSuchGroupException(groupReference.getUUID()));
-      }
+    try (Repository allUsersRepo = repositoryManager.openRepository(allUsers)) {
+      AccountGroup.UUID groupUuid = groupReference.getUUID();
+      GroupConfig groupConfig = GroupConfig.loadForGroup(allUsers, allUsersRepo, groupUuid);
+      return groupConfig
+          .getLoadedGroup()
+          .orElseThrow(() -> new NoSuchGroupException(groupReference.getUUID()));
+    } catch (RepositoryNotFoundException e) {
+      throw new NoSuchGroupException(groupReference.getUUID(), e);
     }
-    throw new NoSuchGroupException(groupReference.getUUID());
   }
 
   /**
@@ -102,13 +100,11 @@ public class GroupsOnInit {
    * @throws ConfigInvalidException if the data in NoteDb is in an incorrect format
    */
   public Stream<GroupReference> getAllGroupReferences() throws IOException, ConfigInvalidException {
-    File allUsersRepoPath = getPathToAllUsersRepository();
-    if (allUsersRepoPath != null) {
-      try (Repository allUsersRepo = new FileRepository(allUsersRepoPath)) {
-        return GroupNameNotes.loadAllGroups(allUsersRepo).stream();
-      }
+    try (Repository allUsersRepo = repositoryManager.openRepository(allUsers)) {
+      return GroupNameNotes.loadAllGroups(allUsersRepo).stream();
+    } catch (RepositoryNotFoundException e) {
+      return Stream.empty();
     }
-    return Stream.empty();
   }
 
   /**
@@ -124,11 +120,10 @@ public class GroupsOnInit {
    */
   public void addGroupMember(AccountGroup.UUID groupUuid, Account account)
       throws NoSuchGroupException, IOException, ConfigInvalidException {
-    File allUsersRepoPath = getPathToAllUsersRepository();
-    if (allUsersRepoPath != null) {
-      try (Repository repository = new FileRepository(allUsersRepoPath)) {
-        addGroupMemberInNoteDb(repository, groupUuid, account);
-      }
+    try (Repository repository = repositoryManager.openRepository(allUsers)) {
+      addGroupMemberInNoteDb(repository, groupUuid, account);
+    } catch (RepositoryNotFoundException e) {
+      // Preserve init's behavior when All-Users has not been created yet.
     }
   }
 
@@ -144,13 +139,6 @@ public class GroupsOnInit {
     groupConfig.setGroupDelta(groupDelta, auditLogFormatter);
 
     commit(repository, groupConfig, group.getCreatedOn());
-  }
-
-  @Nullable
-  private File getPathToAllUsersRepository() {
-    Path basePath = site.resolve(flags.cfg.getString("gerrit", null, "basePath"));
-    checkArgument(basePath != null, "gerrit.basePath must be configured");
-    return RepositoryCache.FileKey.resolve(basePath.resolve(allUsers.get()).toFile(), FS.DETECTED);
   }
 
   private static GroupDelta getMemberAdditionDelta(Account account) {

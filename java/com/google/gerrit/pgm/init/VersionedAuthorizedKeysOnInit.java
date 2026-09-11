@@ -21,12 +21,12 @@ import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.pgm.init.api.AllUsersNameOnInitProvider;
+import com.google.gerrit.pgm.init.api.GitRepositoryManagerOnInit;
 import com.google.gerrit.pgm.init.api.InitFlags;
 import com.google.gerrit.pgm.init.api.VersionedMetaDataOnInit;
 import com.google.gerrit.server.account.AccountSshKey;
 import com.google.gerrit.server.account.AuthorizedKeys;
 import com.google.gerrit.server.account.VersionedAuthorizedKeys;
-import com.google.gerrit.server.config.SitePaths;
 import com.google.inject.Inject;
 import com.google.inject.assistedinject.Assisted;
 import java.io.IOException;
@@ -46,10 +46,10 @@ public class VersionedAuthorizedKeysOnInit extends VersionedMetaDataOnInit {
   @Inject
   public VersionedAuthorizedKeysOnInit(
       AllUsersNameOnInitProvider allUsers,
-      SitePaths site,
       InitFlags flags,
+      GitRepositoryManagerOnInit repositoryManager,
       @Assisted Account.Id accountId) {
-    super(flags, site, allUsers.get(), RefNames.refsUsers(accountId));
+    super(flags, repositoryManager, allUsers.get(), RefNames.refsUsers(accountId));
     this.accountId = accountId;
   }
 

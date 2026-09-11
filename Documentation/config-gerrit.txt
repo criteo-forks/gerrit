@@ -2815,6 +2815,13 @@ Classes are resolved using the primary Gerrit class loader, hence the
 class needs to be either declared in Gerrit or an additional JAR
 located under the `/lib` directory.
 +
+During `init`, these modules are loaded after configuration is saved.
+Schema creation and upgrades, followed by the init steps' `postRun`
+methods, use the configured `GitRepositoryManager`. Init helpers use
+local repositories while collecting configuration, before that manager
+is available. Init steps that read or write repository data should do so
+in `postRun` through `GitRepositoryManagerOnInit`.
++
 By default unset.
 
 [[gerrit.installIndexModule]]gerrit.installIndexModule::

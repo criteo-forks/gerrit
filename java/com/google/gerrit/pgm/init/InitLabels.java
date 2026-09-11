@@ -55,8 +55,6 @@ public class InitLabels implements InitStep {
   private ProjectConfig.Factory projectConfigFactory;
   private SystemGroupBackend systemGroupBackend;
 
-  private boolean installVerified;
-
   @Inject
   InitLabels(
       ConsoleUI ui,
@@ -83,19 +81,23 @@ public class InitLabels implements InitStep {
   }
 
   @Override
-  public void run() throws Exception {
-    Config cfg = allProjectsConfig.load().getConfig();
-    if (cfg == null || !cfg.getSubsections(KEY_LABEL).contains(VERIFIED)) {
-      ui.header("Review Labels");
-      installVerified = ui.yesno(false, "Install Verified label");
-    }
-  }
+  public void run() {}
 
   @Override
   public void postRun() throws Exception {
-    if (installVerified) {
-      installVerified();
+    // The configured repository manager is available only after run(). Decide whether to offer
+    // the label here so a stale local repository cannot hide or overwrite its configuration.
+    if (shouldInstallVerified()) {
+      ui.header("Review Labels");
+      if (ui.yesno(false, "Install Verified label")) {
+        installVerified();
+      }
     }
+  }
+
+  private boolean shouldInstallVerified() throws IOException, ConfigInvalidException {
+    Config cfg = allProjectsConfig.load().getConfig();
+    return cfg == null || !cfg.getSubsections(KEY_LABEL).contains(VERIFIED);
   }
 
   private void installVerified() throws IOException, ConfigInvalidException {

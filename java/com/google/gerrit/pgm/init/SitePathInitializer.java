@@ -24,10 +24,12 @@ import static com.google.gerrit.pgm.init.api.InitUtil.version;
 import com.google.gerrit.common.FileUtil;
 import com.google.gerrit.common.Nullable;
 import com.google.gerrit.pgm.init.api.ConsoleUI;
+import com.google.gerrit.pgm.init.api.GitRepositoryManagerOnInit;
 import com.google.gerrit.pgm.init.api.InitFlags;
 import com.google.gerrit.pgm.init.api.InitStep;
 import com.google.gerrit.pgm.init.api.Section;
 import com.google.gerrit.server.config.SitePaths;
+import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.mail.EmailModule;
 import com.google.inject.Binding;
 import com.google.inject.Inject;
@@ -47,6 +49,7 @@ public class SitePathInitializer {
   private final List<InitStep> steps;
   private final Section.Factory sectionFactory;
   private final SecureStoreInitData secureStoreInitData;
+  private final GitRepositoryManagerOnInit repositoryManager;
 
   @Inject
   public SitePathInitializer(
@@ -55,11 +58,13 @@ public class SitePathInitializer {
       final InitFlags flags,
       final SitePaths site,
       final Section.Factory sectionFactory,
+      final GitRepositoryManagerOnInit repositoryManager,
       @Nullable final SecureStoreInitData secureStoreInitData) {
     this.ui = ui;
     this.flags = flags;
     this.site = site;
     this.sectionFactory = sectionFactory;
+    this.repositoryManager = repositoryManager;
     this.secureStoreInitData = secureStoreInitData;
     this.steps = stepsOf(injector);
   }
@@ -159,6 +164,7 @@ public class SitePathInitializer {
   }
 
   public void postRun(Injector injector) throws Exception {
+    repositoryManager.setDelegate(injector.getInstance(GitRepositoryManager.class));
     for (InitStep step : steps) {
       if (step instanceof InitPlugins && flags.skipPlugins) {
         continue;

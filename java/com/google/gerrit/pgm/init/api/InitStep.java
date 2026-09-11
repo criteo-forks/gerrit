@@ -18,6 +18,11 @@ package com.google.gerrit.pgm.init.api;
 public interface InitStep {
   void run() throws Exception;
 
-  /** Executed after the site has been initialized */
+  /**
+   * Executed after the schema has been initialized or upgraded.
+   *
+   * <p>Repository access belongs here, when {@link GitRepositoryManagerOnInit} uses the configured
+   * repository manager. During {@link #run()}, that manager is not yet available.
+   */
   default void postRun() throws Exception {}
 }
