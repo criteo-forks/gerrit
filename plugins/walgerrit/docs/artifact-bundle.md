@@ -6,7 +6,8 @@ the JAR supplies its WalGerrit storage and index modules.
 The build workflow tests the exact pair before uploading it. Its smoke test covers fresh init,
 reindex, daemon readiness, shutdown, compaction, restart, index rebuilding and import.
 `SOURCE_COMMIT` identifies the source revision, `GERRIT_VERSION` records `3.14.2`, and
-`SHA256SUMS` covers the WAR and JAR.
+`SHA256SUMS` covers the WAR and both JARs. `readonly.jar` is the readonly plugin built against this
+WAR; a shadow deployment loads it to refuse writes.
 
 ## Verify and install
 

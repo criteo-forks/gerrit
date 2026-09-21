@@ -69,8 +69,8 @@ jobs:
           AWS_REGION: us-east-1
         run: ./mvnw --batch-mode --no-transfer-progress verify
 
-      - name: Build Gerrit 3.14.2 release WAR
-        run: npx --yes @bazel/bazelisk build --config=java21 //:release
+      - name: Build the Gerrit 3.14.2 release WAR and the readonly plugin
+        run: npx --yes @bazel/bazelisk build --config=java21 //:release //plugins/readonly
 
       - name: Assemble the deployment bundle
         env:
@@ -79,13 +79,14 @@ jobs:
           mkdir -p dist
           cp bazel-bin/release.war dist/gerrit.war
           cp plugins/walgerrit/target/walgerrit-0.1.0-SNAPSHOT.jar dist/walgerrit.jar
+          cp bazel-bin/plugins/readonly/readonly.jar dist/readonly.jar
           cp plugins/walgerrit/docs/artifact-bundle.md dist/INSTALL.md
           printf '%s\n' "$SOURCE_COMMIT" > dist/SOURCE_COMMIT
           printf '%s\n' '3.14.2' > dist/GERRIT_VERSION
-          sha256sum dist/gerrit.war dist/walgerrit.jar \
+          sha256sum dist/gerrit.war dist/walgerrit.jar dist/readonly.jar \
             | sed 's#dist/##' > dist/SHA256SUMS
           tar -C dist -czf dist/walgerrit-bundle.tar.gz \
-            gerrit.war walgerrit.jar INSTALL.md SOURCE_COMMIT GERRIT_VERSION SHA256SUMS
+            gerrit.war walgerrit.jar readonly.jar INSTALL.md SOURCE_COMMIT GERRIT_VERSION SHA256SUMS
 
       - name: Exercise the exact bundle
         env:
@@ -130,6 +131,7 @@ jobs:
           gh release create --repo "$GITHUB_REPOSITORY" "$RELEASE_TAG" \
             dist/gerrit.war \
             dist/walgerrit.jar \
+            dist/readonly.jar \
             dist/SHA256SUMS \
             dist/SOURCE_COMMIT \
             dist/GERRIT_VERSION \

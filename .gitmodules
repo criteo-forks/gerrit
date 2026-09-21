@@ -65,3 +65,6 @@
 	path = polymer-bridges
 	url = https://gerrit.googlesource.com/polymer-bridges
 	branch = .
+[submodule "plugins/readonly"]
+	path = plugins/readonly
+	url = https://gerrit.googlesource.com/plugins/readonly
