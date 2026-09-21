@@ -19,20 +19,24 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * The peers a node gossips with: fixed {@code host[:port]} entries and, for a StatefulSet, one DNS
- * name whose address records are every pod, as a Kubernetes headless service answers. Names are
- * resolved again once the refresh interval has passed, so a replaced pod is reached without a
- * restart. A resolution that yields nothing keeps the previous answer.
+ * Resolves fixed peers and a DNS service name. Each source keeps its last successful addresses when
+ * a refresh fails or returns no records.
  */
 final class GossipPeers {
   private static final Logger logger = LoggerFactory.getLogger(GossipPeers.class);
+
+  interface Resolver {
+    InetAddress[] resolve(String host) throws UnknownHostException;
+  }
 
   /** One configured peer; without an explicit port it takes the cluster's gossip port. */
   record Peer(String host, int port) {
@@ -47,6 +51,8 @@ final class GossipPeers {
   private final int defaultPort;
   private final long refreshMillis;
   private final Clock clock;
+  private final Resolver resolver;
+  private final Map<Peer, List<InetSocketAddress>> lastAnswers = new HashMap<>();
   private volatile List<InetSocketAddress> resolved = List.of();
   private volatile long resolvedAtMillis;
   private volatile boolean resolvedOnce;
@@ -57,11 +63,22 @@ final class GossipPeers {
    */
   GossipPeers(
       List<String> peers, String dnsName, int defaultPort, Duration refreshInterval, Clock clock) {
+    this(peers, dnsName, defaultPort, refreshInterval, clock, InetAddress::getAllByName);
+  }
+
+  GossipPeers(
+      List<String> peers,
+      String dnsName,
+      int defaultPort,
+      Duration refreshInterval,
+      Clock clock,
+      Resolver resolver) {
     this.fixed = peers.stream().map(peer -> parse(peer, defaultPort)).toList();
     this.dnsName = dnsName;
     this.defaultPort = defaultPort;
     this.refreshMillis = Math.max(0, refreshInterval.toMillis());
     this.clock = clock;
+    this.resolver = resolver;
   }
 
   static GossipPeers fromConfiguration(WalGitConfiguration configuration, Clock clock) {
@@ -144,21 +161,26 @@ final class GossipPeers {
     if (dnsName != null) {
       addAll(addresses, dnsName, defaultPort);
     }
-    if (!addresses.isEmpty() || resolved.isEmpty()) {
-      resolved = List.copyOf(addresses);
-    }
+    resolved = List.copyOf(addresses);
     resolvedAtMillis = now;
     resolvedOnce = true;
   }
 
-  private static void addAll(Set<InetSocketAddress> into, String host, int port) {
+  private void addAll(Set<InetSocketAddress> into, String host, int port) {
+    Peer peer = new Peer(host, port);
     try {
-      for (InetAddress address : InetAddress.getAllByName(host)) {
-        into.add(new InetSocketAddress(address, port));
+      InetAddress[] addresses = resolver.resolve(host);
+      if (addresses.length > 0) {
+        lastAnswers.put(
+            peer,
+            java.util.Arrays.stream(addresses)
+                .map(address -> new InetSocketAddress(address, port))
+                .toList());
       }
     } catch (UnknownHostException unknown) {
       logger.warn("WalGerrit gossip cannot resolve peer {}; keeping the previous answer", host);
     }
+    into.addAll(lastAnswers.getOrDefault(peer, List.of()));
   }
 
   @Override

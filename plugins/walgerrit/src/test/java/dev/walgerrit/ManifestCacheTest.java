@@ -68,7 +68,7 @@ class ManifestCacheTest {
     ManifestCache cache = new ManifestCache();
     cache.offer("repo", new VersionedManifest(Manifest.newBuilder().setRevision(1).build(), "v1"));
     assertTrue(cache.expect("repo", "v2", 2));
-    cache.markCurrent("repo", 1_000);
+    cache.markCurrent("repo", cache.expectation("repo"), 1_000);
     assertFalse(cache.expecting("repo"));
     assertTrue(cache.validatedWithin("repo", 60_000, 1_000));
 

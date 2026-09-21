@@ -21,14 +21,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
 import dev.walgerrit.ManifestCache.VersionedManifest;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicReference;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.Repository;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Two managers over one shared store stand in for two Gerrit nodes: each has its own node-wide
@@ -38,6 +44,65 @@ class ManifestFreshnessTest {
   private static final String MAIN = Constants.R_HEADS + "main";
 
   @TempDir Path root;
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void unchangedReadPreservesHintsReceivedAfterTheStoreAnswered(boolean alreadyExpecting)
+      throws Exception {
+    WalGitRepositoryManager writer = node("writer", "0");
+    Project.NameKey project = Project.nameKey("platform/in-flight-read");
+    writer.createRepository(project).close();
+    ObjectStore shared = new FileObjectStore(root.resolve("shared-store"));
+    AtomicReference<Executable> afterRead = new AtomicReference<>();
+    ObjectStore delayed =
+        (ObjectStore)
+            Proxy.newProxyInstance(
+                ObjectStore.class.getClassLoader(),
+                new Class<?>[] {ObjectStore.class},
+                (proxy, method, args) -> {
+                  Object result;
+                  try {
+                    result = method.invoke(shared, args);
+                  } catch (InvocationTargetException failure) {
+                    throw failure.getCause();
+                  }
+                  if (method.getName().equals("getIfChanged")) {
+                    Executable action = afterRead.getAndSet(null);
+                    if (action != null) {
+                      action.execute();
+                    }
+                  }
+                  return result;
+                });
+    Config config = new Config();
+    config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
+    WalGitRepositoryManager reader =
+        new WalGitRepositoryManager(
+            WalGitConfiguration.from(config, root.resolve("reader")),
+            new StorageLayout(
+                delayed, root.resolve("reader-cache"), root.resolve("reader-cursors"), ""));
+    try (Repository writing = writer.openRepository(project);
+        Repository reading = reader.openRepository(project)) {
+      if (alreadyExpecting) {
+        reader.storage().expectManifest(project, "unconfirmed", 1);
+      }
+      AtomicReference<ObjectId> commit = new AtomicReference<>();
+      afterRead.set(
+          () -> {
+            commit.set(publishMain(writing, "after the read"));
+            VersionedManifest published =
+                writer.storage().manifestStore(project).refreshVersionedManifest();
+            reader
+                .storage()
+                .expectManifest(project, published.version(), published.manifest().getRevision());
+          });
+      reader.storage().manifestStore(project).refresh();
+      assertTrue(
+          reader.storage().manifestStore(project).expectingNewerManifest(),
+          "the earlier response cannot settle a later announcement");
+      assertEquals(commit.get(), reading.exactRef(MAIN).getObjectId());
+    }
+  }
 
   @Test
   void handleServesItsNodeViewUntilItRevalidates() throws Exception {
@@ -83,14 +148,16 @@ class ManifestFreshnessTest {
       VersionedManifest published =
           nodeA.storage().manifestStore(project).refreshVersionedManifest();
       assertTrue(
-          nodeB.storage()
+          nodeB
+              .storage()
               .expectManifest(project, published.version(), published.manifest().getRevision()));
 
       // The open handle's next lookup revalidates, with no open, scan or elapsed interval.
       assertEquals(commit, reader.exactRef(MAIN).getObjectId());
       assertFalse(nodeB.storage().manifestStore(project).expectingNewerManifest());
       assertFalse(
-          nodeB.storage()
+          nodeB
+              .storage()
               .expectManifest(project, published.version(), published.manifest().getRevision()),
           "an announcement of what the node already holds changes nothing");
     }

@@ -1,8 +1,7 @@
 # Roadmap
 
-WalGerrit implements the storage and convergence paths below. It remains experimental: an
-implemented feature and a passing test are evidence for a specific contract, not a production
-qualification for every deployment.
+WalGerrit remains experimental. The features below are implemented; deployment qualification
+still requires tests against the target storage service and configuration.
 
 ## Implemented
 

@@ -34,8 +34,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Every manifest lives under one {@code manifests/} prefix, apart from the repository's packs
  * and log entries under {@code repos/}. One paginated listing of that prefix therefore enumerates
- * every repository together with the current version of its manifest, which is how repositories
- * are discovered and how the index-event sweep finds the ones that changed without reading any.
+ * every repository together with the current version of its manifest, which is how repositories are
+ * discovered and how the index-event sweep finds the ones that changed without reading any.
  */
 final class StorageLayout {
   private static final Logger logger = LoggerFactory.getLogger(StorageLayout.class);
@@ -81,8 +81,7 @@ final class StorageLayout {
       long packFetchChunkSize) {
     this.objectStore = objectStore;
     this.packFetchChunkSize = packFetchChunkSize;
-    cacheRepositoriesPath =
-        cacheRoot.resolve(REPOSITORIES_DIRECTORY).toAbsolutePath().normalize();
+    cacheRepositoriesPath = cacheRoot.resolve(REPOSITORIES_DIRECTORY).toAbsolutePath().normalize();
     indexCursorRepositoriesPath =
         indexCursorRoot.resolve(REPOSITORIES_DIRECTORY).toAbsolutePath().normalize();
     String normalizedPrefix = prefix == null ? "" : prefix.replaceAll("/+$", "");
@@ -96,8 +95,8 @@ final class StorageLayout {
   }
 
   /**
-   * Whether the node-local cache directory is the store itself, as with the local backend. Then
-   * a cached file is the only copy, so nothing may evict it; only reclamation's grace rule deletes.
+   * Whether the node-local cache directory is the store itself, as with the local backend. Then a
+   * cached file is the only copy, so nothing may evict it; only reclamation's grace rule deletes.
    */
   boolean cacheIsStore() {
     return cacheIsStore;
@@ -152,7 +151,9 @@ final class StorageLayout {
     return new PrefixedObjectStore(objectStore, clusterPrefix);
   }
 
-  /** A lease every node competes for, such as {@code sweep}; lives under {@code leases/cluster/}. */
+  /**
+   * A lease every node competes for, such as {@code sweep}; lives under {@code leases/cluster/}.
+   */
   StoreLease clusterLease(String name) {
     return new StoreLease(
         objectStore,

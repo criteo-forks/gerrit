@@ -30,7 +30,7 @@ The local backend maps the store and file cache onto the same filesystem tree, w
 write locks under `.object-locks/`. The S3 backend keeps the shared objects beneath `s3Prefix` in
 the bucket and the cache beneath each node's `storagePath`.
 
-## The manifest grows with live data, not history
+## The manifest records live data
 
 Format version 3 records the repository name, SHA-1 object format, head sequence and transaction
 ID, overall revision, ref revision, writer, timestamp and live pack families. Each family records
@@ -57,7 +57,8 @@ leave unreferenced log objects.
 | `PACK` | File additions without a logical ref transaction; also used for import and recovery fences. |
 | `REF_UPDATE` | File changes and the complete logical ref transaction. |
 | `COMPACT` | Replacement files and the names they supersede. |
-| `EVENT` | Serialized Gerrit notifications. |
+| `EVENT` | Serialized Gerrit notifications, optionally with document IDs to reindex. |
+| `INDEX` | Document IDs to reindex without a ref update or public event. |
 
 A logical ref update records the ref name, old and new object IDs, and a new symbolic target when
 applicable. Several independent local batches can share one entry; their logical updates are

@@ -39,7 +39,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
-import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
@@ -131,9 +130,7 @@ class GossipEndpointTest {
       assertEquals(1, receiving.acceptedCount());
       assertEquals(1, delivered.get());
       assertTrue(
-          nodeB.storage()
-              .manifestStore(Project.nameKey("platform/peer"))
-              .expectingNewerManifest());
+          nodeB.storage().manifestStore(Project.nameKey("platform/peer")).expectingNewerManifest());
     } finally {
       receiving.stop();
     }

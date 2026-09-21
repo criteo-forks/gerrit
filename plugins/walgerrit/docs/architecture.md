@@ -44,10 +44,9 @@ Startup catches up before Gerrit opens its listeners. Later sweeps maintain read
 that cannot be replayed can trigger a full rebuild. Search convergence is asynchronous and has
 no global order across repositories. See [Index events](index-events.md).
 
-A node with peers configured also tells them over UDP what it just published. Their tailers
-replay that repository before their next sweep, and their open handles revalidate on their next
-read. The datagram is a hint; the store and the sweep remain the sources of truth. See
-[Peer wake-ups](gossip.md).
+After publication, a node with peers configured sends them a UDP hint. Receivers queue replay
+for that repository and revalidate open handles on their next read. The store remains
+authoritative; sweeps discover writes missed by gossip. See [Peer wake-ups](gossip.md).
 
 Public Gerrit notifications use separate, best-effort `EVENT` entries. Their delivery guarantee
 is weaker than the durable ref payload used for indexing. See [Events](events.md).

@@ -104,8 +104,8 @@ The store's manifest is authoritative. A handle revalidates it:
 2. At the start of each ref-transaction attempt, before expected-value validation.
 3. On `scanForRepoChanges`.
 4. During active reads when `manifestRevalidateInterval` has elapsed, `1 sec` by default.
-5. On the next read after a peer's wake-up named a manifest this node has not read, whatever
-   the interval. See [Peer wake-ups](gossip.md).
+5. On the next read after a peer announces a newer manifest, regardless of the interval.
+   See [Peer wake-ups](gossip.md).
 
 A read triggers the periodic check; there is no background timer. Setting the interval to `0`
 disables it; opens, ref transactions, explicit scans and peer wake-ups still revalidate.

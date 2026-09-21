@@ -21,11 +21,11 @@ manifest's store version, validate the ref generation and resolve uncertain writ
 
 ## Two tokens protect different state
 
-The **store version** is an opaque token, an ETag on S3. Conditional replacement against it
+The store version is an opaque token, an ETag on S3. Conditional replacement against it
 prevents lost manifest updates. The local backend provides equivalent exclusion through JVM and
 OS file locks beneath `.object-locks/`, followed by atomic replacement.
 
-The manifest's **`ref_revision`** identifies the live reftable stack. It advances on ref updates
+The manifest's `ref_revision` identifies the live reftable stack. It advances on ref updates
 and reftable compaction, but not on object-only additions. This lets an object flush coexist with
 a prepared ref transaction without invalidating its ref checks.
 
@@ -133,6 +133,7 @@ result of a particular execution.
 | Lost responses, delayed CAS, failed verification and recovery fencing | `PublicationFaultTest`, `PublicationRecoveryTest`, `RecoveryFaultTest` |
 | Queued/interrupted publishers and pending-pack snapshots | `GroupPublisherFailureTest` |
 | Manifest freshness and request counts | `ManifestFreshnessTest`, `ManifestCacheTest`, `ManifestReadCountTest` |
+| UDP notifications, authentication and peer discovery | `GossipEndpointTest`, `GossipCodecTest`, `GossipPeersTest` |
 | S3 conditional writes, listings, range reads and multipart upload | `S3ObjectStoreContractTest` |
 | Compaction, lease contention and grace intervals | `CompactorTest`, `StoreLeaseTest`, `SweepLeaseTest`, `ReclaimerRetentionTest` |
 | Index replay, cursor seeding and readiness | `IndexEventTailerTest`, `IndexCursorSeederTest` |

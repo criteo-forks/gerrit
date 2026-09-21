@@ -23,12 +23,56 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import dev.walgerrit.GossipPeers.Peer;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class GossipPeersTest {
+  @Test
+  void failedPeerKeepsItsAddressesWhileOtherPeersRefresh() throws Exception {
+    SteppingClock clock = new SteppingClock(Instant.EPOCH);
+    InetAddress first = InetAddress.getByName("192.0.2.1");
+    InetAddress second = InetAddress.getByName("192.0.2.2");
+    InetAddress replacement = InetAddress.getByName("192.0.2.3");
+    Map<String, InetAddress[]> answers = new HashMap<>();
+    answers.put("fixed", new InetAddress[] {first});
+    answers.put("service", new InetAddress[] {second});
+    GossipPeers peers =
+        new GossipPeers(
+            List.of("fixed:1000"),
+            "service",
+            3000,
+            Duration.ofSeconds(30),
+            clock,
+            host -> {
+              if (!answers.containsKey(host)) {
+                throw new UnknownHostException(host);
+              }
+              return answers.get(host);
+            });
+
+    assertEquals(
+        List.of(new InetSocketAddress(first, 1000), new InetSocketAddress(second, 3000)),
+        peers.addresses());
+    answers.remove("fixed");
+    answers.put("service", new InetAddress[] {replacement});
+    clock.advance(Duration.ofSeconds(30));
+    assertEquals(
+        List.of(new InetSocketAddress(first, 1000), new InetSocketAddress(replacement, 3000)),
+        peers.addresses());
+
+    answers.put("fixed", new InetAddress[] {second});
+    answers.put("service", new InetAddress[0]);
+    clock.advance(Duration.ofSeconds(30));
+    assertEquals(
+        List.of(new InetSocketAddress(second, 1000), new InetSocketAddress(replacement, 3000)),
+        peers.addresses());
+  }
+
   @Test
   void parsesHostsWithAndWithoutPorts() {
     assertEquals(new Peer("gerrit-1", 29419), GossipPeers.parse("gerrit-1", 29419));
@@ -45,8 +89,16 @@ class GossipPeersTest {
   void rejectsMalformedPeers() {
     for (String invalid :
         List.of(
-            "", "   ", ":29419", "gerrit-1:", "gerrit-1:0", "gerrit-1:65536", "gerrit-1:sshd",
-            "[::1", "[::1]x", "[]:5")) {
+            "",
+            "   ",
+            ":29419",
+            "gerrit-1:",
+            "gerrit-1:0",
+            "gerrit-1:65536",
+            "gerrit-1:sshd",
+            "[::1",
+            "[::1]x",
+            "[]:5")) {
       assertThrows(
           IllegalArgumentException.class, () -> GossipPeers.parse(invalid, 29419), invalid);
     }

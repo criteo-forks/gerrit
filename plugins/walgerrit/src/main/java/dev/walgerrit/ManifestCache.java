@@ -34,7 +34,7 @@ final class ManifestCache {
   record VersionedManifest(Manifest manifest, String version) {}
 
   /** A manifest a peer announced and this node has not observed yet. */
-  private record Expectation(String version, long revision) {}
+  record Expectation(String version, long revision) {}
 
   private final ConcurrentHashMap<String, VersionedManifest> latest = new ConcurrentHashMap<>();
   private final ConcurrentHashMap<String, Long> validatedAtMillis = new ConcurrentHashMap<>();
@@ -44,7 +44,9 @@ final class ManifestCache {
     return latest.get(key);
   }
 
-  /** Records that this node compared its view of {@code key} with the store at {@code nowMillis}. */
+  /**
+   * Records that this node compared its view of {@code key} with the store at {@code nowMillis}.
+   */
   void markValidated(String key, long nowMillis) {
     if (latest.containsKey(key)) {
       validatedAtMillis.put(key, nowMillis);
@@ -52,13 +54,18 @@ final class ManifestCache {
   }
 
   /**
-   * Records that the store itself reported the node's view of {@code key} current at {@code
-   * nowMillis}. Unlike a listing or a peer's word, that settles any announced manifest: whatever a
-   * peer said it published is not newer than what this node holds.
+   * Records an unchanged store response, clearing only the expectation captured before the read. A
+   * hint received during the request may describe a later publication and must remain pending.
    */
-  void markCurrent(String key, long nowMillis) {
+  void markCurrent(String key, Expectation beforeRead, long nowMillis) {
     markValidated(key, nowMillis);
-    expected.remove(key);
+    if (beforeRead != null) {
+      expected.remove(key, beforeRead);
+    }
+  }
+
+  Expectation expectation(String key) {
+    return expected.get(key);
   }
 
   /**
@@ -71,7 +78,10 @@ final class ManifestCache {
       return false;
     }
     Long at = validatedAtMillis.get(key);
-    return at != null && latest.containsKey(key) && maxAgeMillis > 0 && nowMillis - at < maxAgeMillis;
+    return at != null
+        && latest.containsKey(key)
+        && maxAgeMillis > 0
+        && nowMillis - at < maxAgeMillis;
   }
 
   /**

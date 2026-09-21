@@ -96,5 +96,9 @@ class GossipCodecTest {
   void hintsThatDoNotFitOneDatagramAreRefused() {
     GossipHint huge = HINT.toBuilder().setRepo("x".repeat(GossipCodec.MAX_DATAGRAM)).build();
     assertThrows(IllegalArgumentException.class, () -> GossipCodec.unsigned().encode(huge));
+    byte[] payload = huge.toByteArray();
+    byte[] datagram = Arrays.copyOf(GossipCodec.MAGIC, GossipCodec.MAGIC.length + payload.length);
+    System.arraycopy(payload, 0, datagram, GossipCodec.MAGIC.length, payload.length);
+    assertTrue(GossipCodec.unsigned().decode(datagram, datagram.length).isEmpty());
   }
 }

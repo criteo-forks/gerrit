@@ -17,10 +17,10 @@ deletions are idempotent, so delivery can be at least once. A failed index or cu
 the entry unacknowledged.
 
 `EVENT` and `INDEX` entries share the log and cursor. `EVENT` entries carry best-effort Gerrit
-notifications; both may carry the documents the writing node reindexed without a ref update, which
-the tailer reindexes here, minus changes a ref transaction in the same sweep covers. The tailer
-replays foreign-host entries and skips its own host's. Their failures and rebuild behavior differ
-from index intents; see [Events](events.md).
+notifications. Both may identify documents reindexed without a ref update. The tailer reindexes
+those documents on other nodes, skipping changes already covered by ref transactions in the same
+replay. It skips its own host's events and index updates. See [Events](events.md) for their failure
+and rebuild behavior.
 
 ## Ref-to-index mapping
 
@@ -139,11 +139,10 @@ requires a store whose listing and conditional-write semantics satisfy the backe
 Sweep duration, log backlog, index work and retries add latency. Repository opens and ref
 transactions also discover new manifests, but do not replace the tailer's index work.
 
-With peers configured, a node also replays a repository as soon as a peer's UDP wake-up names
-it, on the tailer thread and through the same catch-up as a sweep: the cached manifest when it
-already matches the announced version, otherwise one conditional read, then the intervening log
-entries. Convergence then no longer waits for the sweep in the common case; the sweep remains the
-bound for whatever a lost datagram missed. See [Peer wake-ups](gossip.md).
+A peer's UDP hint queues replay for one repository on the tailer thread. When it runs, the
+replay conditionally reads the current manifest and applies unseen log entries. Hints received
+while replay is queued share that pass; hints received during replay can queue another. Sweeps
+retry failed work and discover writes whose hints were lost. See [Peer wake-ups](gossip.md).
 
 ## Replay
 

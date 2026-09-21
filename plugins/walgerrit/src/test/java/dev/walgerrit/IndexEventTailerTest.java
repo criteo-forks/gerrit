@@ -30,6 +30,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -105,8 +106,7 @@ class IndexEventTailerTest {
               throw new IllegalStateException("injected index failure");
             });
     assertThrows(IllegalStateException.class, () -> failing.catchUp(project));
-    long cursorAfterFailure =
-        new IndexCursorStore(store.indexCursorPath()).read().getSequence();
+    long cursorAfterFailure = new IndexCursorStore(store.indexCursorPath()).read().getSequence();
     assertTrue(cursorAfterFailure >= cursorBefore);
     assertEquals(store.read().getHeadSeq() - 1, cursorAfterFailure);
 
@@ -315,8 +315,7 @@ class IndexEventTailerTest {
         update.setNewObjectId(commit);
         assertEquals(RefUpdate.Result.NEW, update.update());
       }
-      String version =
-          writer.storage().manifestStore(project).refreshVersionedManifest().version();
+      String version = writer.storage().manifestStore(project).refreshVersionedManifest().version();
       assertFalse(applier.sawUpdate(Constants.R_HEADS + "main", commit));
 
       tailer.wake(project, version);
@@ -335,6 +334,73 @@ class IndexEventTailerTest {
     }
     tailer.wake(project, null); // Stopped: ignored rather than rejected.
     assertEquals(1, tailer.wakeUpsReplayed());
+  }
+
+  @Test
+  void queuedWakeUpReadsPublicationsAnnouncedWhileItWasWaiting() throws Exception {
+    Path shared = storagePath.resolve("shared-wal");
+    WalGitRepositoryManager writer = configuredManager(shared, storagePath.resolve("writer"));
+    Config config = new Config();
+    config.setString("walgerrit", null, "storagePath", shared.toString());
+    config.setString("walgerrit", null, "indexPollInterval", "1 hour");
+    WalGitRepositoryManager reader =
+        new WalGitRepositoryManager(
+            WalGitConfiguration.from(config, storagePath.resolve("reader")));
+    Project.NameKey blocker = Project.nameKey("platform/blocker");
+    Project.NameKey project = Project.nameKey("platform/queued");
+    writer.createRepository(blocker).close();
+    writer.createRepository(project).close();
+    CountDownLatch replayStarted = new CountDownLatch(1);
+    CountDownLatch releaseReplay = new CountDownLatch(1);
+    AtomicBoolean block = new AtomicBoolean();
+    RecordingApplier applied = new RecordingApplier();
+    IndexEventTailer tailer =
+        startingTailer(
+            reader,
+            (name, transaction) -> {
+              if (name.equals(blocker) && block.get()) {
+                replayStarted.countDown();
+                try {
+                  if (!releaseReplay.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("test did not release replay");
+                  }
+                } catch (InterruptedException interrupted) {
+                  Thread.currentThread().interrupt();
+                  throw new IllegalStateException(interrupted);
+                }
+              }
+              applied.apply(name, transaction);
+            },
+            readiness("queued"));
+    tailer.start();
+    try {
+      block.set(true);
+      publishRef(writer, blocker, "refs/heads/block");
+      tailer.wake(blocker, null);
+      assertTrue(replayStarted.await(10, TimeUnit.SECONDS));
+
+      publishRef(writer, project, "refs/heads/first");
+      String firstVersion =
+          reader.storage().manifestStore(project).refreshVersionedManifest().version();
+      tailer.wake(project, firstVersion);
+      ObjectId second = publishRef(writer, project, "refs/heads/second");
+      var latest = writer.storage().manifestStore(project).refreshVersionedManifest();
+      reader.storage().expectManifest(project, latest.version(), latest.manifest().getRevision());
+      tailer.wake(project, latest.version());
+      releaseReplay.countDown();
+
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+      while (tailer.wakeUpsReplayed() < 2 && System.nanoTime() < deadline) {
+        Thread.sleep(10);
+      }
+      assertEquals(2, tailer.wakeUpsReplayed());
+      assertTrue(
+          applied.sawUpdate("refs/heads/second", second),
+          "a coalesced hint must not leave replay at the first announced version");
+    } finally {
+      releaseReplay.countDown();
+      tailer.stop();
+    }
   }
 
   private static org.eclipse.jgit.lib.Config durableLuceneConfig() {
@@ -366,17 +432,9 @@ class IndexEventTailerTest {
   }
 
   private static IndexEventTailer startingTailer(
-      WalGitRepositoryManager manager,
-      IndexEventApplier applier,
-      IndexEventReadiness readiness) {
+      WalGitRepositoryManager manager, IndexEventApplier applier, IndexEventReadiness readiness) {
     return new IndexEventTailer(
-        manager,
-        applier,
-        GerritRuntime.DAEMON,
-        "lucene",
-        durableLuceneConfig(),
-        readiness,
-        null);
+        manager, applier, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(), readiness, null);
   }
 
   @Test
@@ -400,7 +458,12 @@ class IndexEventTailerTest {
     IndexEventReadiness readiness = readiness("floor-node-b");
     IndexEventTailer tailerB =
         new IndexEventTailer(
-            nodeB, applierB, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(), readiness,
+            nodeB,
+            applierB,
+            GerritRuntime.DAEMON,
+            "lucene",
+            durableLuceneConfig(),
+            readiness,
             rebuilder);
     tailerB.start();
     try {
@@ -447,8 +510,13 @@ class IndexEventTailerTest {
         };
     IndexEventTailer tailerB =
         new IndexEventTailer(
-            nodeB, applierB, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(),
-            readiness("during-node-b"), rebuilder);
+            nodeB,
+            applierB,
+            GerritRuntime.DAEMON,
+            "lucene",
+            durableLuceneConfig(),
+            readiness("during-node-b"),
+            rebuilder);
     tailerB.start();
     try {
       assertEquals(1, rebuilder.rebuilds.get());
@@ -469,8 +537,13 @@ class IndexEventTailerTest {
     FakeRebuilder rebuilder = new FakeRebuilder();
     IndexEventTailer tailer =
         new IndexEventTailer(
-            manager, applier, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(),
-            readiness("mismatch-node"), rebuilder);
+            manager,
+            applier,
+            GerritRuntime.DAEMON,
+            "lucene",
+            durableLuceneConfig(),
+            readiness("mismatch-node"),
+            rebuilder);
     tailer.runOnce();
     assertEquals(0, rebuilder.rebuilds.get());
 
@@ -482,12 +555,16 @@ class IndexEventTailerTest {
     // the node restarts, which a fresh tailer models.
     IndexEventTailer restarted =
         new IndexEventTailer(
-            manager, applier, GerritRuntime.DAEMON, "lucene", durableLuceneConfig(),
-            readiness("mismatch-node"), rebuilder);
+            manager,
+            applier,
+            GerritRuntime.DAEMON,
+            "lucene",
+            durableLuceneConfig(),
+            readiness("mismatch-node"),
+            rebuilder);
     restarted.runOnce();
     assertEquals(1, rebuilder.rebuilds.get(), "a cursor naming an unknown transaction rebuilds");
-    assertEquals(
-        store.read().getHeadTransactionId(), cursorStore.read().getTransactionId());
+    assertEquals(store.read().getHeadTransactionId(), cursorStore.read().getTransactionId());
   }
 
   @Test
@@ -505,8 +582,13 @@ class IndexEventTailerTest {
     IndexEventReadiness readiness = readiness("closed-node-b");
     IndexEventTailer noRebuilder =
         new IndexEventTailer(
-            limitedManager(shared, "node-b"), new RecordingApplier(), GerritRuntime.DAEMON,
-            "lucene", durableLuceneConfig(), readiness, null);
+            limitedManager(shared, "node-b"),
+            new RecordingApplier(),
+            GerritRuntime.DAEMON,
+            "lucene",
+            durableLuceneConfig(),
+            readiness,
+            null);
     IllegalStateException failure = assertThrows(IllegalStateException.class, noRebuilder::start);
     assertTrue(failure.getCause().getMessage().contains("offline reindex"));
     assertFalse(readiness.isReady());
@@ -518,8 +600,13 @@ class IndexEventTailerTest {
             WalGitConfiguration.from(config, shared.resolveSibling("node-c-site")));
     IndexEventTailer disabled =
         new IndexEventTailer(
-            nodeC, new RecordingApplier(), GerritRuntime.DAEMON, "lucene", durableLuceneConfig(),
-            readiness("closed-node-c"), new FakeRebuilder());
+            nodeC,
+            new RecordingApplier(),
+            GerritRuntime.DAEMON,
+            "lucene",
+            durableLuceneConfig(),
+            readiness("closed-node-c"),
+            new FakeRebuilder());
     failure = assertThrows(IllegalStateException.class, disabled::start);
     assertTrue(failure.getCause().getMessage().contains("disabled"));
   }

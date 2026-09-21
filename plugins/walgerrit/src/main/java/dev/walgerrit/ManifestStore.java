@@ -61,8 +61,10 @@ final class ManifestStore {
   static final String MANIFEST_FILE = "manifest.pb";
 
   private static final int FORMAT_VERSION = 3;
+
   /** Cached files younger than this are never evicted: they may await their publication. */
   static final java.time.Duration EVICTION_MIN_AGE = java.time.Duration.ofMinutes(10);
+
   private static final int MAX_CAS_ATTEMPTS = 64;
   private static final String OBJECT_FORMAT = "sha1";
   private static final String LOG_DIRECTORY = "log";
@@ -113,8 +115,8 @@ final class ManifestStore {
    * @param objectStore holds the repository's immutable pack, index, reftable and log objects
    * @param manifestObjects holds {@code manifest.pb}; kept apart so that all manifests share one
    *     listable prefix
-   * @param afterPublish sees every manifest this store publishes, with its store version, after
-   *     the CAS; the compactor evaluates its policy there and the gossip endpoint tells the peers
+   * @param afterPublish sees every manifest this store publishes, with its store version, after the
+   *     CAS; the compactor evaluates its policy there and the gossip endpoint tells the peers
    * @param chunkedFiles the node-wide registry of packs being fetched in chunks, shared so that
    *     every handle of a pack reads through one sparse file
    * @param packFetchChunkSize chunk size for fetching packs larger than one chunk on demand; 0
@@ -261,8 +263,8 @@ final class ManifestStore {
 
   /**
    * Whether a peer announced a manifest for this repository that this node has not read yet. An
-   * open handle then revalidates on its next lookup instead of waiting out its interval. See
-   * {@link StorageLayout#expectManifest}.
+   * open handle then revalidates on its next lookup instead of waiting out its interval. See {@link
+   * StorageLayout#expectManifest}.
    */
   boolean expectingNewerManifest() {
     return cache.expecting(cacheKey);
@@ -274,8 +276,8 @@ final class ManifestStore {
   }
 
   /**
-   * Returns the entries after a follower's cursor, oldest first, by walking the chain back from
-   * the manifest's head: each entry names the transaction id of the one before it, so every key is
+   * Returns the entries after a follower's cursor, oldest first, by walking the chain back from the
+   * manifest's head: each entry names the transaction id of the one before it, so every key is
    * known without a listing, and the id the walk arrives at for the cursor's sequence must be the
    * one the cursor recorded. One object is read per entry behind the cursor.
    *
@@ -334,12 +336,7 @@ final class ManifestStore {
       Collection<String> supersedes,
       boolean requireExactRefRevision)
       throws IOException {
-    return publish(
-        expectedRefRevision,
-        additions,
-        supersedes,
-        requireExactRefRevision,
-        null);
+    return publish(expectedRefRevision, additions, supersedes, requireExactRefRevision, null);
   }
 
   Manifest publish(
@@ -385,10 +382,10 @@ final class ManifestStore {
 
   /**
    * Appends a journal entry: the Gerrit events fired on this node, for every other node to deliver
-   * to its own listeners, and the documents this node reindexed with no ref update behind them,
-   * for every other node to reindex. Nothing else in the manifest changes: no pack, no ref
-   * revision. The entry lands after the ref update that caused the events, because that update was
-   * published before Gerrit fired them. The kind is EVENT when there are events, INDEX otherwise.
+   * to its own listeners, and the documents this node reindexed with no ref update behind them, for
+   * every other node to reindex. Nothing else in the manifest changes: no pack, no ref revision.
+   * The entry lands after the ref update that caused the events, because that update was published
+   * before Gerrit fired them. The kind is EVENT when there are events, INDEX otherwise.
    */
   Manifest publishJournal(List<String> eventJson, @Nullable IndexUpdate indexUpdate)
       throws IOException {
@@ -585,12 +582,12 @@ final class ManifestStore {
   /**
    * A channel over a pack for JGit. A pack already whole in the cache, or one no larger than a
    * chunk, or any pack when chunked fetching is off, is the local file; a larger pack not yet
-   * cached is fetched in chunks as JGit reads it, so a cold node pays for the bytes it needs
-   * rather than for the pack. {@code size} is the pack's size as the manifest records it; 0 when
-   * unknown falls back to fetching the whole pack.
+   * cached is fetched in chunks as JGit reads it, so a cold node pays for the bytes it needs rather
+   * than for the pack. {@code size} is the pack's size as the manifest records it; 0 when unknown
+   * falls back to fetching the whole pack.
    */
-  org.eclipse.jgit.internal.storage.dfs.ReadableChannel openPackChannel(
-      String fileName, long size) throws IOException {
+  org.eclipse.jgit.internal.storage.dfs.ReadableChannel openPackChannel(String fileName, long size)
+      throws IOException {
     createCacheDirectories();
     Path target = walPath.resolve(fileName);
     if (Files.isRegularFile(target) && !Files.exists(ChunkedFile.sidecarFor(target))) {
@@ -688,11 +685,11 @@ final class ManifestStore {
   }
 
   /**
-   * Deletes cached files that are not in {@code live}, except files written within the last
-   * {@link #EVICTION_MIN_AGE}, which may be uploads whose publication has not landed yet. A handle
-   * that still needs an evicted file fetches it again from the store, which keeps it for the
-   * reclamation grace period. Does nothing when the cache is the store: there the copy is the only
-   * one, and only reclamation, with its grace period, may delete it.
+   * Deletes cached files that are not in {@code live}, except files written within the last {@link
+   * #EVICTION_MIN_AGE}, which may be uploads whose publication has not landed yet. A handle that
+   * still needs an evicted file fetches it again from the store, which keeps it for the reclamation
+   * grace period. Does nothing when the cache is the store: there the copy is the only one, and
+   * only reclamation, with its grace period, may delete it.
    */
   int evictLocalFilesExcept(java.util.Set<String> live) throws IOException {
     if (cacheIsStore || !Files.isDirectory(walPath)) {
@@ -767,6 +764,7 @@ final class ManifestStore {
   }
 
   private Optional<VersionedManifest> refreshVersioned() throws IOException {
+    ManifestCache.Expectation beforeRead = cache.expectation(cacheKey);
     VersionedManifest known = cache.get(cacheKey);
     ConditionalRead read =
         manifestObjects.getIfChanged(MANIFEST_FILE, known == null ? null : known.version());
@@ -777,8 +775,7 @@ final class ManifestStore {
               "Object store reported an unchanged manifest without a known version: "
                   + repositoryName);
         }
-        // The store itself says this node's view is current, whatever a peer announced.
-        cache.markCurrent(cacheKey, clock.millis());
+        cache.markCurrent(cacheKey, beforeRead, clock.millis());
         yield Optional.of(known);
       }
       case ABSENT -> {
@@ -856,7 +853,9 @@ final class ManifestStore {
     return supersedes.isEmpty() ? LogEntry.Kind.PACK : LogEntry.Kind.COMPACT;
   }
 
-  /** Whether publishing these additions and supersedes on {@code current} advances the ref revision. */
+  /**
+   * Whether publishing these additions and supersedes on {@code current} advances the ref revision.
+   */
   static boolean changesRefs(
       Collection<PackRef> additions, Collection<String> supersedes, Manifest current) {
     if (additions.stream().anyMatch(ManifestStore::hasReftable)) {
@@ -870,8 +869,7 @@ final class ManifestStore {
   }
 
   private static boolean hasReftable(PackRef pack) {
-    return pack.getFilesList().stream()
-        .anyMatch(file -> file.getExtension().equals("ref"));
+    return pack.getFilesList().stream().anyMatch(file -> file.getExtension().equals("ref"));
   }
 
   private static void moveAtomic(Path source, Path target) throws IOException {

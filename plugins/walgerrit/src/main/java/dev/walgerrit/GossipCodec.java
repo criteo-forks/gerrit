@@ -25,18 +25,13 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * Wire format of a gossip datagram: a four-byte magic, the serialized {@link GossipHint} and, when
- * the cluster shares a secret, a trailing HMAC-SHA256 over everything before it.
- *
- * <p>Decoding never throws. A datagram from another release, another cluster, a stray client or an
- * attacker is simply not a hint. A forged hint could at most make a node perform one conditional
- * read that returns nothing new; the secret exists so that not even that can be triggered from
- * outside the cluster.
+ * Encodes a four-byte magic, a serialized {@link GossipHint} and an optional trailing HMAC-SHA256.
+ * Decoding rejects malformed, oversized or incorrectly signed datagrams.
  */
 final class GossipCodec {
   static final byte[] MAGIC = {'W', 'G', 'G', '1'};
 
-  /** Largest datagram this codec produces: a hint crosses any path in one unfragmented packet. */
+  /** Datagram limit, chosen to reduce fragmentation on typical networks. */
   static final int MAX_DATAGRAM = 1200;
 
   private static final int MAC_LENGTH = 32;
@@ -88,7 +83,7 @@ final class GossipCodec {
   /** The hint in the first {@code length} bytes of {@code datagram}, or empty if it is not one. */
   Optional<GossipHint> decode(byte[] datagram, int length) {
     int trailer = secret == null ? 0 : MAC_LENGTH;
-    if (length < MAGIC.length + trailer || length > datagram.length) {
+    if (length < MAGIC.length + trailer || length > MAX_DATAGRAM || length > datagram.length) {
       return Optional.empty();
     }
     for (int i = 0; i < MAGIC.length; i++) {

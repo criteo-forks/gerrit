@@ -43,25 +43,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Tells the other nodes about this node's publications over UDP, and acts on theirs.
+ * Sends publication hints to peers and delivers their hints to the cache and index tailer.
  *
- * <p>After a manifest CAS lands, the publication listener queues a {@link GossipHint} that a sender
- * thread datagrams to every peer. A receiver thread takes peers' hints and, for each, records an
- * expectation in the node's manifest cache, so Git reads revalidate at once, and calls the
- * registered listeners, which is how the index-event tailer replays that repository ahead of its
- * next sweep.
+ * <p>After a manifest CAS succeeds, a sender thread sends the queued {@link GossipHint} to each
+ * peer. The receiver records a cache expectation and calls listeners to queue index replay.
  *
- * <p>Nothing here is a source of truth. UDP loses, duplicates and reorders. A lost hint means a
- * repository converges at the next sweep or conditional read, as it would without gossip; a stale
- * or duplicate hint costs a receiver at most one conditional read that returns nothing new.
- * Sending never blocks the publishing thread and never fails it: a full queue drops the hint. The
- * endpoint stays idle in batch programs and when no peer is configured.
+ * <p>Conditional reads and index sweeps recover from missed hints. Network I/O runs outside the
+ * publishing thread; a full queue drops hints. Batch programs and nodes without peers stay idle.
  */
 @Singleton
 final class GossipEndpoint implements LifecycleListener {
   private static final Logger logger = LoggerFactory.getLogger(GossipEndpoint.class);
   private static final int OUTBOX_CAPACITY = 4096;
-  private static final int RECEIVE_BUFFER = 65_535;
   private static final long STOP_TIMEOUT_MILLIS = 5_000;
 
   /** Receives a peer's hint about {@code project} on the receiver thread; must return promptly. */
@@ -79,7 +72,7 @@ final class GossipEndpoint implements LifecycleListener {
   private final List<HintListener> listeners = new CopyOnWriteArrayList<>();
   private volatile GossipPeers peers;
 
-  /** Whether a hint's writer is another node; this node's own hints come back from its peers. */
+  /** Filters hints from this node's writer host. */
   private volatile Predicate<String> foreignWriter =
       writer -> !ManifestStore.writtenOnThisHost(writer);
 
@@ -286,7 +279,8 @@ final class GossipEndpoint implements LifecycleListener {
   }
 
   private void receiveLoop(DatagramSocket open) {
-    byte[] buffer = new byte[RECEIVE_BUFFER];
+    // The extra byte lets the codec reject oversized packets even when receive truncates them.
+    byte[] buffer = new byte[GossipCodec.MAX_DATAGRAM + 1];
     DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
     while (!open.isClosed()) {
       packet.setLength(buffer.length);

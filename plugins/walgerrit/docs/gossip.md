@@ -1,128 +1,114 @@
 # Peer wake-ups over UDP
 
-WalGerrit nodes share nothing but the store. Each learns of the others' writes by asking it: a
-conditional manifest read when a repository is opened or a handle's revalidation interval elapses,
-and one listing of the `manifests/` prefix per index sweep. Both bound staleness by a configured
-interval rather than by the write itself.
+After a manifest CAS succeeds, the writing node sends a UDP hint to each configured peer. Each
+receiver schedules index replay for that repository and marks its cached manifest for
+revalidation. This lets nodes discover writes before their next sweep or periodic manifest read.
 
-Gossip adds a channel that is faster and deliberately unreliable, in the way Cursor's
-[Git at any scale](https://cursor.com/blog/git-at-any-scale) describes for its replicas: after a
-manifest CAS lands, the writing node sends one small UDP datagram to every peer, carrying what a
-receiver needs to catch up straight from the store. The receiver treats it as a hint. Correctness
-still comes from conditional reads and the sweep; gossip only moves them earlier.
+UDP delivery is best effort. Conditional reads still determine what is committed, and index
+sweeps catch up after missed hints. The design follows the notification approach described in
+Cursor's [Git at any scale](https://cursor.com/blog/git-at-any-scale).
 
-## The datagram
+## Datagram format
 
-A datagram is a four-byte magic (`WGG1`), a serialized `GossipHint` and, when the cluster shares a
-secret, a 32-byte HMAC-SHA256 over the bytes before it.
+A datagram contains a four-byte magic (`WGG1`), a serialized `GossipHint` and, when a shared secret
+is configured, a 32-byte HMAC-SHA256 over the preceding bytes.
 
 | Field | Meaning |
 | --- | --- |
-| `repo` | The project name. |
-| `manifest_version` | The store's version token for the manifest the sender wrote; its ETag on S3. Compared for equality, like a listed version. |
-| `revision`, `head_seq`, `head_transaction_id` | The manifest's revision and log head, so a receiver can tell a hint older than what it holds without I/O. |
-| `writer` | The sender's writer identity, `host:pid`; a node drops its own hints. |
-| `sent_at_epoch_millis` | Sender clock, for diagnostics only. |
+| `repo` | Project name. |
+| `manifest_version` | Opaque store version of the announced manifest; its ETag on S3. Compared for equality only. |
+| `revision` | Manifest revision, used to ignore cache invalidations for versions already observed. |
+| `head_seq`, `head_transaction_id` | Announced log head; currently unused by the receiver. |
+| `writer` | Sender identity, `host:pid`; a node ignores hints from its own host. |
+| `sent_at_epoch_millis` | Sender timestamp; currently unused by the receiver. |
 
-A hint is well under 200 bytes; the codec refuses anything above 1200 bytes so no datagram is ever
-fragmented.
+The codec limits datagrams to 1,200 bytes. Size depends on the project name and version token.
+This limit reduces fragmentation on typical networks; it cannot guarantee an unfragmented packet
+on every path.
 
-## What the sender does
+## Sending and receiving
 
-Every publication that lands, whether it carries packs, a ref transaction, a compaction, an event
-batch or an index update, is a manifest replacement, and every one is announced. The publication
-listener that also feeds the compactor queues a hint; a sender thread encodes it and sends one
-datagram per peer address. The publishing thread never waits on the network and never sees a send
-fail. A full queue drops the hint, counted as `dropped`, and the receivers' sweeps cover the gap.
+Every successful manifest publication queues a hint, including pack, ref, compaction, event and
+index-update publications. A sender thread encodes the hint and sends one datagram per resolved
+peer address. Network I/O runs outside the publishing thread. A full queue drops the hint and
+increments `dropped`.
 
-## What a receiver does
+A receiver:
 
-For each datagram on its gossip port a node:
+1. Checks the magic, size, payload and project name. If a secret is configured, it also verifies
+   the HMAC.
+2. Ignores hints from its own writer host.
+3. Records the announced version and revision in the manifest cache unless it already holds
+   that manifest or a newer one. An outstanding hint forces the next open or lookup to revalidate,
+   even with `manifestRevalidateOnOpen = false` or `manifestRevalidateInterval = 0`.
+4. Queues the repository on the index tailer's thread unless that exact version was already
+   replayed. The tailer conditionally reads the current manifest, then applies unseen log entries
+   through the same catch-up path as a sweep.
 
-1. Rejects what is not a hint for this cluster: wrong magic, a bad or missing HMAC when a secret
-   is configured, a malformed payload, or a project name the layout would not map to a key.
-2. Ignores hints whose writer host is its own; they are its own publications coming back.
-3. Records the announced version and revision in its manifest cache. Until the node reads a
-   manifest at that revision, or the store itself reports the node's view current, the
-   repository does not count as recently validated. The next open makes a conditional read even
-   with `manifestRevalidateOnOpen = false`, and an open handle revalidates on its next lookup
-   whatever its interval, including an interval of `0`. A hint for a manifest the node already
-   holds, or an older one, records nothing.
-4. Wakes the index-event tailer for the repository. On the tailer thread, the same catch-up a
-   sweep performs runs for that one repository: the cached manifest if it already matches the
-   announced version, otherwise one conditional read, then the intervening log entries are applied
-   to the local indexes, foreign events are dispatched and derived caches evicted. Wake-ups for a
-   repository coalesce while one is queued; a hint that arrives during the replay queues another,
-   since the replay may have read an older manifest. A wake-up that cannot be replayed leaves the
-   decision to rebuild to the sweep.
+Hints for a repository coalesce while its replay is queued. The replay reads the store when it
+runs, so it includes publications announced while it was waiting. A hint received during replay
+can queue another pass. Failed replay leaves retries and any index rebuild to the next sweep.
 
-The conditional read the tailer makes lands in the node-wide manifest cache, so Git handles on
-that node adopt the newer manifest without a read of their own.
+A manifest read updates the node-wide cache, which other Git handles can then adopt. Reading the
+announced revision settles its hint. An unchanged store response clears only the hint observed
+before that request; hints received while the request was in flight remain pending.
 
-## Membership
+## Peer discovery
 
-Peers come from two sources, combined:
+Peers come from both configured sources:
 
-- `gossipPeer`, a fixed `host[:port]`, one key per peer.
-- `gossipPeerDnsName`, a name whose every address record is a peer on `gossipPort`. A Kubernetes
-  headless service resolves to every pod of a StatefulSet, so a cluster needs no per-pod list.
+- `gossipPeer`: a fixed `host[:port]`, repeated for each peer. IPv6 with a port uses `[address]:port`.
+- `gossipPeerDnsName`: a name whose address records supply peers on `gossipPort`, such as a
+  Kubernetes headless service.
 
-Names are resolved again after `gossipPeerRefreshInterval`, so a replaced pod is reached without a
-restart; a resolution that yields nothing keeps the previous answer. A node may find its own
-address among the peers; it sends to itself and ignores the result by writer host.
+Before sending, the sender refreshes names whose `gossipPeerRefreshInterval` has elapsed. The [JVM's DNS cache](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/InetAddress.html) also affects when changed records become visible. Failed or empty resolutions retain
+that source's previous addresses; other sources can still refresh. Addresses are deduplicated.
 
-Every WalGerrit node serves every repository, so a hint goes to every peer directly. There is no
-placement by repository, no relaying between peers and no membership protocol: the peer list is
-configuration, and a peer that is down simply misses hints until it is back, when its own sweep
-catches it up.
+Every node serves every repository, so each sender contacts every peer directly. Peers do not
+relay hints. A node may send to its own address and discard the hint by writer host. Nodes that
+share a host name also ignore one another's hints, as they do for
+[events](events.md#each-node-replays-foreign-events).
 
-## Guarantees and failure modes
-
-Gossip never changes what a node may serve, only when it asks the store.
+## Failure behavior
 
 | Event | Effect |
 | --- | --- |
-| Datagram lost | The receiver converges at its next sweep or conditional read, as without gossip. |
-| Datagram duplicated or reordered | At most one conditional read that returns nothing new; an older hint is dropped against the cache. |
-| Datagram forged | Without a secret, one conditional read per forged hint; with a secret, dropped. Nothing a hint says is ever served to a client. |
-| Hint for a repository this node has not seen | The first read of it fetches the manifest as it always would. |
-| Peer down or address stale | Sends fail or go nowhere; counted as `dropped`; the peer's sweep covers it. |
-| Port already bound | The daemon refuses to start, as with any misconfiguration. |
+| Datagram lost | Conditional reads and index sweeps still discover the write. |
+| Datagram duplicated or reordered | It may cause another conditional read. Cache invalidation skips older revisions; replay skips an exact version already caught up. |
+| Datagram forged | Unsigned hints can trigger reads and queued work, including failed lookups for nonexistent projects. A configured HMAC rejects hints without a valid signature; captured signed hints can still be replayed. |
+| Hint for an unseen repository | The tailer attempts to fetch its manifest and replay its log. A missing repository fails that attempt. |
+| Peer down or address stale | A send may fail or appear successful without delivery. Only local send errors increment `dropped`. |
+| Port already bound | The daemon fails to start. |
 
-Nodes that share a host name, and so a writer host, ignore one another's hints, as they already
-treat one another's events as local. See [Events](events.md#each-node-replays-foreign-events).
+Hints never supply Git data or authorize a publication. Restrict access to the gossip port to
+cluster peers, especially when running unsigned. The receiver has no rate limit, and the tailer
+queue has no limit on the number of distinct repository names.
 
 ## Configuration
 
-Gossip is active when it is enabled and at least one peer source is configured. All keys belong
-to `[walgerrit]`; the shown values are defaults.
+Gossip runs in daemons when `gossipEnabled` is true and at least one peer source is configured.
+Batch programs do not open the socket. All keys belong to `[walgerrit]`:
 
 ```ini
 [walgerrit]
-  gossipEnabled = true
   gossipPeerDnsName = gerrit.gerrit-poc.svc.cluster.local
   gossipPort = 29419
-  gossipListenAddress = 0.0.0.0
   gossipPeerRefreshInterval = 30 sec
 ```
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `gossipEnabled` | `true` | Send and receive wake-ups once a peer source is configured. |
-| `gossipPeer` | none | One peer as `host[:port]`; repeat the key for each peer. |
-| `gossipPeerDnsName` | none | A name whose every address record is a peer on `gossipPort`. |
-| `gossipPort` | `29419` | UDP port to listen on, and to send to for peers that name none. |
+| `gossipEnabled` | `true` | Enable sending and receiving when a peer source is configured. |
+| `gossipPeer` | none | Peer as `host[:port]`; repeat for multiple peers. |
+| `gossipPeerDnsName` | none | DNS name whose addresses are peers on `gossipPort`. |
+| `gossipPort` | `29419` | UDP listening port and default peer port. |
 | `gossipListenAddress` | all interfaces | Local address to bind. |
-| `gossipPeerRefreshInterval` | `30 sec` | How often peer names are resolved again. |
-| `gossipSecret` | none | Shared secret; datagrams without its HMAC are dropped. Put it in `secure.config`, which Gerrit reads into the same configuration. |
+| `gossipPeerRefreshInterval` | `30 sec` | Minimum interval between peer-name refreshes. |
+| `gossipSecret` | none | Shared HMAC secret. Put it in `secure.config` on every node. |
 
-With gossip in place, `indexPollInterval` bounds only what a lost datagram missed. Raising it
-from the default `5 sec` to `30 sec` or more cuts the idle listing traffic in proportion without
-delaying convergence in the common case. The sweep also refreshes the node's validation time for
-unchanged repositories, so a longer interval makes `manifestRevalidateOnOpen = false` reuse
-views for longer.
-
-Batch programs never open the socket, whatever the configuration.
+Increasing `indexPollInterval` reduces idle listing traffic but delays recovery from missed hints,
+failed replay and stale cursors. Sweep duration, backlog and failures add to the delay. The setting
+does not change the cache-reuse window controlled by `manifestRevalidateInterval`.
 
 ## Metrics
 
@@ -130,20 +116,21 @@ Cumulative counters under `walgerrit/gossip/`:
 
 | Metric | Meaning |
 | --- | --- |
-| `sent` | Datagrams sent, one per peer per publication. |
-| `dropped` | Hints not sent: the outbox was full, a send failed or the hint was too large. |
+| `sent` | Successful local datagram sends; does not confirm delivery. |
+| `dropped` | Hints lost to a full outbox, encoding size limit or local send error. |
 | `received` | Datagrams received on the gossip port. |
-| `accepted` | Hints from other nodes this node acted on. |
-| `ignored` | Hints about this node's own publications. |
-| `rejected` | Datagrams that were not hints for this cluster. |
+| `accepted` | Valid foreign hints passed to the manifest cache and listeners. |
+| `ignored` | Hints from this node's writer host. |
+| `rejected` | Invalid datagrams, signatures or project names. |
 
-A steady `received` with `accepted` at zero on every node means the nodes share a host name or the
-secret differs. `dropped` growing on one node points at its peer list.
+If `received` grows while `accepted` stays at zero, compare `ignored` and `rejected`. Shared host
+names raise `ignored`; signature mismatches and malformed packets raise `rejected`. Rising
+`dropped` can indicate queue pressure, oversized hints or local send errors. An empty resolved
+peer list produces no sends and does not increment `dropped`.
 
 ## Kubernetes
 
-Give the StatefulSet a headless service and name it in `gossipPeerDnsName`; declare the port so a
-network policy can allow it between pods:
+Configure a headless service and set `gossipPeerDnsName` to its DNS name:
 
 ```yaml
 apiVersion: v1
@@ -160,4 +147,6 @@ spec:
       protocol: UDP
 ```
 
-Each pod's `HOSTNAME` is its pod name, which is what makes writer hosts distinct.
+Allow UDP port 29419 between pods in the network policy. [Service DNS](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/) normally returns ready
+endpoints; use `publishNotReadyAddresses` if peers must include unready pods. Give each node a
+distinct host name so it accepts the other nodes' hints.

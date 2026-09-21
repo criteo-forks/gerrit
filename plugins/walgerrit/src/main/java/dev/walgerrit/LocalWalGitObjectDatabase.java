@@ -62,11 +62,15 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   private final ManifestStore manifestStore;
   private final GroupPublisher publisher;
+
   /** Packs this handle committed ahead of a ref transaction and has not seen published. */
   private final Set<String> deferredPacks = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
   private final long revalidateIntervalNanos;
+
   /** The ref transaction the current thread is running through this handle, if any. */
   private final ThreadLocal<RefTransactionState> refTransaction = new ThreadLocal<>();
+
   private volatile Set<ObjectId> shallowCommits = Collections.emptySet();
   private volatile long observedManifestRevision = -1;
   private volatile long lastRevalidationNanos;
@@ -361,7 +365,9 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     return adoptObservedManifest();
   }
 
-  /** Forces one conditional manifest read and adopts the result. Returns whether the view changed. */
+  /**
+   * Forces one conditional manifest read and adopts the result. Returns whether the view changed.
+   */
   boolean revalidateNow() throws IOException {
     manifestStore.refresh();
     lastRevalidationNanos = System.nanoTime();
@@ -424,9 +430,9 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   /**
    * After this handle published, JGit adds the new pack or reftable to its own in-memory list, so
    * the list still mirrors the manifest when the publication carried nothing but this handle's own
-   * files. A compaction (JGit does not update the list itself), a group that carried other
-   * handles' files, or a manifest that absorbed other writers' work in the meantime requires a
-   * rescan from the cached manifest; no network read is involved either way.
+   * files. A compaction (JGit does not update the list itself), a group that carried other handles'
+   * files, or a manifest that absorbed other writers' work in the meantime requires a rescan from
+   * the cached manifest; no network read is involved either way.
    */
   private void afterOwnPublication(Manifest updated, boolean rescan) {
     synchronized (this) {

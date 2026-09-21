@@ -66,14 +66,16 @@ record WalGitConfiguration(
     Duration gossipPeerRefreshInterval,
     String gossipSecret) {
   /**
-   * Longest time an open repository handle serves reads without another conditional manifest
-   * read. Every handle also revalidates when it starts a ref transaction, and when it is opened
-   * unless {@code manifestRevalidateOnOpen} is off, in which case an open reuses the node's view
-   * when it was validated against the store less than this interval ago.
+   * Longest time an open repository handle serves reads without another conditional manifest read.
+   * Every handle also revalidates when it starts a ref transaction, and when it is opened unless
+   * {@code manifestRevalidateOnOpen} is off, in which case an open reuses the node's view when it
+   * was validated against the store less than this interval ago.
    */
   static final Duration DEFAULT_MANIFEST_REVALIDATE_INTERVAL = Duration.ofSeconds(1);
 
-  /** Entries a node replays into its indexes at most before rebuilding them from scratch instead. */
+  /**
+   * Entries a node replays into its indexes at most before rebuilding them from scratch instead.
+   */
   static final long DEFAULT_INDEX_REPLAY_LIMIT = 10_000;
 
   /**
@@ -83,7 +85,9 @@ record WalGitConfiguration(
    */
   static final long DEFAULT_PACK_FETCH_CHUNK_SIZE = 8L << 20;
 
-  /** Pooled HTTP connections to S3 per node; a write is several requests and reads run in parallel. */
+  /**
+   * Pooled HTTP connections to S3 per node; a write is several requests and reads run in parallel.
+   */
   static final int DEFAULT_S3_MAX_CONNECTIONS = 64;
 
   /** TCP connect timeout to S3. */
@@ -107,7 +111,10 @@ record WalGitConfiguration(
   /** Reftable stack depth at which the whole stack is compacted into one table. */
   static final int DEFAULT_COMPACT_MIN_REFTABLES = 8;
 
-  /** Reftables up to this size are merged with every new table above them; larger ones are left as bases. */
+  /**
+   * Reftables up to this size are merged with every new table above them; larger ones are left as
+   * bases.
+   */
   static final long DEFAULT_COMPACT_SMALL_REFTABLE_SIZE = 8L << 20;
 
   /** Stack depth at which even the large base tables are merged into one. */
@@ -122,7 +129,9 @@ record WalGitConfiguration(
    */
   static final Duration DEFAULT_RECLAIM_GRACE = Duration.ofHours(24);
 
-  /** How long a node holds the sweep lease before another may take over; renewed every third of it. */
+  /**
+   * How long a node holds the sweep lease before another may take over; renewed every third of it.
+   */
   static final Duration DEFAULT_SWEEP_LEASE = Duration.ofSeconds(60);
 
   /** How often a node sweeps every repository to reclaim files and queue overdue compactions. */
@@ -195,7 +204,8 @@ record WalGitConfiguration(
     String endpoint = config.getString(SECTION, null, "s3Endpoint");
     WalGitConfiguration configuration =
         new WalGitConfiguration(
-            BackendType.parse(Optional.ofNullable(config.getString(SECTION, null, "backend")).orElse("local")),
+            BackendType.parse(
+                Optional.ofNullable(config.getString(SECTION, null, "backend")).orElse("local")),
             storagePath,
             config.getString(SECTION, null, "s3Bucket"),
             Optional.ofNullable(config.getString(SECTION, null, "s3Region")).orElse("us-east-1"),
@@ -215,10 +225,12 @@ record WalGitConfiguration(
             config.getBoolean(SECTION, null, "indexRebuildOnStaleCursor", true),
             config.getBoolean(SECTION, null, "compactionEnabled", true),
             config.getInt(SECTION, null, "compactMinPacks", DEFAULT_COMPACT_MIN_PACKS),
-            config.getInt(SECTION, null, "compactGeometricFactor", DEFAULT_COMPACT_GEOMETRIC_FACTOR),
+            config.getInt(
+                SECTION, null, "compactGeometricFactor", DEFAULT_COMPACT_GEOMETRIC_FACTOR),
             config.getLong(SECTION, null, "compactMaxPackSize", DEFAULT_COMPACT_MAX_PACK_SIZE),
             config.getInt(SECTION, null, "compactMinReftables", DEFAULT_COMPACT_MIN_REFTABLES),
-            config.getLong(SECTION, null, "compactSmallReftableSize", DEFAULT_COMPACT_SMALL_REFTABLE_SIZE),
+            config.getLong(
+                SECTION, null, "compactSmallReftableSize", DEFAULT_COMPACT_SMALL_REFTABLE_SIZE),
             config.getInt(SECTION, null, "compactMaxReftables", DEFAULT_COMPACT_MAX_REFTABLES),
             duration(config, "compactionLeaseDuration", DEFAULT_COMPACTION_LEASE),
             config.getBoolean(SECTION, null, "reclaimEnabled", true),
@@ -268,16 +280,20 @@ record WalGitConfiguration(
     require(
         packFetchChunkSize >= (64L << 10) && packFetchChunkSize <= (1L << 30),
         "packFetchChunkSize must be between 64k and 1g");
-    require(backend != BackendType.S3 || (s3Bucket != null && !s3Bucket.isBlank()),
+    require(
+        backend != BackendType.S3 || (s3Bucket != null && !s3Bucket.isBlank()),
         "s3Bucket is required for the s3 backend");
-    require(!s3Prefix.startsWith("/") && !s3Prefix.contains("..") && s3Prefix.indexOf('\\') < 0,
+    require(
+        !s3Prefix.startsWith("/") && !s3Prefix.contains("..") && s3Prefix.indexOf('\\') < 0,
         "s3Prefix is invalid: " + s3Prefix);
     require(s3MaxConnections >= 1, "s3MaxConnections must be at least 1");
     require(isPositive(s3ConnectTimeout), "s3ConnectTimeout must be positive");
     require(isPositive(s3SocketTimeout), "s3SocketTimeout must be positive");
     require(s3MaxAttempts >= 1, "s3MaxAttempts must be at least 1");
     require(isPositive(indexPollInterval), "indexPollInterval must be positive");
-    require(!manifestRevalidateInterval.isNegative(), "manifestRevalidateInterval must be zero or positive");
+    require(
+        !manifestRevalidateInterval.isNegative(),
+        "manifestRevalidateInterval must be zero or positive");
     require(indexReplayLimit >= 1, "indexReplayLimit must be at least 1");
     require(compactMinPacks >= 2, "compactMinPacks must be at least 2");
     require(compactGeometricFactor >= 2, "compactGeometricFactor must be at least 2");
@@ -293,8 +309,7 @@ record WalGitConfiguration(
     require(isPositive(sweepLeaseDuration), "sweepLeaseDuration must be positive");
     require(cacheSizeLimit >= 0, "cacheSizeLimit must be zero or positive");
     require(gossipPort >= 1 && gossipPort <= 65535, "gossipPort must be between 1 and 65535");
-    require(
-        isPositive(gossipPeerRefreshInterval), "gossipPeerRefreshInterval must be positive");
+    require(isPositive(gossipPeerRefreshInterval), "gossipPeerRefreshInterval must be positive");
     for (String peer : gossipPeers) {
       try {
         GossipPeers.parse(peer, gossipPort);

@@ -135,8 +135,7 @@ class WalGitConfigurationTest {
 
     IllegalArgumentException exception =
         assertThrows(
-            IllegalArgumentException.class,
-            () -> WalGitConfiguration.from(config, sitePath));
+            IllegalArgumentException.class, () -> WalGitConfiguration.from(config, sitePath));
 
     assertTrue(exception.getMessage().contains("indexPollInterval must be positive"));
   }
@@ -148,8 +147,7 @@ class WalGitConfigurationTest {
 
     IllegalArgumentException exception =
         assertThrows(
-            IllegalArgumentException.class,
-            () -> WalGitConfiguration.from(config, sitePath));
+            IllegalArgumentException.class, () -> WalGitConfiguration.from(config, sitePath));
 
     assertTrue(exception.getMessage().contains("walgerrit.s3Bucket is required"));
   }
@@ -161,8 +159,7 @@ class WalGitConfigurationTest {
 
     IllegalArgumentException exception =
         assertThrows(
-            IllegalArgumentException.class,
-            () -> WalGitConfiguration.from(config, sitePath));
+            IllegalArgumentException.class, () -> WalGitConfiguration.from(config, sitePath));
 
     assertTrue(exception.getMessage().contains("Unsupported walgerrit.backend 'unknown'"));
   }

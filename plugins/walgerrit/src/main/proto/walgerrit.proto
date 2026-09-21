@@ -148,13 +148,9 @@ message PartialFile {
   bytes present = 3;
 }
 
-// One node telling its peers that it just replaced a repository's manifest.
-// Sent as a UDP datagram right after the manifest CAS, to every configured
-// peer, and deliberately unreliable: a lost or delayed hint costs a receiver
-// nothing but the latency of its next conditional read or listing. The hint
-// carries what a receiver needs to catch up straight from the store without
-// listing: the repository, and the version and revision of the manifest that
-// landed. A receiver whose cache already holds that revision ignores it.
+// Best-effort UDP notification after a manifest publication. Receivers use it
+// to trigger conditional reads and index replay for one repository. Periodic
+// reads and sweeps discover writes whose notifications were lost.
 message GossipHint {
   string repo = 1;
   // The store's version token for the manifest the sender wrote; on S3, its
@@ -163,7 +159,7 @@ message GossipHint {
   uint64 revision = 3;
   uint64 head_seq = 4;
   string head_transaction_id = 5;
-  // Manifest.writer of the publication: the sending node drops its own hints.
+  // Sender identity; receivers ignore hints from their own host.
   string writer = 6;
   int64 sent_at_epoch_millis = 7;
 }

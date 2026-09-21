@@ -18,8 +18,8 @@ import com.google.gerrit.entities.Change;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.extensions.events.LifecycleListener;
 import com.google.gerrit.index.IndexConfig;
-import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.config.GerritRuntime;
+import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
@@ -50,11 +50,10 @@ import org.slf4j.LoggerFactory;
  * Replays committed WAL ref transactions into this node's derived Gerrit indexes and caches.
  *
  * <p>Each sweep is one paginated listing of the manifests prefix, which yields every repository
- * with the current version of its manifest. A repository is replayed only when that version
- * differs from the one this node last caught up to, so an unchanged repository costs nothing
- * beyond its share of the listing, and the sweep interval bounds cross-node convergence. A peer's
- * wake-up (see {@link GossipEndpoint}) replays one repository ahead of the sweep, on the same
- * thread and through the same {@link #catchUp} path.
+ * with the current version of its manifest. A repository is replayed only when that version differs
+ * from the one this node last caught up to, so an unchanged repository costs nothing beyond its
+ * share of the listing. A peer's wake-up (see {@link GossipEndpoint}) replays one repository ahead
+ * of the sweep, on the same thread and through the same {@link #catchUp} path.
  *
  * <p>A cursor that cannot be advanced by replay, because it is too far behind, ahead of a
  * rolled-back head, or names a transaction the manifest no longer does, makes the node rebuild all
@@ -68,17 +67,25 @@ final class IndexEventTailer implements LifecycleListener {
   private final WalGitRepositoryManager repositories;
   private final IndexEventApplier applier;
   private final EventReplayer replayer;
-  /** Whether a log entry's writer is another node; this node's own events were fired here already. */
-  private volatile Predicate<String> foreignWriter = writer -> !ManifestStore.writtenOnThisHost(writer);
+
+  /**
+   * Whether a log entry's writer is another node; this node's own events were fired here already.
+   */
+  private volatile Predicate<String> foreignWriter =
+      writer -> !ManifestStore.writtenOnThisHost(writer);
+
   private final GerritRuntime runtime;
   private final String indexType;
   private final Config serverConfig;
   private final IndexEventReadiness readiness;
   private final IndexRebuilder rebuilder;
+
   /** Manifest version at which this node last confirmed each repository's cursor was at head. */
   private final Map<Project.NameKey, String> caughtUpVersions = new ConcurrentHashMap<>();
+
   /** Repositories a peer's wake-up queued for replay that the tailer thread has not started. */
   private final Set<Project.NameKey> pendingWakeUps = ConcurrentHashMap.newKeySet();
+
   private final AtomicLong wakeUpsReplayed = new AtomicLong();
   private volatile ScheduledExecutorService executor;
   private boolean participating;
@@ -114,8 +121,7 @@ final class IndexEventTailer implements LifecycleListener {
         runtime,
         "lucene",
         new Config(),
-        new IndexEventReadiness(
-            repositories.configuration().indexCursorPath().resolve("READY")),
+        new IndexEventReadiness(repositories.configuration().indexCursorPath().resolve("READY")),
         null);
   }
 
@@ -127,7 +133,15 @@ final class IndexEventTailer implements LifecycleListener {
       Config serverConfig,
       IndexEventReadiness readiness,
       IndexRebuilder rebuilder) {
-    this(repositories, applier, runtime, indexType, serverConfig, readiness, rebuilder, EventReplayer.NONE);
+    this(
+        repositories,
+        applier,
+        runtime,
+        indexType,
+        serverConfig,
+        readiness,
+        rebuilder,
+        EventReplayer.NONE);
   }
 
   IndexEventTailer(
@@ -215,8 +229,8 @@ final class IndexEventTailer implements LifecycleListener {
   }
 
   /**
-   * One full sweep. If any repository's cursor cannot be advanced by replay, the node's indexes
-   * are rebuilt and every cursor reseeded, then the sweep runs once more to replay whatever was
+   * One full sweep. If any repository's cursor cannot be advanced by replay, the node's indexes are
+   * rebuilt and every cursor reseeded, then the sweep runs once more to replay whatever was
    * published during the rebuild.
    */
   void runOnce() throws IOException {
@@ -274,9 +288,9 @@ final class IndexEventTailer implements LifecycleListener {
   }
 
   /**
-   * Replays this repository's unseen WAL entries. With the version a listing reported, the
-   * manifest is taken from the node cache when it already holds that version; otherwise, and
-   * always without a listed version, one conditional read is made.
+   * Replays this repository's unseen WAL entries. With the version a listing reported, the manifest
+   * is taken from the node cache when it already holds that version; otherwise, and always without
+   * a listed version, one conditional read is made.
    *
    * @throws IndexRebuildRequiredException when the cursor cannot be advanced by replay
    */
@@ -382,7 +396,8 @@ final class IndexEventTailer implements LifecycleListener {
 
   /**
    * Rebuilds every index from current repository state and reseeds every cursor at the head each
-   * repository had before the rebuild began, so anything published meanwhile is replayed afterwards.
+   * repository had before the rebuild began, so anything published meanwhile is replayed
+   * afterwards.
    */
   private void rebuildIndexes(Map<Project.NameKey, IndexRebuildRequiredException> stale)
       throws IOException {
@@ -467,7 +482,7 @@ final class IndexEventTailer implements LifecycleListener {
       return;
     }
     try {
-      running.execute(() -> replayWakeUp(project, announced));
+      running.execute(() -> replayWakeUp(project));
     } catch (RejectedExecutionException stopped) {
       pendingWakeUps.remove(project);
     }
@@ -478,10 +493,11 @@ final class IndexEventTailer implements LifecycleListener {
     return wakeUpsReplayed.get();
   }
 
-  private void replayWakeUp(Project.NameKey project, String version) {
+  private void replayWakeUp(Project.NameKey project) {
     pendingWakeUps.remove(project);
     try {
-      catchUp(project, version);
+      // A queued hint may have coalesced newer publications. Read the current store state.
+      catchUp(project);
       wakeUpsReplayed.incrementAndGet();
     } catch (IndexRebuildRequiredException rebuildRequired) {
       // Whether to rebuild is the sweep's decision; it will find the same cursor.

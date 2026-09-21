@@ -32,11 +32,11 @@ Replay failures are logged and skipped, allowing the cursor to advance. A crash 
 but before cursor persistence can cause duplicate delivery. A full index rebuild seeds cursors
 at captured heads and skips older notifications; it does not reconstruct them from Git.
 
-## Reindexed documents ride in the same journal
+## The journal also records reindexed documents
 
-A node also reindexes documents with no ref update behind them: the mergeable endpoint,
-`gerrit index changes`, `POST /changes/{id}/index`, `autoReindexIfStale`. `WalJournal` listens for
-indexed changes, accounts, groups and projects and adds their ids to the batch (`index_update`).
+The mergeable endpoint, `gerrit index changes`, `POST /changes/{id}/index` and
+`autoReindexIfStale` can reindex documents without a ref update. `WalJournal` listens for indexed
+changes, accounts, groups and projects and adds their IDs to the batch (`index_update`).
 A batch with no events becomes an `INDEX` entry. Changes are journaled in their repository,
 accounts and groups in `All-Users`, projects in `All-Projects`.
 
@@ -47,8 +47,8 @@ Replay and index rebuilds run under `EventReplay`, so a reindex is never journal
 
 ## Consumers must tolerate loss and duplication
 
-A committed notification normally reaches foreign nodes on a later sweep, after preceding ref
-entries in the same repository have been indexed. There is no order across repositories and no
+A committed notification reaches foreign nodes through a sweep or a
+[peer wake-up](gossip.md), after preceding ref entries in the same repository have been indexed. There is no order across repositories and no
 fixed latency bound: journal scheduling, sweep duration, backlog and failures all add delay.
 
 Plugins receive replayed events through the normal dispatcher. A plugin that forwards them to an

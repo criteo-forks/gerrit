@@ -147,7 +147,8 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
 
   @Override
   public void repositoryDeleted(Project.NameKey name) {
-    // Durable deletion requires a tombstone transaction and is intentionally not inferred from this hook.
+    // Durable deletion requires a tombstone transaction and is intentionally not inferred from this
+    // hook.
   }
 
   WalGitConfiguration configuration() {
@@ -167,11 +168,10 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     return storage;
   }
 
-  private LocalWalGitRepository openInitialized(
-      Project.NameKey name, ManifestStore manifestStore) throws IOException {
+  private LocalWalGitRepository openInitialized(Project.NameKey name, ManifestStore manifestStore)
+      throws IOException {
     LocalWalGitRepository repository =
-        new LocalWalGitRepository(
-            name, manifestStore, configuration.manifestRevalidateInterval());
+        new LocalWalGitRepository(name, manifestStore, configuration.manifestRevalidateInterval());
     if (!repository.exists()) {
       if (manifestStore.current().getRevision() != 0) {
         repository.close();

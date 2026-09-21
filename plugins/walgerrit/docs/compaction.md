@@ -8,14 +8,14 @@ These are separate operations: replacing a file in the manifest does not immedia
 
 `CompactionPolicy` plans from the manifest inventory without storage I/O.
 
-**Object packs use a geometric policy.** Candidates are sorted by size. The policy finds a break
+Object packs use a geometric policy. Candidates are sorted by size. The policy finds a break
 in the progression between neighboring packs, then extends the selected prefix while its combined
 size would crowd the next pack. It merges that prefix only when at least `compactMinPacks`
 (default `8`) qualify. `compactGeometricFactor` defaults to `2`; input packs larger than
 `compactMaxPackSize` (default `8g`) are excluded. That cap applies to inputs only; the merged
 pack may be larger, and the result need not satisfy the factor at every step.
 
-**Reftables merge from the top down.** Transaction tables and the small compacted tables directly
+Reftables merge from the top down. Transaction tables and the small compacted tables directly
 beneath them qualify once `compactMinReftables` (default `8`) accumulate. A compacted table larger
 than `compactSmallReftableSize` (default `8m`) remains a base until the whole stack reaches
 `compactMaxReftables` (default `32`), when all tables merge. Deletions must survive the merge so
@@ -129,7 +129,7 @@ All keys below belong to `[walgerrit]` except `core.dfs.blockLimit`.
 | `cacheSizeLimit` | `0` | Periodic disk-cache size target; `0` disables trimming. |
 | `core.dfs.blockLimit` | heap-based, with JGit default as a floor | Process-wide JGit block-cache size. |
 
-## Deliberate limits
+## Limits
 
 Compaction does not perform reachability-based garbage collection: it preserves objects in its
 inputs, including unreachable ones. Reclamation removes unreferenced files, including failed
