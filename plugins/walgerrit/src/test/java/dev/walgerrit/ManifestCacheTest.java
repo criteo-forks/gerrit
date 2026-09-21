@@ -38,4 +38,44 @@ class ManifestCacheTest {
     cache.offer("repo", new VersionedManifest(Manifest.newBuilder().setRevision(2).build(), "v2"));
     assertFalse(cache.validatedWithin("repo", 60_000, 1_000), "eviction forgets the validation");
   }
+
+  @Test
+  void aPeerAnnouncementSuspendsValidationUntilThatRevisionArrives() {
+    ManifestCache cache = new ManifestCache();
+    cache.offer("repo", new VersionedManifest(Manifest.newBuilder().setRevision(1).build(), "v1"));
+    cache.markValidated("repo", 1_000);
+    assertTrue(cache.validatedWithin("repo", 60_000, 2_000));
+
+    assertFalse(cache.expect("repo", "v1", 1), "the node already holds that manifest");
+    assertFalse(cache.expect("repo", "v0", 0), "the node already holds a newer one");
+    assertFalse(cache.expecting("repo"));
+    assertTrue(cache.validatedWithin("repo", 60_000, 2_000));
+
+    assertTrue(cache.expect("repo", "v2", 2));
+    assertTrue(cache.expecting("repo"));
+    assertFalse(cache.validatedWithin("repo", 60_000, 2_000), "announced but not read");
+    cache.markValidated("repo", 3_000);
+    assertFalse(cache.validatedWithin("repo", 60_000, 3_000), "a listing does not settle it");
+
+    cache.offer("repo", new VersionedManifest(Manifest.newBuilder().setRevision(2).build(), "v2"));
+    assertFalse(cache.expecting("repo"));
+    cache.markValidated("repo", 4_000);
+    assertTrue(cache.validatedWithin("repo", 60_000, 4_000));
+  }
+
+  @Test
+  void theStoreConfirmingTheViewSettlesAnAnnouncement() {
+    ManifestCache cache = new ManifestCache();
+    cache.offer("repo", new VersionedManifest(Manifest.newBuilder().setRevision(1).build(), "v1"));
+    assertTrue(cache.expect("repo", "v2", 2));
+    cache.markCurrent("repo", 1_000);
+    assertFalse(cache.expecting("repo"));
+    assertTrue(cache.validatedWithin("repo", 60_000, 1_000));
+
+    assertTrue(cache.expect("repo", "v3", 3));
+    cache.offer("repo", new VersionedManifest(Manifest.newBuilder().setRevision(2).build(), "v2"));
+    assertTrue(cache.expecting("repo"), "an older revision does not settle it");
+    cache.evict("repo");
+    assertFalse(cache.expecting("repo"));
+  }
 }

@@ -30,6 +30,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.eclipse.jgit.lib.Config;
@@ -287,6 +288,53 @@ class IndexEventTailerTest {
     batch.stop();
 
     assertTrue(Files.isRegularFile(readiness.markerPath()));
+  }
+
+  @Test
+  void wakeUpReplaysOneRepositoryWithoutASweep() throws Exception {
+    Path sharedWal = storagePath.resolve("shared-wal");
+    WalGitRepositoryManager writer = configuredManager(sharedWal, storagePath.resolve("writer"));
+    org.eclipse.jgit.lib.Config readerConfig = new org.eclipse.jgit.lib.Config();
+    readerConfig.setString("walgerrit", null, "storagePath", sharedWal.toString());
+    readerConfig.setString("walgerrit", null, "indexPollInterval", "1 hour");
+    WalGitRepositoryManager reader =
+        new WalGitRepositoryManager(
+            WalGitConfiguration.from(readerConfig, storagePath.resolve("reader")));
+    Project.NameKey project = Project.nameKey("platform/wake-up");
+    writer.createRepository(project).close();
+
+    RecordingApplier applier = new RecordingApplier();
+    IndexEventTailer tailer = startingTailer(reader, applier, readiness("wake-up-node"));
+    tailer.wake(project, null); // No tailer thread yet: the startup sweep covers this.
+    tailer.start();
+    try {
+      ObjectId commit;
+      try (Repository repository = writer.openRepository(project)) {
+        commit = WalGitRepositoryManagerTest.insertCommit(repository, "woken");
+        RefUpdate update = repository.updateRef(Constants.R_HEADS + "main");
+        update.setNewObjectId(commit);
+        assertEquals(RefUpdate.Result.NEW, update.update());
+      }
+      String version =
+          writer.storage().manifestStore(project).refreshVersionedManifest().version();
+      assertFalse(applier.sawUpdate(Constants.R_HEADS + "main", commit));
+
+      tailer.wake(project, version);
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+      while (tailer.wakeUpsReplayed() < 1 && System.nanoTime() < deadline) {
+        Thread.sleep(10);
+      }
+      assertEquals(1, tailer.wakeUpsReplayed());
+      assertTrue(applier.sawUpdate(Constants.R_HEADS + "main", commit));
+
+      // The node replayed exactly that manifest: another wake-up for it is a no-op.
+      tailer.wake(project, version);
+      assertEquals(1, tailer.wakeUpsReplayed());
+    } finally {
+      tailer.stop();
+    }
+    tailer.wake(project, null); // Stopped: ignored rather than rejected.
+    assertEquals(1, tailer.wakeUpsReplayed());
   }
 
   private static org.eclipse.jgit.lib.Config durableLuceneConfig() {

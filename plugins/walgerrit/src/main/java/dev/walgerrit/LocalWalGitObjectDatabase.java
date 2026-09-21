@@ -347,11 +347,14 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
 
   /**
    * Adopts the newest manifest this node has observed, after a conditional read if the handle has
-   * gone longer than the configured interval without one. Returns whether the view changed.
+   * gone longer than the configured interval without one, or if a peer announced a manifest this
+   * node has not read yet. Returns whether the view changed.
    */
   boolean revalidateIfStale() throws IOException {
     long now = System.nanoTime();
-    if (revalidateIntervalNanos > 0 && now - lastRevalidationNanos >= revalidateIntervalNanos) {
+    boolean intervalElapsed =
+        revalidateIntervalNanos > 0 && now - lastRevalidationNanos >= revalidateIntervalNanos;
+    if (intervalElapsed || manifestStore.expectingNewerManifest()) {
       manifestStore.refresh();
       lastRevalidationNanos = now;
     }

@@ -16,11 +16,13 @@ package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import org.eclipse.jgit.lib.Config;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -202,6 +204,65 @@ class WalGitConfigurationTest {
           IllegalArgumentException.class,
           () -> WalGitConfiguration.from(config, sitePath),
           invalid[0]);
+    }
+  }
+
+  @Test
+  void gossipIsIdleUntilAPeerSourceIsConfigured() {
+    WalGitConfiguration defaults = WalGitConfiguration.from(new Config(), sitePath);
+    assertTrue(defaults.gossipEnabled());
+    assertFalse(defaults.gossipActive());
+    assertEquals(List.of(), defaults.gossipPeers());
+    assertNull(defaults.gossipPeerDnsName());
+    assertEquals(29419, defaults.gossipPort());
+    assertNull(defaults.gossipListenAddress());
+    assertEquals(Duration.ofSeconds(30), defaults.gossipPeerRefreshInterval());
+    assertNull(defaults.gossipSecret());
+
+    Config config = new Config();
+    config.setStringList(
+        "walgerrit", null, "gossipPeer", List.of("gerrit-1", " gerrit-2:30000 ", ""));
+    config.setString("walgerrit", null, "gossipPeerDnsName", "gerrit.gerrit-poc.svc.cluster.local");
+    config.setInt("walgerrit", null, "gossipPort", 29500);
+    config.setString("walgerrit", null, "gossipListenAddress", "10.0.0.7");
+    config.setString("walgerrit", null, "gossipPeerRefreshInterval", "5 sec");
+    config.setString("walgerrit", null, "gossipSecret", "s3cret");
+    WalGitConfiguration gossiping = WalGitConfiguration.from(config, sitePath);
+    assertTrue(gossiping.gossipActive());
+    assertEquals(List.of("gerrit-1", "gerrit-2:30000"), gossiping.gossipPeers());
+    assertEquals("gerrit.gerrit-poc.svc.cluster.local", gossiping.gossipPeerDnsName());
+    assertEquals(29500, gossiping.gossipPort());
+    assertEquals("10.0.0.7", gossiping.gossipListenAddress());
+    assertEquals(Duration.ofSeconds(5), gossiping.gossipPeerRefreshInterval());
+    assertEquals("s3cret", gossiping.gossipSecret());
+
+    config.setBoolean("walgerrit", null, "gossipEnabled", false);
+    assertFalse(WalGitConfiguration.from(config, sitePath).gossipActive());
+
+    Config dnsOnly = new Config();
+    dnsOnly.setString("walgerrit", null, "gossipPeerDnsName", "gerrit");
+    assertTrue(WalGitConfiguration.from(dnsOnly, sitePath).gossipActive());
+  }
+
+  @Test
+  void gossipSettingsAreValidated() {
+    for (String[] invalid :
+        new String[][] {
+          {"gossipPort", "0"},
+          {"gossipPort", "70000"},
+          {"gossipPeerRefreshInterval", "0"},
+          {"gossipPeer", "gerrit-1:99999"},
+          {"gossipPeer", ":29419"}
+        }) {
+      Config config = new Config();
+      config.setString("walgerrit", null, invalid[0], invalid[1]);
+      assertTrue(
+          assertThrows(
+                  IllegalArgumentException.class,
+                  () -> WalGitConfiguration.from(config, sitePath),
+                  invalid[0])
+              .getMessage()
+              .contains(invalid[0]));
     }
   }
 }

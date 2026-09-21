@@ -64,7 +64,7 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     this.storage = storage == null ? storageFor(configuration) : storage;
     this.runtime = runtime;
     this.compactor = new Compactor(this);
-    this.storage.onPublication(compactor::consider);
+    this.storage.onPublication((name, published) -> compactor.consider(name, published.manifest()));
   }
 
   @Override

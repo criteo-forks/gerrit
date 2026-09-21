@@ -16,6 +16,8 @@ package dev.walgerrit;
 import java.net.URI;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import org.eclipse.jgit.lib.Config;
@@ -55,7 +57,14 @@ record WalGitConfiguration(
     boolean rangedPackReads,
     long packFetchChunkSize,
     boolean eventJournalEnabled,
-    Duration sweepLeaseDuration) {
+    Duration sweepLeaseDuration,
+    boolean gossipEnabled,
+    List<String> gossipPeers,
+    String gossipPeerDnsName,
+    int gossipPort,
+    String gossipListenAddress,
+    Duration gossipPeerRefreshInterval,
+    String gossipSecret) {
   /**
    * Longest time an open repository handle serves reads without another conditional manifest
    * read. Every handle also revalidates when it starts a ref transaction, and when it is opened
@@ -119,6 +128,12 @@ record WalGitConfiguration(
   /** How often a node sweeps every repository to reclaim files and queue overdue compactions. */
   static final Duration DEFAULT_RECLAIM_INTERVAL = Duration.ofHours(6);
 
+  /** UDP port on which a node listens for its peers' wake-ups and to which it sends its own. */
+  static final int DEFAULT_GOSSIP_PORT = 29419;
+
+  /** How often peer names are resolved again, so a replaced pod is reached without a restart. */
+  static final Duration DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL = Duration.ofSeconds(30);
+
   private static final String SECTION = "walgerrit";
 
   /** The local backend below the site's data directory, with every other setting at its default. */
@@ -157,7 +172,22 @@ record WalGitConfiguration(
         true,
         DEFAULT_PACK_FETCH_CHUNK_SIZE,
         true,
-        DEFAULT_SWEEP_LEASE);
+        DEFAULT_SWEEP_LEASE,
+        true,
+        List.of(),
+        null,
+        DEFAULT_GOSSIP_PORT,
+        null,
+        DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL,
+        null);
+  }
+
+  /**
+   * Whether this node sends and receives peer wake-ups: gossip is enabled and at least one peer
+   * source, a fixed peer or a DNS name, is configured. See {@link GossipEndpoint}.
+   */
+  boolean gossipActive() {
+    return gossipEnabled && (!gossipPeers.isEmpty() || gossipPeerDnsName != null);
   }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
@@ -198,9 +228,28 @@ record WalGitConfiguration(
             config.getBoolean(SECTION, null, "rangedPackReads", true),
             config.getLong(SECTION, null, "packFetchChunkSize", DEFAULT_PACK_FETCH_CHUNK_SIZE),
             config.getBoolean(SECTION, null, "eventJournalEnabled", true),
-            duration(config, "sweepLeaseDuration", DEFAULT_SWEEP_LEASE));
+            duration(config, "sweepLeaseDuration", DEFAULT_SWEEP_LEASE),
+            config.getBoolean(SECTION, null, "gossipEnabled", true),
+            peers(config),
+            blankToNull(config.getString(SECTION, null, "gossipPeerDnsName")),
+            config.getInt(SECTION, null, "gossipPort", DEFAULT_GOSSIP_PORT),
+            blankToNull(config.getString(SECTION, null, "gossipListenAddress")),
+            duration(config, "gossipPeerRefreshInterval", DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL),
+            blankToNull(config.getString(SECTION, null, "gossipSecret")));
     configuration.validate();
     return configuration;
+  }
+
+  /** Every {@code gossipPeer} value, one {@code host[:port]} each, blanks dropped. */
+  private static List<String> peers(Config config) {
+    return Arrays.stream(config.getStringList(SECTION, null, "gossipPeer"))
+        .map(String::trim)
+        .filter(peer -> !peer.isEmpty())
+        .toList();
+  }
+
+  private static String blankToNull(String value) {
+    return value == null || value.isBlank() ? null : value;
   }
 
   private static Path path(Config config, Path sitePath, String key, String defaultValue) {
@@ -243,6 +292,16 @@ record WalGitConfiguration(
     require(isPositive(reclaimInterval), "reclaimInterval must be positive");
     require(isPositive(sweepLeaseDuration), "sweepLeaseDuration must be positive");
     require(cacheSizeLimit >= 0, "cacheSizeLimit must be zero or positive");
+    require(gossipPort >= 1 && gossipPort <= 65535, "gossipPort must be between 1 and 65535");
+    require(
+        isPositive(gossipPeerRefreshInterval), "gossipPeerRefreshInterval must be positive");
+    for (String peer : gossipPeers) {
+      try {
+        GossipPeers.parse(peer, gossipPort);
+      } catch (IllegalArgumentException invalid) {
+        throw new IllegalArgumentException("walgerrit.gossipPeer is invalid: " + peer, invalid);
+      }
+    }
   }
 
   private static boolean isPositive(Duration duration) {

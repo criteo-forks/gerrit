@@ -139,6 +139,12 @@ requires a store whose listing and conditional-write semantics satisfy the backe
 Sweep duration, log backlog, index work and retries add latency. Repository opens and ref
 transactions also discover new manifests, but do not replace the tailer's index work.
 
+With peers configured, a node also replays a repository as soon as a peer's UDP wake-up names
+it, on the tailer thread and through the same catch-up as a sweep: the cached manifest when it
+already matches the announced version, otherwise one conditional read, then the intervening log
+entries. Convergence then no longer waits for the sweep in the common case; the sweep remains the
+bound for whatever a lost datagram missed. See [Peer wake-ups](gossip.md).
+
 ## Replay
 
 The manifest names the log head; each entry names its predecessor. The tailer walks backward to

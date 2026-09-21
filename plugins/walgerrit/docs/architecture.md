@@ -13,9 +13,9 @@ GitRepositoryManager
     |
 WalGitRepositoryManager + JGit DFS/reftables
     |
-Immutable files -> immutable log entry -> manifest CAS
+Immutable files -> immutable log entry -> manifest CAS --UDP hint--> peers
                           |
-                  Each node's WAL tailer
+                  Each node's WAL tailer (sweep, or a peer's hint)
                           |
                   Local Lucene and caches
 ```
@@ -43,6 +43,11 @@ local indexes and saves a durable cursor after the index writes finish. A listin
 Startup catches up before Gerrit opens its listeners. Later sweeps maintain readiness; a cursor
 that cannot be replayed can trigger a full rebuild. Search convergence is asynchronous and has
 no global order across repositories. See [Index events](index-events.md).
+
+A node with peers configured also tells them over UDP what it just published. Their tailers
+replay that repository before their next sweep, and their open handles revalidate on their next
+read. The datagram is a hint; the store and the sweep remain the sources of truth. See
+[Peer wake-ups](gossip.md).
 
 Public Gerrit notifications use separate, best-effort `EVENT` entries. Their delivery guarantee
 is weaker than the durable ref payload used for indexing. See [Events](events.md).

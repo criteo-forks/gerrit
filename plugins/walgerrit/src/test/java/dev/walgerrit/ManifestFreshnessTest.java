@@ -15,9 +15,12 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
+import dev.walgerrit.ManifestCache.VersionedManifest;
 import java.nio.file.Path;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
@@ -60,6 +63,36 @@ class ManifestFreshnessTest {
       // The older handle now adopts the manifest its node has already observed, with no read.
       assertEquals(commit, staleReader.exactRef(MAIN).getObjectId());
       assertEquals(Constants.OBJ_COMMIT, staleReader.open(commit).getType());
+    }
+  }
+
+  @Test
+  void peerWakeUpMakesAnOpenHandleRevalidateWhateverItsInterval() throws Exception {
+    WalGitRepositoryManager nodeA = node("node-a", "0");
+    WalGitRepositoryManager nodeB = node("node-b", "0");
+    Project.NameKey project = Project.nameKey("platform/wake-up");
+    nodeA.createRepository(project).close();
+
+    try (Repository writer = nodeA.openRepository(project);
+        Repository reader = nodeB.openRepository(project)) {
+      assertNull(reader.exactRef(MAIN));
+      ObjectId commit = publishMain(writer, "from node A");
+      assertNull(reader.exactRef(MAIN), "periodic revalidation is off");
+
+      // What node A's gossip endpoint tells node B about the publication.
+      VersionedManifest published =
+          nodeA.storage().manifestStore(project).refreshVersionedManifest();
+      assertTrue(
+          nodeB.storage()
+              .expectManifest(project, published.version(), published.manifest().getRevision()));
+
+      // The open handle's next lookup revalidates, with no open, scan or elapsed interval.
+      assertEquals(commit, reader.exactRef(MAIN).getObjectId());
+      assertFalse(nodeB.storage().manifestStore(project).expectingNewerManifest());
+      assertFalse(
+          nodeB.storage()
+              .expectManifest(project, published.version(), published.manifest().getRevision()),
+          "an announcement of what the node already holds changes nothing");
     }
   }
 

@@ -118,6 +118,37 @@ Setting `manifestRevalidateOnOpen = false` allows an open to reuse a recently va
 view. This reduces reads during offline reindexing but gives up freshness at every open. Ref
 transactions still revalidate. See [Freshness](docs/consistency.md#freshness).
 
+## Peers wake each other up over UDP
+
+Without gossip, a node learns of another node's write at its next conditional read, and its
+search index at its next sweep. With peers configured, a node also sends one small UDP datagram
+per publication to every peer, naming the repository and the manifest version it just wrote. A
+receiving node marks its view of that repository as due for revalidation and replays the
+repository's log at once, ahead of the sweep. Every read of the store stays conditional.
+
+```ini
+[walgerrit]
+  gossipPeerDnsName = gerrit.gerrit-poc.svc.cluster.local
+```
+
+A Kubernetes headless service answers with every pod's address, so a StatefulSet needs no
+per-pod list. Fixed peers work too: `gossipPeer = gerrit-1:29419`, one key per peer. The port
+is UDP.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `gossipEnabled` | `true` | Send and receive wake-ups once a peer source is configured. |
+| `gossipPeer` | none | One peer as `host[:port]`; repeat the key for each peer. |
+| `gossipPeerDnsName` | none | A name whose every address record is a peer on `gossipPort`. |
+| `gossipPort` | `29419` | UDP port to listen on, and to send to for peers that name none. |
+| `gossipListenAddress` | all interfaces | Local address to bind. |
+| `gossipPeerRefreshInterval` | `30 sec` | How often peer names are resolved again. |
+| `gossipSecret` | none | Shared secret, best kept in `secure.config`; datagrams without its HMAC are dropped. |
+
+Gossip is a hint, never a source of truth. A lost datagram costs the latency of the next sweep
+or conditional read; a duplicate or forged one costs one conditional read that returns nothing
+new. See [Peer wake-ups](docs/gossip.md).
+
 ## Cold reads fetch only the needed pack chunks
 
 The S3 backend fetches indexes, bitmaps and reftables whole. Packs larger than
@@ -184,4 +215,5 @@ results for the revision being deployed.
 | JGit integration and test coverage | [JGit/CAS audit](docs/jgit-cas-deep-dive.md) |
 | Local search and recovery | [Index events](docs/index-events.md) |
 | Cross-node notifications | [Events in the WAL](docs/events.md) |
+| Peer wake-ups over UDP | [Gossip](docs/gossip.md) |
 | Shared login cookies | [Web sessions](docs/web-sessions.md) |

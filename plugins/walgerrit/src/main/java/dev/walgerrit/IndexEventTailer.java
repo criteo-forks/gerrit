@@ -37,8 +37,10 @@ import java.util.NavigableMap;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import org.eclipse.jgit.lib.Config;
 import org.slf4j.Logger;
@@ -50,7 +52,9 @@ import org.slf4j.LoggerFactory;
  * <p>Each sweep is one paginated listing of the manifests prefix, which yields every repository
  * with the current version of its manifest. A repository is replayed only when that version
  * differs from the one this node last caught up to, so an unchanged repository costs nothing
- * beyond its share of the listing, and the sweep interval is the cross-node convergence latency.
+ * beyond its share of the listing, and the sweep interval bounds cross-node convergence. A peer's
+ * wake-up (see {@link GossipEndpoint}) replays one repository ahead of the sweep, on the same
+ * thread and through the same {@link #catchUp} path.
  *
  * <p>A cursor that cannot be advanced by replay, because it is too far behind, ahead of a
  * rolled-back head, or names a transaction the manifest no longer does, makes the node rebuild all
@@ -73,7 +77,10 @@ final class IndexEventTailer implements LifecycleListener {
   private final IndexRebuilder rebuilder;
   /** Manifest version at which this node last confirmed each repository's cursor was at head. */
   private final Map<Project.NameKey, String> caughtUpVersions = new ConcurrentHashMap<>();
-  private ScheduledExecutorService executor;
+  /** Repositories a peer's wake-up queued for replay that the tailer thread has not started. */
+  private final Set<Project.NameKey> pendingWakeUps = ConcurrentHashMap.newKeySet();
+  private final AtomicLong wakeUpsReplayed = new AtomicLong();
+  private volatile ScheduledExecutorService executor;
   private boolean participating;
 
   @Inject
@@ -85,7 +92,8 @@ final class IndexEventTailer implements LifecycleListener {
       @GerritServerConfig Config serverConfig,
       IndexEventReadiness readiness,
       GerritIndexRebuilder rebuilder,
-      GerritEventReplayer replayer) {
+      GerritEventReplayer replayer,
+      GossipEndpoint gossip) {
     this(
         asWalGit(repositories),
         (IndexEventApplier) applier,
@@ -95,6 +103,7 @@ final class IndexEventTailer implements LifecycleListener {
         readiness,
         rebuilder,
         replayer);
+    gossip.onHint((project, hint) -> wake(project, hint.getManifestVersion()));
   }
 
   IndexEventTailer(
@@ -436,6 +445,56 @@ final class IndexEventTailer implements LifecycleListener {
   /** Test hook: decide by writer identity which entries came from another node. */
   void foreignWriter(Predicate<String> foreignWriter) {
     this.foreignWriter = foreignWriter;
+  }
+
+  /**
+   * A peer's wake-up: replays {@code project} on the tailer thread now rather than at the next
+   * sweep. {@code version} is the manifest version the peer published, or null or empty when
+   * unknown. Wake-ups for a repository coalesce while one is queued; one that arrives during the
+   * replay queues another, since that replay may have read an older manifest. Before start and
+   * after stop, wake-ups are ignored and the sweep covers the repository.
+   */
+  void wake(Project.NameKey project, String version) {
+    ScheduledExecutorService running = executor;
+    if (running == null) {
+      return;
+    }
+    String announced = version == null || version.isEmpty() ? null : version;
+    if (announced != null && announced.equals(caughtUpVersions.get(project))) {
+      return; // This node already replayed exactly that manifest.
+    }
+    if (!pendingWakeUps.add(project)) {
+      return;
+    }
+    try {
+      running.execute(() -> replayWakeUp(project, announced));
+    } catch (RejectedExecutionException stopped) {
+      pendingWakeUps.remove(project);
+    }
+  }
+
+  /** Repositories replayed because a peer asked, rather than found by a sweep. */
+  long wakeUpsReplayed() {
+    return wakeUpsReplayed.get();
+  }
+
+  private void replayWakeUp(Project.NameKey project, String version) {
+    pendingWakeUps.remove(project);
+    try {
+      catchUp(project, version);
+      wakeUpsReplayed.incrementAndGet();
+    } catch (IndexRebuildRequiredException rebuildRequired) {
+      // Whether to rebuild is the sweep's decision; it will find the same cursor.
+      logger.warn(
+          "WalGerrit wake-up for {} cannot be replayed; leaving it to the next sweep: {}",
+          project.get(),
+          rebuildRequired.getMessage());
+    } catch (IOException | RuntimeException failure) {
+      logger.warn(
+          "WalGerrit wake-up replay failed for {}; the next sweep retries: {}",
+          project.get(),
+          failure.toString());
+    }
   }
 
   void runBackgroundSweep() {

@@ -15,15 +15,19 @@
 package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
-import dev.walgerrit.proto.StorageProto.Manifest;
+import dev.walgerrit.ManifestCache.VersionedManifest;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.List;
 import java.util.NavigableMap;
 import java.util.NavigableSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BiConsumer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Maps Gerrit project names onto object-store keys and node-local cache paths.
@@ -34,6 +38,7 @@ import java.util.function.BiConsumer;
  * are discovered and how the index-event sweep finds the ones that changed without reading any.
  */
 final class StorageLayout {
+  private static final Logger logger = LoggerFactory.getLogger(StorageLayout.class);
   private static final String MANIFESTS_DIRECTORY = "manifests";
   private static final String REPOSITORIES_DIRECTORY = "repos";
   private static final String LEASES_DIRECTORY = "leases";
@@ -53,7 +58,8 @@ final class StorageLayout {
   private final java.util.concurrent.ConcurrentHashMap<Path, ChunkedFile> chunkedFiles =
       new java.util.concurrent.ConcurrentHashMap<>();
   private final RepositoryLocks repositoryLocks = new RepositoryLocks();
-  private volatile BiConsumer<Project.NameKey, Manifest> publicationListener = (name, manifest) -> {};
+  private final List<BiConsumer<Project.NameKey, VersionedManifest>> publicationListeners =
+      new CopyOnWriteArrayList<>();
 
   StorageLayout(Path root) {
     this(new FileObjectStore(root), root, root.resolve("index-events"), "");
@@ -102,9 +108,36 @@ final class StorageLayout {
     return chunkedFiles.size();
   }
 
-  /** Observes every manifest a store created by this layout publishes. */
-  void onPublication(BiConsumer<Project.NameKey, Manifest> listener) {
-    publicationListener = listener;
+  /**
+   * Observes every manifest a store created by this layout publishes, with the version the store
+   * assigned it, after the CAS. Listeners run in registration order on the publishing thread; one
+   * that fails is logged and does not stop the others, and none can fail the publication.
+   */
+  void onPublication(BiConsumer<Project.NameKey, VersionedManifest> listener) {
+    publicationListeners.add(listener);
+  }
+
+  /**
+   * Records a peer's wake-up for {@code name}: it published the manifest at {@code version} and
+   * {@code revision}. Until this node reads a manifest at that revision, or the store confirms its
+   * view is current, the node's view of the repository does not count as recently validated.
+   * Returns false when this node already holds that manifest or a newer one.
+   *
+   * @throws IOException for a name that is not a valid project name
+   */
+  boolean expectManifest(Project.NameKey name, String version, long revision) throws IOException {
+    return manifestCache.expect(
+        manifestsPrefix + "/" + repositoryRelativePath(name), version, revision);
+  }
+
+  private void published(Project.NameKey name, VersionedManifest manifest) {
+    for (BiConsumer<Project.NameKey, VersionedManifest> listener : publicationListeners) {
+      try {
+        listener.accept(name, manifest);
+      } catch (RuntimeException failure) {
+        logger.warn("Post-publication listener failed for {}", name.get(), failure);
+      }
+    }
   }
 
   Path cacheRepositoriesPath() {
@@ -146,7 +179,7 @@ final class StorageLayout {
         indexCursorRepositoriesPath.resolve(relative + ".cursor"),
         name.get(),
         Clock.systemUTC(),
-        manifest -> publicationListener.accept(name, manifest),
+        manifest -> published(name, manifest),
         manifestCache,
         repositoryLocks,
         chunkedFiles,

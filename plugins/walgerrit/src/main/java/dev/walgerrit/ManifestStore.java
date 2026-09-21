@@ -79,7 +79,7 @@ final class ManifestStore {
   private final long packFetchChunkSize;
   private final String repositoryName;
   private final Clock clock;
-  private final Consumer<Manifest> afterPublish;
+  private final Consumer<VersionedManifest> afterPublish;
   private final ManifestCache cache;
   private final String cacheKey;
   private final ReentrantLock writeLock;
@@ -113,8 +113,8 @@ final class ManifestStore {
    * @param objectStore holds the repository's immutable pack, index, reftable and log objects
    * @param manifestObjects holds {@code manifest.pb}; kept apart so that all manifests share one
    *     listable prefix
-   * @param afterPublish sees every manifest this store publishes, after the CAS; the compactor
-   *     evaluates its policy there
+   * @param afterPublish sees every manifest this store publishes, with its store version, after
+   *     the CAS; the compactor evaluates its policy there and the gossip endpoint tells the peers
    * @param chunkedFiles the node-wide registry of packs being fetched in chunks, shared so that
    *     every handle of a pack reads through one sparse file
    * @param packFetchChunkSize chunk size for fetching packs larger than one chunk on demand; 0
@@ -129,7 +129,7 @@ final class ManifestStore {
       Path indexCursorPath,
       String repositoryName,
       Clock clock,
-      Consumer<Manifest> afterPublish,
+      Consumer<VersionedManifest> afterPublish,
       ManifestCache cache,
       RepositoryLocks locks,
       java.util.concurrent.ConcurrentMap<Path, ChunkedFile> chunkedFiles,
@@ -257,6 +257,15 @@ final class ManifestStore {
     if (known != null && known.version().equals(version)) {
       cache.markValidated(cacheKey, clock.millis());
     }
+  }
+
+  /**
+   * Whether a peer announced a manifest for this repository that this node has not read yet. An
+   * open handle then revalidates on its next lookup instead of waiting out its interval. See
+   * {@link StorageLayout#expectManifest}.
+   */
+  boolean expectingNewerManifest() {
+    return cache.expecting(cacheKey);
   }
 
   /** The key of the log entry with this sequence and transaction id. */
@@ -487,20 +496,20 @@ final class ManifestStore {
             failure instanceof IOException io
                 ? io
                 : new IOException("Manifest conditional write failed", failure);
-        Manifest fresh;
+        VersionedManifest fresh;
         boolean landed;
         try {
-          fresh = refresh();
-          landed = transactionLanded(fresh, sequence, transactionId);
+          fresh = refreshVersionedManifest();
+          landed = transactionLanded(fresh.manifest(), sequence, transactionId);
         } catch (IOException | RuntimeException verificationFailure) {
           cause.addSuppressed(verificationFailure);
           throw new AmbiguousPublicationException(sequence, transactionId, cause);
         }
         if (landed) {
           notifyPublished(fresh);
-          return fresh;
+          return fresh.manifest();
         }
-        if (fresh.getHeadSeq() < sequence) {
+        if (fresh.manifest().getHeadSeq() < sequence) {
           throw new AmbiguousPublicationException(sequence, transactionId, cause);
         }
         // A different transaction occupies the sequence, so this CAS cannot still land. A
@@ -510,8 +519,9 @@ final class ManifestStore {
         }
         continue;
       }
-      cache.offer(cacheKey, new VersionedManifest(updated, stored.version()));
-      notifyPublished(updated);
+      VersionedManifest published = new VersionedManifest(updated, stored.version());
+      cache.offer(cacheKey, published);
+      notifyPublished(published);
       return updated;
     }
     throw new IOException("Manifest CAS did not converge after " + MAX_CAS_ATTEMPTS + " attempts");
@@ -534,7 +544,7 @@ final class ManifestStore {
     return new Resolution(fresh, transactionLanded(fresh, sequence, transactionId));
   }
 
-  private void notifyPublished(Manifest manifest) {
+  private void notifyPublished(VersionedManifest manifest) {
     try {
       afterPublish.accept(manifest);
     } catch (RuntimeException failure) {
@@ -767,7 +777,8 @@ final class ManifestStore {
               "Object store reported an unchanged manifest without a known version: "
                   + repositoryName);
         }
-        cache.markValidated(cacheKey, clock.millis());
+        // The store itself says this node's view is current, whatever a peer announced.
+        cache.markCurrent(cacheKey, clock.millis());
         yield Optional.of(known);
       }
       case ABSENT -> {

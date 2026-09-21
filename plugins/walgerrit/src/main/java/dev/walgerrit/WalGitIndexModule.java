@@ -26,6 +26,8 @@ import com.google.gerrit.server.events.EventListener;
 public final class WalGitIndexModule extends LifecycleModule {
   @Override
   protected void configure() {
+    // Peers' wake-ups let the tailer replay a repository before its next sweep finds it.
+    listener().to(GossipEndpoint.class);
     listener().to(IndexEventTailer.class);
     // What this node does travels in the WAL to the other nodes' tailers: the events it fires and
     // the documents it reindexes with no ref update behind them.

@@ -15,6 +15,7 @@ qualification for every deployment.
 | Maintenance | Geometric object compaction; tiered reftable merging; leases; grace-based reclamation; heap-sized JGit block cache. | [Compaction](compaction.md) |
 | Import | Bare-repository import; optional staging, repack and connectivity checks; ref verification; offline cursor seeding. | [Import](import.md) |
 | Notifications | Best-effort cross-node event forwarding; reindexed documents journaled so every node's index follows. | [Events](events.md) |
+| Peer wake-ups | One UDP hint per publication to every peer; receivers revalidate and replay ahead of the sweep; optional HMAC. | [Gossip](gossip.md) |
 | Sessions | Optional signed cookies and a shared signing key. | [Web sessions](web-sessions.md) |
 | Packaging | Matched WAR/JAR bundles, checksums, smoke testing and tagged prereleases. | [Deployment bundle](artifact-bundle.md) |
 
@@ -33,6 +34,6 @@ sources and runnable checks. Use results from the exact revision and environment
 
 ## Optional extensions
 
-Peer wake-ups could reduce index latency below the polling delay. Multi-pack indexes could reduce
-pack-index scans, but require a storage-format extension for coverage relationships. Native GCS
-conditional requests and per-session revocation are not implemented.
+Multi-pack indexes could reduce pack-index scans, but require a storage-format extension for
+coverage relationships. Native GCS conditional requests and per-session revocation are not
+implemented.
