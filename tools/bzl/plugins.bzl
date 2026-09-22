@@ -14,7 +14,7 @@ CORE_PLUGINS = [
 ]
 
 CUSTOM_PLUGINS = [
-    # Add custom core plugins here
+    "rename-project",
 ]
 
 CUSTOM_PLUGINS_TEST_DEPS = [

@@ -67,7 +67,8 @@ record WalGitConfiguration(
     String gossipListenAddress,
     Duration gossipPeerRefreshInterval,
     String gossipSecret,
-    Set<Project.NameKey> systemProjects) {
+    Project.NameKey allProjects,
+    Project.NameKey allUsers) {
   /**
    * Longest time an open repository handle serves reads without another conditional manifest read.
    * Every handle also revalidates when it starts a ref transaction, and when it is opened unless
@@ -192,7 +193,13 @@ record WalGitConfiguration(
         null,
         DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL,
         null,
-        Set.of(Project.nameKey("All-Projects"), Project.nameKey("All-Users")));
+        Project.nameKey("All-Projects"),
+        Project.nameKey("All-Users"));
+  }
+
+  /** The projects Gerrit itself needs under their configured names. */
+  Set<Project.NameKey> systemProjects() {
+    return Set.of(allProjects, allUsers);
   }
 
   /**
@@ -252,19 +259,14 @@ record WalGitConfiguration(
             blankToNull(config.getString(SECTION, null, "gossipListenAddress")),
             duration(config, "gossipPeerRefreshInterval", DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL),
             blankToNull(config.getString(SECTION, null, "gossipSecret")),
-            systemProjects(config));
+            Project.nameKey(
+                Optional.ofNullable(config.getString("gerrit", null, "allProjects"))
+                    .orElse("All-Projects")),
+            Project.nameKey(
+                Optional.ofNullable(config.getString("gerrit", null, "allUsers"))
+                    .orElse("All-Users")));
     configuration.validate();
     return configuration;
-  }
-
-  /** The projects Gerrit itself needs under their configured names. */
-  private static Set<Project.NameKey> systemProjects(Config config) {
-    return Set.of(
-        Project.nameKey(
-            Optional.ofNullable(config.getString("gerrit", null, "allProjects"))
-                .orElse("All-Projects")),
-        Project.nameKey(
-            Optional.ofNullable(config.getString("gerrit", null, "allUsers")).orElse("All-Users")));
   }
 
   /** Every {@code gossipPeer} value, one {@code host[:port]} each, blanks dropped. */

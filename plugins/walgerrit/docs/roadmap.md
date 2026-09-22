@@ -9,7 +9,7 @@ still requires tests against the target storage service and configuration.
 | --- | --- | --- |
 | Gerrit integration | Library modules; daemon and batch repository access; init helpers; acceptance-test adapter. | [Architecture](architecture.md) |
 | Storage | Local and S3-compatible backends; immutable files; format-4 manifest CAS; bounded retries and ambiguous-outcome recovery. | [Consistency](consistency.md) |
-| Names | Id-keyed repositories; catalog of name bindings; rename and delete with write-epoch fencing; resumable operations; index reconciliation on every node. | [Project names](namespace.md) |
+| Names | Id-keyed repositories; catalog of name bindings; rename and delete with write-epoch fencing; account watches, destinations and subscription permissions rewritten; resumable operations; index reconciliation on every node; replication from the rename-project plugin. | [Project names](namespace.md) |
 | Reads | Shared manifest cache; conditional revalidation; ranged S3 pack reads; configurable cache trimming. | [README](../README.md) |
 | Indexes | Durable ref payloads; node-local replay cursors; startup catch-up; readiness; automatic rebuild for stale cursors. | [Index events](index-events.md) |
 | Maintenance | Geometric object compaction; tiered reftable merging; leases; grace-based reclamation; heap-sized JGit block cache. | [Compaction](compaction.md) |
@@ -27,8 +27,9 @@ sources and runnable checks. Use results from the exact revision and environment
 - Batched Lucene checkpoints to replace the cost of committing every replayed index write.
 - Replay lag/error metrics and operational alerts beyond the readiness gauge and logs.
 - Reclaiming a deleted repository's files, snapshots and ongoing integrity checking.
-- Moving project-name references outside the repository on rename: watch entries, plugin
-  configuration and access rules that name the project.
+- Renaming a parent, or a project that superprojects subscribe to; both are refused. Textual
+  references are not rewritten; those in All-Projects' configuration and in accounts' watch
+  filters and named queries are reported.
 - A tested end-to-end cutover and rollback procedure, including writes accepted after cutover.
 - Explicit bounds or distributed protection for writers and readers that outlive reclamation's
   grace period.

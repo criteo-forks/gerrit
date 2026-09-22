@@ -147,7 +147,7 @@ class WalGitRepositoryManagerTest {
                         reserved,
                         Catalog.State.PENDING,
                         0,
-                        new Catalog.Operation("op-1", Catalog.Kind.CREATE, 0, 0, null),
+                        new Catalog.Operation("op-1", Catalog.Kind.CREATE, 0, 0, null, false),
                         null,
                         0)));
     ManifestStore manifestStore = manager.storage().manifestStore(reserved);

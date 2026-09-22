@@ -179,9 +179,13 @@ java -jar gerrit.war walgerrit-namespace -d "$site" rename platform/old platform
 java -jar gerrit.war walgerrit-namespace -d "$site" delete platform/gone
 ```
 
-Every node's indexes follow the catalog. A name is never reused: pushing to the old name fails
-with the new one. Read [Project names](docs/namespace.md) for the protocol, what a deletion keeps,
-and how to finish an operation whose node died.
+Every node's indexes follow the catalog. Account watches, destinations and subscription
+permissions naming the project are rewritten before the new name is served; a parent, or a project
+that superprojects may subscribe to, is refused. A name is never reused: pushing to the old name
+fails with the new one. Read [Project names](docs/namespace.md) for the protocol, what is rewritten
+and what is only reported, what a deletion keeps, and how to finish an operation whose node died.
+A replica following a Gerrit that runs the rename-project plugin installs this fork's
+`rename-project` plugin, which accepts that plugin's replication.
 
 ## Verify the integration
 

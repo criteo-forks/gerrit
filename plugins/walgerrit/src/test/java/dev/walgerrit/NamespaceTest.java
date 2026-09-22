@@ -33,6 +33,7 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -65,7 +66,7 @@ class NamespaceTest {
     }
     RepositoryId id = node.idOf(OLD);
 
-    node.namespace().rename(OLD, NEW);
+    node.namespace().rename(OLD, NEW, false);
 
     assertEquals(id, node.idOf(NEW), "the repository kept its id");
     try (Repository renamed = node.openRepository(NEW)) {
@@ -98,7 +99,7 @@ class NamespaceTest {
     try (Repository before = node.openRepository(OLD)) {
       ObjectId first = publish(before, "admitted under epoch 0");
 
-      node.namespace().rename(OLD, NEW);
+      node.namespace().rename(OLD, NEW, false);
       long headAfterRename = node.storage().manifestStore(node.idOf(NEW)).refresh().getHeadSeq();
 
       ObjectId stale = WalGitRepositoryManagerTest.insertCommit(before, "after the fence");
@@ -135,7 +136,7 @@ class NamespaceTest {
     }
     RepositoryId id = node.idOf(OLD);
     try (Repository before = node.openRepository(OLD)) {
-      node.namespace().delete(OLD);
+      node.namespace().delete(OLD, false);
 
       assertEquals(GitRepositoryManager.Status.NON_EXISTENT, node.getRepositoryStatus(OLD));
       RepositoryNotFoundException gone =
@@ -167,7 +168,7 @@ class NamespaceTest {
     node.createRepository(service).close();
     assertEquals(Set.of(team, service), node.list());
 
-    node.namespace().rename(team, Project.nameKey("org"));
+    node.namespace().rename(team, Project.nameKey("org"), false);
 
     assertEquals(Set.of(Project.nameKey("org"), service), node.list());
     node.openRepository(service).close();
@@ -181,24 +182,24 @@ class NamespaceTest {
     node.createRepository(a).close();
     node.createRepository(b).close();
 
-    IOException taken = assertThrows(IOException.class, () -> node.namespace().rename(a, b));
+    IOException taken = assertThrows(IOException.class, () -> node.namespace().rename(a, b, false));
     assertTrue(taken.getMessage().contains("b exists"), taken.getMessage());
 
-    node.namespace().delete(b);
-    IOException retired = assertThrows(IOException.class, () -> node.namespace().rename(a, b));
+    node.namespace().delete(b, false);
+    IOException retired = assertThrows(IOException.class, () -> node.namespace().rename(a, b, false));
     assertTrue(retired.getMessage().contains("never reused"), retired.getMessage());
     assertThrows(RepositoryExistsException.class, () -> node.createRepository(b));
 
     IOException missing =
-        assertThrows(IOException.class, () -> node.namespace().rename(Project.nameKey("x"), a));
+        assertThrows(IOException.class, () -> node.namespace().rename(Project.nameKey("x"), a, false));
     assertTrue(missing.getMessage().contains("No project x"), missing.getMessage());
 
     Project.NameKey allUsers = Project.nameKey("All-Users");
     node.createRepository(allUsers).close();
     IOException system =
-        assertThrows(IOException.class, () -> node.namespace().rename(allUsers, Project.nameKey("y")));
+        assertThrows(IOException.class, () -> node.namespace().rename(allUsers, Project.nameKey("y"), false));
     assertTrue(system.getMessage().contains("system project"), system.getMessage());
-    assertThrows(IOException.class, () -> node.namespace().delete(allUsers));
+    assertThrows(IOException.class, () -> node.namespace().delete(allUsers, false));
     node.openRepository(allUsers).close();
     assertTrue(node.namespace().pending().isEmpty(), "refusals leave nothing in flight");
   }
@@ -328,7 +329,7 @@ class NamespaceTest {
     tailer.runOnce();
     assertEquals(List.of(NEW), applier.projects);
 
-    node.namespace().delete(NEW);
+    node.namespace().delete(NEW, false);
     tailer.runOnce();
     assertTrue(
         applier.namespaceChanges.contains(new NamespaceChange(NEW, id, Catalog.State.RETIRED, null)),
@@ -374,12 +375,33 @@ class NamespaceTest {
         IllegalArgumentException.class, () -> NamespaceProgram.run(node, List.of("frobnicate"), printer));
   }
 
+  @Test
+  void renamedToFollowsEveryRenameAndDeletedStaysTrue() throws Exception {
+    WalGitRepositoryManager node = node("a");
+    Project.NameKey newer = Project.nameKey("platform/newer");
+    node.createRepository(OLD).close();
+    assertEquals(Optional.empty(), node.namespace().renamedTo(OLD));
+
+    node.namespace().rename(OLD, NEW, true);
+    node.namespace().rename(NEW, newer, true);
+    assertEquals(Optional.of(newer), node.namespace().renamedTo(OLD));
+    assertEquals(Optional.of(newer), node.namespace().renamedTo(NEW));
+    assertEquals(Optional.empty(), node.namespace().renamedTo(newer));
+    assertFalse(node.namespace().deleted(newer));
+
+    node.namespace().delete(newer, true);
+    assertTrue(node.namespace().deleted(newer));
+    assertFalse(node.namespace().deleted(OLD), "renamed away, not deleted");
+    assertEquals(Optional.of(newer), node.namespace().renamedTo(OLD));
+    assertEquals(Optional.empty(), node.namespace().renamedTo(Project.nameKey("platform/unknown")));
+  }
+
   private static NamespaceChange pending(Project.NameKey name, RepositoryId id) {
     return new NamespaceChange(name, id, Catalog.State.PENDING, name.equals(OLD) ? NEW : null);
   }
 
   /** The first transition of a rename, as {@link Namespace#rename} makes it, and nothing more. */
-  private static void prepareRename(
+  static void prepareRename(
       WalGitRepositoryManager node, String operation, Project.NameKey from, Project.NameKey to)
       throws IOException {
     node.catalog()
@@ -392,7 +414,7 @@ class NamespaceTest {
                   source.with(
                       Catalog.State.PENDING,
                       source.epoch(),
-                      new Catalog.Operation(operation, Catalog.Kind.RENAME, source.epoch(), target, to),
+                      new Catalog.Operation(operation, Catalog.Kind.RENAME, source.epoch(), target, to, false),
                       to,
                       1),
                   new Catalog.Binding(
@@ -400,7 +422,7 @@ class NamespaceTest {
                       source.id(),
                       Catalog.State.PENDING,
                       target,
-                      new Catalog.Operation(operation, Catalog.Kind.RENAME, source.epoch(), target, from),
+                      new Catalog.Operation(operation, Catalog.Kind.RENAME, source.epoch(), target, from, false),
                       null,
                       1));
             });

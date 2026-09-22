@@ -94,9 +94,18 @@ final class Catalog {
     DELETE
   }
 
-  /** A namespace operation in flight, recorded on every binding it touches. */
+  /**
+   * A namespace operation in flight, recorded on every binding it touches. {@code replicated}: the
+   * operation follows one a primary made, whose name references arrive by replication, so none are
+   * rewritten here.
+   */
   record Operation(
-      String id, Kind kind, long expectedEpoch, long targetEpoch, @Nullable Project.NameKey other) {}
+      String id,
+      Kind kind,
+      long expectedEpoch,
+      long targetEpoch,
+      @Nullable Project.NameKey other,
+      boolean replicated) {}
 
   /**
    * One name's binding. {@code epoch} is the repository write epoch writers admitted under this
@@ -458,6 +467,9 @@ final class Catalog {
       if (op.other() != null) {
         config.setString("operation", null, "other", op.other().get());
       }
+      if (op.replicated()) {
+        config.setBoolean("operation", null, "replicated", true);
+      }
     }
     return config.toText().getBytes(StandardCharsets.UTF_8);
   }
@@ -479,7 +491,8 @@ final class Catalog {
               Kind.valueOf(config.getString("operation", null, "kind").toUpperCase(java.util.Locale.ROOT)),
               config.getLong("operation", null, "expectedEpoch", 0),
               config.getLong("operation", null, "targetEpoch", 0),
-              other == null ? null : Project.nameKey(other));
+              other == null ? null : Project.nameKey(other),
+              config.getBoolean("operation", null, "replicated", false));
     }
     String movedTo = config.getString("binding", null, "movedTo");
     return new Binding(
