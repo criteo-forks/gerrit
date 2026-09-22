@@ -66,12 +66,13 @@ class GroupCommitTest {
             });
     node("setup", shared, ignored -> {}).createRepository(PROJECT).close();
     WalGitRepositoryManager node = node("node-a", hooked, ignored -> {});
+    RepositoryId id = node.idOf(PROJECT);
     Map<String, ObjectId> expected = createRefsConcurrently(node, everyoneStarted, "t");
 
     assertEquals(
         2, hooked.matchedCasAttempts.get(), "the held CAS, then one CAS for everybody who queued");
-    Manifest manifest = manifest(shared);
-    LogEntry group = entry(shared, manifest);
+    Manifest manifest = manifest(shared, id);
+    LogEntry group = entry(shared, id, manifest);
     assertEquals(LogEntry.Kind.REF_UPDATE, group.getKind());
     assertEquals(WRITERS - 1, group.getRefTransaction().getUpdatesCount(), "one entry, five transactions");
     assertEquals(
@@ -160,17 +161,18 @@ class GroupCommitTest {
     FileObjectStore shared = new FileObjectStore(root.resolve("store"));
     WalGitRepositoryManager node = node("node-a", shared, ignored -> {});
     node.createRepository(PROJECT).close();
-    long sequenceBefore = manifest(shared).getHeadSeq();
+    RepositoryId id = node.idOf(PROJECT);
+    long sequenceBefore = manifest(shared, id).getHeadSeq();
     ObjectId commit;
     try (Repository repository = node.openRepository(PROJECT)) {
       commit = WalGitRepositoryManagerTest.insertCommit(repository, "flushed, never referenced");
       assertEquals(
-          sequenceBefore, manifest(shared).getHeadSeq(), "a flush alone publishes nothing");
+          sequenceBefore, manifest(shared, id).getHeadSeq(), "a flush alone publishes nothing");
       assertNotNull(repository.open(commit, Constants.OBJ_COMMIT), "the handle that wrote it reads it");
     }
-    Manifest manifest = manifest(shared);
+    Manifest manifest = manifest(shared, id);
     assertEquals(sequenceBefore + 1, manifest.getHeadSeq(), "closing the handle published the pack");
-    LogEntry entry = entry(shared, manifest);
+    LogEntry entry = entry(shared, id, manifest);
     assertEquals(LogEntry.Kind.PACK, entry.getKind());
     assertEquals(1, entry.getAdditionsCount());
     try (Repository other = node("node-b", shared, ignored -> {}).openRepository(PROJECT)) {
@@ -184,13 +186,14 @@ class GroupCommitTest {
     WalGitRepositoryManager node =
         node("node-a", shared, config -> config.setString("walgerrit", null, "reclaimGrace", "0"));
     node.createRepository(PROJECT).close();
+    String wal = "repos/" + node.idOf(PROJECT) + "/wal/";
     try (Repository repository = node.openRepository(PROJECT)) {
       ObjectId commit = WalGitRepositoryManagerTest.insertCommit(repository, "pending during a sweep");
-      int filesBefore = shared.listWithVersions("repos/" + PROJECT.get() + ".git/wal/").size();
+      int filesBefore = shared.listWithVersions(wal).size();
       node.compactor().reclaimer().reclaim(PROJECT);
       assertEquals(
           filesBefore,
-          shared.listWithVersions("repos/" + PROJECT.get() + ".git/wal/").size(),
+          shared.listWithVersions(wal).size(),
           "an unpublished pack is referenced by the transaction to come, not garbage");
       RefUpdate update = repository.updateRef(Constants.R_HEADS + "main");
       update.setNewObjectId(commit);
@@ -251,19 +254,17 @@ class GroupCommitTest {
     }
   }
 
-  private static Manifest manifest(ObjectStore store) throws IOException {
+  private static Manifest manifest(ObjectStore store, RepositoryId id) throws IOException {
     return Manifest.parseFrom(
-        store
-            .get("manifests/" + PROJECT.get() + ".git/" + ManifestStore.MANIFEST_FILE)
-            .orElseThrow()
-            .bytes());
+        store.get("manifests/" + id + "/" + ManifestStore.MANIFEST_FILE).orElseThrow().bytes());
   }
 
-  private static LogEntry entry(ObjectStore store, Manifest manifest) throws IOException {
+  private static LogEntry entry(ObjectStore store, RepositoryId id, Manifest manifest)
+      throws IOException {
     String key =
         "repos/"
-            + PROJECT.get()
-            + ".git/"
+            + id
+            + "/"
             + ManifestStore.logKey(manifest.getHeadSeq(), manifest.getHeadTransactionId());
     return LogEntry.parseFrom(store.get(key).orElseThrow().bytes());
   }

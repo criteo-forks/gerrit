@@ -78,6 +78,16 @@ a deletion can safely encounter an already deleted change.
 
 A missing or malformed `REF_UPDATE` payload, missing log entry, sequence error, index failure or
 cursor-write failure stops replay for that repository. Other repositories are still attempted.
+
+## The catalog is replayed first
+
+Each sweep replays the [catalog](namespace.md) before any repository. A catalog commit names the
+bindings it changed; the tailer evicts those projects' caches, refreshes the project list, and
+for each activated name reindexes the project and every change in the repository under that
+name. For a retired name it deletes the change documents by project and drops the project
+document. A repository whose only names are pending is left where it is and replayed once a name
+is active.
+Replayed entries are always indexed under the repository's current name.
 A failed startup sweep prevents startup; a failed background sweep revokes readiness. A later
 clean sweep restores it.
 
@@ -180,5 +190,5 @@ notifications before the captured heads are skipped.
 
 ## Format boundary
 
-The backend accepts manifest format 3. Older layouts have no automatic migration. Missing log
+The backend accepts manifest format 4. Older layouts have no automatic migration. Missing log
 objects or logical ref payloads are errors; they must not be treated as empty transactions.

@@ -41,7 +41,7 @@ class EventLogReplayTest {
         new WalGitRepositoryManager(new WalGitConfiguration(BackendType.LOCAL, storagePath));
     Project.NameKey project = Project.nameKey("platform/index");
     manager.createRepository(project).close();
-    ManifestStore store = manager.storage().manifestStore(project);
+    ManifestStore store = manager.manifestStore(project);
     RecordingReindexer home = new RecordingReindexer();
     IndexEventTailer homeTailer = tailer(manager, home, storagePath.resolve("home-READY"), false);
     homeTailer.catchUp(project); // Seed the cursor past the repository's creation.
@@ -129,7 +129,7 @@ class EventLogReplayTest {
         new WalGitRepositoryManager(new WalGitConfiguration(BackendType.LOCAL, storagePath));
     Project.NameKey project = Project.nameKey("platform/events");
     manager.createRepository(project).close();
-    ManifestStore store = manager.storage().manifestStore(project);
+    ManifestStore store = manager.manifestStore(project);
     List<LogEntry> replayed = new ArrayList<>();
     IndexEventTailer home =
         new IndexEventTailer(

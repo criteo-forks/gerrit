@@ -108,7 +108,7 @@ class RepositoryImporterTest {
       }
       assertEquals(expected.keySet(), names, "no ref beyond the source's was imported");
     }
-    Manifest manifest = manager.storage().manifestStore(project).refresh();
+    Manifest manifest = manager.manifestStore(project).refresh();
     assertTrue(manifest.getPacksList().stream().allMatch(p -> p.getSource().equals("COMPACT")));
     // JGit's GC packs head-reachable and other-ref-reachable objects separately; both come over.
     assertTrue(manifest.getPacksList().stream().filter(CompactionPolicy::isObjectPack).count() >= 1);
@@ -119,7 +119,7 @@ class RepositoryImporterTest {
     Report again = importer.importAll(source, Set.of(), 2);
     assertEquals(0, again.imported());
     assertEquals(1, again.alreadyImported());
-    assertEquals(manifest, manager.storage().manifestStore(project).refresh());
+    assertEquals(manifest, manager.manifestStore(project).refresh());
 
     // Another node sees the same repository and can write on top of it.
     WalGitRepositoryManager other = manager("node-b");
@@ -183,7 +183,7 @@ class RepositoryImporterTest {
         assertEquals(Constants.OBJ_COMMIT, imported.open(ref.getValue()).getType());
       }
     }
-    Manifest manifest = manager.storage().manifestStore(Project.nameKey("staged")).refresh();
+    Manifest manifest = manager.manifestStore(Project.nameKey("staged")).refresh();
     assertEquals(1, manifest.getPacksList().stream().filter(CompactionPolicy::isObjectPack).count(), "git repack -a produced one pack");
   }
 

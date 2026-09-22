@@ -71,15 +71,18 @@ class IndexCursorSeederTest {
         () -> tailer.catchUp(project),
         "without a cursor the log is further behind than the node may replay");
 
-    assertEquals(1, new IndexCursorSeeder(fresh, new PrintStream(System.out)).seedAll());
+    assertEquals(
+        2,
+        new IndexCursorSeeder(fresh, new PrintStream(System.out)).seedAll(),
+        "the imported repository and the catalog");
 
-    Manifest head = fresh.storage().manifestStore(project).read();
+    Manifest head = fresh.manifestStore(project).read();
     IndexCursor cursor =
-        new IndexCursorStore(fresh.storage().manifestStore(project).indexCursorPath()).read();
+        new IndexCursorStore(fresh.manifestStore(project).indexCursorPath()).read();
     assertEquals(head.getHeadSeq(), cursor.getSequence());
     assertEquals(head.getHeadTransactionId(), cursor.getTransactionId());
     assertEquals(
-        fresh.storage().listManifestVersions().get(project),
+        fresh.storage().listManifestVersions().get(fresh.idOf(project)),
         cursor.getManifestVersion(),
         "the cursor names the manifest version it is at, so a sweep can skip the read");
     assertEquals(0, tailer.catchUp(project), "nothing to replay at the seeded head");

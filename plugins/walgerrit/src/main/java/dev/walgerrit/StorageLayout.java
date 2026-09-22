@@ -14,7 +14,6 @@
 
 package dev.walgerrit;
 
-import com.google.gerrit.entities.Project;
 import dev.walgerrit.ManifestCache.VersionedManifest;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -30,12 +29,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Maps Gerrit project names onto object-store keys and node-local cache paths.
+ * Maps repository ids onto object-store keys and node-local cache paths.
  *
  * <p>Every manifest lives under one {@code manifests/} prefix, apart from the repository's packs
  * and log entries under {@code repos/}. One paginated listing of that prefix therefore enumerates
  * every repository together with the current version of its manifest, which is how repositories are
- * discovered and how the index-event sweep finds the ones that changed without reading any.
+ * discovered and how the index-event sweep finds the ones that changed without reading any. Names
+ * are the {@link Catalog}'s business: nothing here knows a project name.
  */
 final class StorageLayout {
   private static final Logger logger = LoggerFactory.getLogger(StorageLayout.class);
@@ -43,7 +43,6 @@ final class StorageLayout {
   private static final String REPOSITORIES_DIRECTORY = "repos";
   private static final String LEASES_DIRECTORY = "leases";
   private static final String CLUSTER_DIRECTORY = "cluster";
-  private static final String REPOSITORY_SUFFIX = ".git";
 
   private final ObjectStore objectStore;
   private final Path cacheRepositoriesPath;
@@ -58,7 +57,7 @@ final class StorageLayout {
   private final java.util.concurrent.ConcurrentHashMap<Path, ChunkedFile> chunkedFiles =
       new java.util.concurrent.ConcurrentHashMap<>();
   private final RepositoryLocks repositoryLocks = new RepositoryLocks();
-  private final List<BiConsumer<Project.NameKey, VersionedManifest>> publicationListeners =
+  private final List<BiConsumer<RepositoryId, VersionedManifest>> publicationListeners =
       new CopyOnWriteArrayList<>();
 
   StorageLayout(Path root) {
@@ -112,29 +111,26 @@ final class StorageLayout {
    * assigned it, after the CAS. Listeners run in registration order on the publishing thread; one
    * that fails is logged and does not stop the others, and none can fail the publication.
    */
-  void onPublication(BiConsumer<Project.NameKey, VersionedManifest> listener) {
+  void onPublication(BiConsumer<RepositoryId, VersionedManifest> listener) {
     publicationListeners.add(listener);
   }
 
   /**
-   * Records a peer's wake-up for {@code name}: it published the manifest at {@code version} and
+   * Records a peer's wake-up for {@code id}: it published the manifest at {@code version} and
    * {@code revision}. Until this node reads a manifest at that revision, or the store confirms its
    * view is current, the node's view of the repository does not count as recently validated.
    * Returns false when this node already holds that manifest or a newer one.
-   *
-   * @throws IOException for a name that is not a valid project name
    */
-  boolean expectManifest(Project.NameKey name, String version, long revision) throws IOException {
-    return manifestCache.expect(
-        manifestsPrefix + "/" + repositoryRelativePath(name), version, revision);
+  boolean expectManifest(RepositoryId id, String version, long revision) {
+    return manifestCache.expect(manifestsPrefix + "/" + id.value(), version, revision);
   }
 
-  private void published(Project.NameKey name, VersionedManifest manifest) {
-    for (BiConsumer<Project.NameKey, VersionedManifest> listener : publicationListeners) {
+  private void published(RepositoryId id, VersionedManifest manifest) {
+    for (BiConsumer<RepositoryId, VersionedManifest> listener : publicationListeners) {
       try {
-        listener.accept(name, manifest);
+        listener.accept(id, manifest);
       } catch (RuntimeException failure) {
-        logger.warn("Post-publication listener failed for {}", name.get(), failure);
+        logger.warn("Post-publication listener failed for {}", id, failure);
       }
     }
   }
@@ -162,25 +158,24 @@ final class StorageLayout {
         ManifestStore.writerIdentity());
   }
 
-  StoreLease compactionLease(Project.NameKey name) throws IOException {
+  StoreLease compactionLease(RepositoryId id) {
     return new StoreLease(
         objectStore,
-        leasesPrefix + "/" + repositoryRelativePath(name) + "/" + StoreLease.FILE,
+        leasesPrefix + "/" + id.value() + "/" + StoreLease.FILE,
         Clock.systemUTC(),
         ManifestStore.writerIdentity());
   }
 
-  ManifestStore manifestStore(Project.NameKey name) throws IOException {
-    String relative = repositoryRelativePath(name);
-    String manifestPrefix = manifestsPrefix + "/" + relative;
+  ManifestStore manifestStore(RepositoryId id) {
+    String manifestPrefix = manifestsPrefix + "/" + id.value();
     return new ManifestStore(
-        new PrefixedObjectStore(objectStore, repositoriesPrefix + "/" + relative),
+        new PrefixedObjectStore(objectStore, repositoriesPrefix + "/" + id.value()),
         new PrefixedObjectStore(objectStore, manifestPrefix),
-        cacheRepositoriesPath.resolve(relative),
-        indexCursorRepositoriesPath.resolve(relative + ".cursor"),
-        name.get(),
+        cacheRepositoriesPath.resolve(id.value()),
+        indexCursorRepositoriesPath.resolve(id.value() + ".cursor"),
+        id.value(),
         Clock.systemUTC(),
-        manifest -> published(name, manifest),
+        manifest -> published(id, manifest),
         manifestCache,
         repositoryLocks,
         chunkedFiles,
@@ -189,8 +184,8 @@ final class StorageLayout {
         cacheIsStore);
   }
 
-  /** Every repository, from one listing of the manifests prefix. */
-  NavigableSet<Project.NameKey> listProjects() throws IOException {
+  /** Every repository, the catalog included, from one listing of the manifests prefix. */
+  NavigableSet<RepositoryId> listRepositories() throws IOException {
     return new TreeSet<>(listManifestVersions().keySet());
   }
 
@@ -199,10 +194,10 @@ final class StorageLayout {
    * manifests prefix. The version is the same opaque token a read of the manifest returns, so a
    * caller holding that version knows the repository has not changed.
    */
-  NavigableMap<Project.NameKey, String> listManifestVersions() throws IOException {
+  NavigableMap<RepositoryId, String> listManifestVersions() throws IOException {
     String prefix = manifestsPrefix + "/";
-    String suffix = REPOSITORY_SUFFIX + "/" + ManifestStore.MANIFEST_FILE;
-    NavigableMap<Project.NameKey, String> versions = new TreeMap<>();
+    String suffix = "/" + ManifestStore.MANIFEST_FILE;
+    NavigableMap<RepositoryId, String> versions = new TreeMap<>();
     for (ObjectStore.ObjectSummary summary : objectStore.listWithVersions(prefix)) {
       String key = summary.key();
       if (!key.startsWith(prefix)
@@ -210,27 +205,17 @@ final class StorageLayout {
           || key.length() <= prefix.length() + suffix.length()) {
         continue;
       }
-      versions.put(
-          Project.nameKey(key.substring(prefix.length(), key.length() - suffix.length())),
-          summary.version());
+      String id = key.substring(prefix.length(), key.length() - suffix.length());
+      try {
+        versions.put(new RepositoryId(id), summary.version());
+      } catch (IllegalArgumentException notAnId) {
+        logger.warn("Ignoring a manifest under a key that is not a repository id: {}", key);
+      }
     }
     return versions;
   }
 
   private static String under(String prefix, String directory) {
     return prefix.isEmpty() ? directory : prefix + "/" + directory;
-  }
-
-  private String repositoryRelativePath(Project.NameKey name) throws IOException {
-    String projectName = name.get();
-    if (projectName.isBlank() || projectName.indexOf('\\') >= 0) {
-      throw new IOException("Invalid project name: " + projectName);
-    }
-    for (String component : projectName.split("/")) {
-      if (component.isBlank() || component.equals(".") || component.equals("..")) {
-        throw new IOException("Invalid project name: " + projectName);
-      }
-    }
-    return projectName + REPOSITORY_SUFFIX;
   }
 }

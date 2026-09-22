@@ -88,7 +88,8 @@ class ChunkedPackReadsTest {
     assertTrue(present >= 1 && present < total, present + " of " + total + " chunks present");
     assertTrue(store.rangeReads.get() >= 1, "chunks came through range reads");
     assertTrue(
-        store.downloads.stream().noneMatch(key -> key.endsWith(".pack")),
+        store.downloads.stream()
+            .noneMatch(key -> key.endsWith(".pack") && !key.startsWith("repos/catalog/")),
         "the pack itself was not downloaded whole: " + store.downloads);
     assertTrue(store.downloads.stream().anyMatch(key -> key.endsWith(".idx")), "the index is read whole");
 
@@ -98,11 +99,13 @@ class ChunkedPackReadsTest {
     assertTrue(!Files.exists(sidecar) || presentChunks(sidecar) > present, "reading the blob fetched more");
 
     // What needs every byte, such as compaction, completes the pack; the sidecar goes away.
-    Path whole = cold.storage().manifestStore(project).immutableFile(pack.getFileName().toString());
+    Path whole = cold.manifestStore(project).immutableFile(pack.getFileName().toString());
     assertEquals(pack, whole);
     assertFalse(Files.exists(sidecar), "complete packs carry no sidecar");
     byte[] original =
-        Files.readAllBytes(root.resolve("store/repos/chunked.git/wal").resolve(pack.getFileName()));
+        Files.readAllBytes(
+            TestStores.cacheWal(root.resolve("store"), new FileObjectStore(root.resolve("store")))
+                .resolve(pack.getFileName()));
     assertArrayEquals(original, Files.readAllBytes(pack), "the chunked copy equals the store object");
 
     store.reset();
@@ -202,7 +205,7 @@ class ChunkedPackReadsTest {
       Files.setLastModifiedTime(path, old);
     }
 
-    ManifestStore manifestStore = cold.storage().manifestStore(project);
+    ManifestStore manifestStore = cold.manifestStore(project);
     Set<String> live = ManifestStore.liveFileNames(manifestStore.current());
     manifestStore.evictLocalFilesExcept(live);
 
@@ -243,7 +246,8 @@ class ChunkedPackReadsTest {
   }
 
   private Path walDirectory(String node) {
-    return root.resolve(node + "-cache/repos/chunked.git/wal");
+    return TestStores.cacheWal(
+        root.resolve(node + "-cache"), new FileObjectStore(root.resolve("store")));
   }
 
   private static Path onlyPack(Path wal) throws IOException {

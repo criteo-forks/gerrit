@@ -234,11 +234,10 @@ class PublicationRecoveryTest {
           fault == CasFault.BEFORE_IO ? 3 : 2,
           attempts.get(),
           "only an unoccupied sequence requires a fencing CAS");
-      assertFalse(a.storage().manifestStore(PROJECT).publisher().hasPending());
+      assertFalse(a.manifestStore(PROJECT).publisher().hasPending());
       if (fault == CasFault.BEFORE_IO) {
         List<LogEntry> entries =
-            a.storage()
-                .manifestStore(PROJECT)
+            a.manifestStore(PROJECT)
                 .readLogEntriesAfter(
                     initial.getHeadSeq(), initial.getHeadTransactionId(), manifest(shared), 100);
         assertEquals(2, entries.size(), "failed proposal is outside the chain");
@@ -332,7 +331,7 @@ class PublicationRecoveryTest {
       // close attempts the fence, whose outcome also becomes ambiguous.
     }
     assertEquals(2, attempts.get());
-    assertTrue(a.storage().manifestStore(PROJECT).publisher().hasPending());
+    assertTrue(a.manifestStore(PROJECT).publisher().hasPending());
     assertEquals(RefUpdate.Result.NEW, update(a, "first", first));
     assertEquals(3, attempts.get());
     assertColdReadable(shared, first);
@@ -410,7 +409,7 @@ class PublicationRecoveryTest {
             HookedObjectStore::publishesRefChange,
             () -> {},
             () -> {
-              b.storage().manifestStore(PROJECT).publishEvents(List.of("{}"));
+              b.manifestStore(PROJECT).publishEvents(List.of("{}"));
               failLogRead.set(true);
               throw new IOException("lost response; another transaction now occupies the head");
             });
@@ -453,11 +452,11 @@ class PublicationRecoveryTest {
       ObjectId first = WalGitRepositoryManagerTest.insertCommit(writer, "first");
       assertEquals(RefUpdate.Result.LOCK_FAILURE, update(writer, "first", first));
       compactAndReclaim(node("b", shared));
-      a.storage().manifestStore(PROJECT).refresh();
+      a.manifestStore(PROJECT).refresh();
       discardDiskCache("a");
       DfsBlockCache.reconfigure(new DfsBlockCacheConfig());
       assertTrue(
-          a.storage().manifestStore(PROJECT).publisher().hasPending(),
+          a.manifestStore(PROJECT).publisher().hasPending(),
           "no write or close has settled local uncertainty yet");
       try (Repository cold = a.openRepository(PROJECT)) {
         assertEquals(first, cold.exactRef("refs/heads/first").getObjectId());
@@ -496,7 +495,7 @@ class PublicationRecoveryTest {
       try {
         assertTrue(committed.await(10, TimeUnit.SECONDS));
         compactAndReclaim(node("b", shared));
-        a.storage().manifestStore(PROJECT).refresh();
+        a.manifestStore(PROJECT).refresh();
         discardDiskCache("a");
         DfsBlockCache.reconfigure(new DfsBlockCacheConfig());
         try (Repository cold = a.openRepository(PROJECT)) {
@@ -638,7 +637,7 @@ class PublicationRecoveryTest {
   private static Manifest manifest(ObjectStore shared) throws IOException {
     return Manifest.parseFrom(
         shared
-            .get("manifests/" + PROJECT.get() + ".git/" + ManifestStore.MANIFEST_FILE)
+            .get("manifests/" + TestStores.onlyRepository(shared) + "/" + ManifestStore.MANIFEST_FILE)
             .orElseThrow()
             .bytes());
   }

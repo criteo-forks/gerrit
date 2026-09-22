@@ -34,6 +34,7 @@ import com.google.inject.Singleton;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -207,10 +208,16 @@ final class WalJournal
     for (Map.Entry<Project.NameKey, JournalBuffer.Batch> entry : buffer.drain().entrySet()) {
       JournalBuffer.Batch batch = entry.getValue();
       try {
-        repositories
-            .storage()
-            .manifestStore(entry.getKey())
-            .publishJournal(batch.events(), batch.index());
+        Optional<ManifestStore> store = repositories.manifestStoreFor(entry.getKey());
+        if (store.isEmpty()) {
+          // Renamed or deleted since the work was done: the other nodes reconcile the project
+          // from the catalog instead, and nothing of this batch can apply under the old name.
+          logger.info(
+              "WalGerrit drops a journal batch for {}: no longer an active project",
+              entry.getKey().get());
+          continue;
+        }
+        store.get().publishJournal(batch.events(), batch.index());
       } catch (IOException | RuntimeException failure) {
         if (batch.index() != null) {
           buffer.requeue(entry.getKey(), batch.index());

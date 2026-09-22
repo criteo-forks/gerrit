@@ -14,7 +14,6 @@
 
 package dev.walgerrit;
 
-import com.google.gerrit.entities.Project;
 import com.google.gerrit.extensions.events.LifecycleListener;
 import com.google.gerrit.metrics.Description;
 import com.google.gerrit.metrics.MetricMaker;
@@ -57,9 +56,9 @@ final class GossipEndpoint implements LifecycleListener {
   private static final int OUTBOX_CAPACITY = 4096;
   private static final long STOP_TIMEOUT_MILLIS = 5_000;
 
-  /** Receives a peer's hint about {@code project} on the receiver thread; must return promptly. */
+  /** Receives a peer's hint about {@code id} on the receiver thread; must return promptly. */
   interface HintListener {
-    void onHint(Project.NameKey project, GossipHint hint);
+    void onHint(RepositoryId id, GossipHint hint);
   }
 
   private final WalGitRepositoryManager repositories;
@@ -187,14 +186,14 @@ final class GossipEndpoint implements LifecycleListener {
   }
 
   /** Publication listener: queues a hint for every peer. Never blocks or fails the publisher. */
-  void announce(Project.NameKey project, VersionedManifest published) {
+  void announce(RepositoryId id, VersionedManifest published) {
     if (socket == null) {
       return;
     }
     Manifest manifest = published.manifest();
     GossipHint hint =
         GossipHint.newBuilder()
-            .setRepo(project.get())
+            .setRepo(id.value())
             .setManifestVersion(published.version())
             .setRevision(manifest.getRevision())
             .setHeadSeq(manifest.getHeadSeq())
@@ -309,19 +308,20 @@ final class GossipEndpoint implements LifecycleListener {
   }
 
   private void deliver(GossipHint hint) {
-    Project.NameKey project = Project.nameKey(hint.getRepo());
+    RepositoryId id;
     try {
-      repositories.storage().expectManifest(project, hint.getManifestVersion(), hint.getRevision());
-    } catch (IOException invalidName) {
+      id = new RepositoryId(hint.getRepo());
+    } catch (IllegalArgumentException notAnId) {
       rejected.incrementAndGet();
       return;
     }
+    repositories.storage().expectManifest(id, hint.getManifestVersion(), hint.getRevision());
     accepted.incrementAndGet();
     for (HintListener listener : listeners) {
       try {
-        listener.onHint(project, hint);
+        listener.onHint(id, hint);
       } catch (RuntimeException failure) {
-        logger.warn("WalGerrit gossip listener failed for {}", project.get(), failure);
+        logger.warn("WalGerrit gossip listener failed for {}", id, failure);
       }
     }
   }

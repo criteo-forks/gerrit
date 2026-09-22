@@ -377,13 +377,13 @@ class LocalWalGitTransactionTest {
     Path path =
         storagePath
             .resolve("manifests")
-            .resolve(project.get() + ".git")
+            .resolve(manager().idOf(project).value())
             .resolve(ManifestStore.MANIFEST_FILE);
     return Manifest.parseFrom(Files.readAllBytes(path));
   }
 
-  private Path repositoryPath(Project.NameKey project) {
-    return storagePath.resolve("repos").resolve(project.get() + ".git");
+  private Path repositoryPath(Project.NameKey project) throws Exception {
+    return storagePath.resolve("repos").resolve(manager().idOf(project).value());
   }
 
   private static String packName(String fileName) {

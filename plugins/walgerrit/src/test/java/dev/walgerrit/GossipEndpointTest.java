@@ -78,11 +78,15 @@ class GossipEndpointTest {
       try (Repository repository = nodeA.openRepository(project)) {
         commit = publishMain(repository, "from node A");
       }
-      Manifest head = nodeA.storage().manifestStore(project).read();
+      Manifest head = nodeA.manifestStore(project).read();
 
+      String id = nodeA.idOf(project).value();
       GossipHint hint =
-          awaitHint(hints, candidate -> candidate.getRevision() == head.getRevision());
-      assertEquals(project.get(), hint.getRepo());
+          awaitHint(
+              hints,
+              candidate ->
+                  candidate.getRepo().equals(id) && candidate.getRevision() == head.getRevision());
+      assertEquals(id, hint.getRepo());
       assertEquals(head.getHeadSeq(), hint.getHeadSeq());
       assertEquals(head.getHeadTransactionId(), hint.getHeadTransactionId());
       assertEquals(ManifestStore.writerIdentity(), hint.getWriter());
@@ -90,7 +94,7 @@ class GossipEndpointTest {
 
       // Node B has never read this repository; the hint leaves an expectation its first read
       // settles, and that read sees node A's commit.
-      ManifestStore storeB = nodeB.storage().manifestStore(project);
+      ManifestStore storeB = nodeB.manifestStore(project);
       assertTrue(storeB.expectingNewerManifest());
       try (Repository repository = nodeB.openRepository(project)) {
         assertEquals(commit, repository.exactRef(MAIN).getObjectId());
@@ -121,7 +125,9 @@ class GossipEndpointTest {
       send(stray, target, codec.encode(hint("platform/own", ManifestStore.writerIdentity())));
       send(stray, target, "not a hint".getBytes(StandardCharsets.UTF_8));
       send(stray, target, codec.encode(hint("../escape", "node-x:1")));
-      send(stray, target, codec.encode(hint("platform/peer", "node-x:1")));
+      // A repository this node has never heard of: the hint still leaves an expectation.
+      RepositoryId peer = RepositoryId.random();
+      send(stray, target, codec.encode(hint(peer.value(), "node-x:1")));
 
       await(() -> receiving.receivedCount() == 4);
       await(() -> outcomes(receiving) == 4);
@@ -130,7 +136,7 @@ class GossipEndpointTest {
       assertEquals(1, receiving.acceptedCount());
       assertEquals(1, delivered.get());
       assertTrue(
-          nodeB.storage().manifestStore(Project.nameKey("platform/peer")).expectingNewerManifest());
+          nodeB.storage().manifestStore(peer).expectingNewerManifest());
     } finally {
       receiving.stop();
     }
@@ -146,8 +152,9 @@ class GossipEndpointTest {
     try (DatagramSocket stray = new DatagramSocket()) {
       InetSocketAddress target =
           new InetSocketAddress(InetAddress.getLoopbackAddress(), receiving.port());
-      send(stray, target, GossipCodec.unsigned().encode(hint("platform/signed", "node-x:1")));
-      send(stray, target, new GossipCodec(secret).encode(hint("platform/signed", "node-x:1")));
+      String signed = RepositoryId.random().value();
+      send(stray, target, GossipCodec.unsigned().encode(hint(signed, "node-x:1")));
+      send(stray, target, new GossipCodec(secret).encode(hint(signed, "node-x:1")));
 
       await(() -> receiving.receivedCount() == 2);
       await(() -> outcomes(receiving) == 2);

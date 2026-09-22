@@ -66,7 +66,7 @@ final class Compactor {
   private final WalGitConfiguration configuration;
   private final CompactionPolicy policy;
   private final Reclaimer reclaimer;
-  private final Set<Project.NameKey> queued = ConcurrentHashMap.newKeySet();
+  private final Set<RepositoryId> queued = ConcurrentHashMap.newKeySet();
   private volatile ScheduledExecutorService executor;
   private volatile SweepLease sweepLease;
 
@@ -153,46 +153,58 @@ final class Compactor {
   }
 
   /**
-   * Called after this node published a manifest for {@code project}. Evaluates the policy on the
+   * Called after this node published a manifest for {@code id}. Evaluates the policy on the
    * manifest in hand, no I/O, and queues one compaction if anything is due.
    */
-  void consider(Project.NameKey project, Manifest manifest) {
+  void consider(RepositoryId id, Manifest manifest) {
     ScheduledExecutorService running = executor;
-    if (running == null || policy.plan(manifest).isEmpty() || !queued.add(project)) {
+    if (running == null
+        || manifest.getDeleted()
+        || policy.plan(manifest).isEmpty()
+        || !queued.add(id)) {
       return;
     }
     try {
-      running.execute(() -> runQueued(project));
+      running.execute(() -> runQueued(id));
     } catch (RejectedExecutionException stopping) {
-      queued.remove(project);
+      queued.remove(id);
     }
   }
 
   /** Repositories queued for compaction but not yet finished; for tests. */
-  boolean isQueued(Project.NameKey project) {
-    return queued.contains(project);
+  boolean isQueued(RepositoryId id) {
+    return queued.contains(id);
   }
 
-  private void runQueued(Project.NameKey project) {
+  boolean isQueued(Project.NameKey project) throws IOException {
+    return isQueued(repositories.idOf(project));
+  }
+
+  /** Compacts the repository {@code project} is bound to; for tests. */
+  Outcome compact(Project.NameKey project) throws IOException {
+    return compact(repositories.idOf(project));
+  }
+
+  private void runQueued(RepositoryId id) {
     try {
-      compact(project);
+      compact(id);
     } catch (IOException | RuntimeException exception) {
-      logger.warn("WalGerrit compaction of {} failed; it is retried after the next write", project.get(), exception);
+      logger.warn("WalGerrit compaction of {} failed; it is retried after the next write", id.value(), exception);
     } finally {
-      queued.remove(project);
+      queued.remove(id);
     }
   }
 
   /**
-   * Compacts {@code project} now, on the calling thread, until the policy is satisfied or the
+   * Compacts {@code id} now, on the calling thread, until the policy is satisfied or the
    * repository's lease is held by another node.
    */
-  Outcome compact(Project.NameKey project) throws IOException {
+  Outcome compact(RepositoryId id) throws IOException {
     Duration leaseDuration = configuration.compactionLeaseDuration();
     Optional<StoreLease.Held> lease =
-        repositories.storage().compactionLease(project).acquire(leaseDuration);
+        repositories.storage().compactionLease(id).acquire(leaseDuration);
     if (lease.isEmpty()) {
-      logger.debug("WalGerrit skips compacting {}: another node holds the lease", project.get());
+      logger.debug("WalGerrit skips compacting {}: another node holds the lease", id.value());
       return Outcome.LEASED_ELSEWHERE;
     }
     boolean compacted = false;
@@ -201,9 +213,13 @@ final class Compactor {
         // A fresh handle starts from a conditional manifest read, so every pass plans against the
         // newest manifest: the previous pass's own publication, or whatever another node did to
         // the packs this pass meant to rewrite.
+        Manifest manifest = repositories.storage().manifestStore(id).refresh();
+        if (manifest.getDeleted()) {
+          break;
+        }
         try (LocalWalGitRepository repository =
-            (LocalWalGitRepository) repositories.openRepository(project)) {
-          Plan plan = policy.plan(repository.manifestStore().current());
+            repositories.openById(id, repositories.nameOf(id), manifest.getWriteEpoch())) {
+          Plan plan = policy.plan(manifest);
           if (plan.isEmpty()) {
             break;
           }
@@ -218,7 +234,7 @@ final class Compactor {
         }
       }
       if (compacted) {
-        reclaimer.evictLocal(project);
+        reclaimer.evictLocal(id);
       }
     }
     return compacted ? Outcome.COMPACTED : Outcome.NOTHING_TO_DO;

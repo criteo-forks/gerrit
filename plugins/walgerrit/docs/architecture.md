@@ -1,8 +1,9 @@
 # Architecture
 
 WalGerrit separates authoritative Git state from rebuildable node state. The shared store holds
-immutable Git files, a transaction log and one mutable manifest per repository. Each Gerrit node
-keeps local Lucene indexes and, with S3, a disposable cache of immutable files.
+immutable Git files, a transaction log and one mutable manifest per repository, all keyed by an
+opaque repository id, and a catalog that binds project names to ids. Each Gerrit node keeps
+local Lucene indexes and, with S3, a disposable cache of immutable files.
 
 ```text
 Git clients
@@ -34,6 +35,15 @@ reftable-stack revision. Compaction must find all its superseded inputs still li
 See [Consistency](consistency.md) for retries, ambiguous outcomes and freshness, and
 [Storage format](storage-format.md) for the persisted data.
 
+## The catalog binds names to repositories
+
+Opening a project resolves its name through the catalog, a repository with a fixed id whose
+commits are the namespace's transitions. Renaming or deleting a project is three durable steps:
+the catalog marks the names pending, the repository's manifest advances its write epoch, which
+refuses every writer admitted under the old name at the commit point, and the catalog retires the
+old name and activates the new one. No files move, and a name is never reused. See
+[Project names](namespace.md).
+
 ## Every node derives its own search indexes
 
 A ref transaction's WAL entry includes its logical ref updates. Each node applies them to its
@@ -64,7 +74,7 @@ The storage module replaces `GitRepositoryManager`. Gerrit's runtime NoteDb and 
 paths continue to use JGit APIs. Init-only helpers use a switching repository manager: a local
 fallback before the system injector exists, then the configured backend for post-init work.
 
-The fork also supplies the import and cursor-seeding commands, an acceptance-test adapter, and
-optional stateless web sessions. Storage integration does not require a JGit fork. The
+The fork also supplies the import, cursor-seeding and namespace commands, an acceptance-test
+adapter, and optional stateless web sessions. Storage integration does not require a JGit fork. The
 [JGit audit](jgit-cas-deep-dive.md) describes that boundary; the [roadmap](roadmap.md) separates
 implemented features from remaining work.

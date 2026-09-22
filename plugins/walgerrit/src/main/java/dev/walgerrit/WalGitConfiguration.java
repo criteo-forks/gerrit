@@ -13,12 +13,14 @@
 // limitations under the License.
 package dev.walgerrit;
 
+import com.google.gerrit.entities.Project;
 import java.net.URI;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.eclipse.jgit.lib.Config;
 
@@ -64,7 +66,8 @@ record WalGitConfiguration(
     int gossipPort,
     String gossipListenAddress,
     Duration gossipPeerRefreshInterval,
-    String gossipSecret) {
+    String gossipSecret,
+    Set<Project.NameKey> systemProjects) {
   /**
    * Longest time an open repository handle serves reads without another conditional manifest read.
    * Every handle also revalidates when it starts a ref transaction, and when it is opened unless
@@ -188,7 +191,8 @@ record WalGitConfiguration(
         DEFAULT_GOSSIP_PORT,
         null,
         DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL,
-        null);
+        null,
+        Set.of(Project.nameKey("All-Projects"), Project.nameKey("All-Users")));
   }
 
   /**
@@ -247,9 +251,20 @@ record WalGitConfiguration(
             config.getInt(SECTION, null, "gossipPort", DEFAULT_GOSSIP_PORT),
             blankToNull(config.getString(SECTION, null, "gossipListenAddress")),
             duration(config, "gossipPeerRefreshInterval", DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL),
-            blankToNull(config.getString(SECTION, null, "gossipSecret")));
+            blankToNull(config.getString(SECTION, null, "gossipSecret")),
+            systemProjects(config));
     configuration.validate();
     return configuration;
+  }
+
+  /** The projects Gerrit itself needs under their configured names. */
+  private static Set<Project.NameKey> systemProjects(Config config) {
+    return Set.of(
+        Project.nameKey(
+            Optional.ofNullable(config.getString("gerrit", null, "allProjects"))
+                .orElse("All-Projects")),
+        Project.nameKey(
+            Optional.ofNullable(config.getString("gerrit", null, "allUsers")).orElse("All-Users")));
   }
 
   /** Every {@code gossipPeer} value, one {@code host[:port]} each, blanks dropped. */

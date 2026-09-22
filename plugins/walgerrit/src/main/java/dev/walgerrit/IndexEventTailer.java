@@ -23,18 +23,23 @@ import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import dev.walgerrit.Catalog.Binding;
+import dev.walgerrit.IndexEventApplier.NamespaceChange;
 import dev.walgerrit.ManifestCache.VersionedManifest;
 import dev.walgerrit.proto.StorageProto.IndexCursor;
 import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.RefUpdate;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -59,6 +64,11 @@ import org.slf4j.LoggerFactory;
  * rolled-back head, or names a transaction the manifest no longer does, makes the node rebuild all
  * of its indexes from current repository state and reseed every cursor, the way a new node with an
  * empty volume bootstraps. That happens before the node becomes ready.
+ *
+ * <p>Repositories are replayed by id and indexed under the name the catalog binds the id to now,
+ * never the name an entry was written under. The catalog's own transactions are replayed too: the
+ * names they touched are handed to the applier with what the catalog says about them now, so every
+ * node converges on the current namespace, whatever the order of the transitions it observed.
  */
 @Singleton
 final class IndexEventTailer implements LifecycleListener {
@@ -81,10 +91,10 @@ final class IndexEventTailer implements LifecycleListener {
   private final IndexRebuilder rebuilder;
 
   /** Manifest version at which this node last confirmed each repository's cursor was at head. */
-  private final Map<Project.NameKey, String> caughtUpVersions = new ConcurrentHashMap<>();
+  private final Map<RepositoryId, String> caughtUpVersions = new ConcurrentHashMap<>();
 
   /** Repositories a peer's wake-up queued for replay that the tailer thread has not started. */
-  private final Set<Project.NameKey> pendingWakeUps = ConcurrentHashMap.newKeySet();
+  private final Set<RepositoryId> pendingWakeUps = ConcurrentHashMap.newKeySet();
 
   private final AtomicLong wakeUpsReplayed = new AtomicLong();
   private volatile ScheduledExecutorService executor;
@@ -110,7 +120,7 @@ final class IndexEventTailer implements LifecycleListener {
         readiness,
         rebuilder,
         replayer);
-    gossip.onHint((project, hint) -> wake(project, hint.getManifestVersion()));
+    gossip.onHint((id, hint) -> wake(id, hint.getManifestVersion()));
   }
 
   IndexEventTailer(
@@ -234,12 +244,12 @@ final class IndexEventTailer implements LifecycleListener {
    * published during the rebuild.
    */
   void runOnce() throws IOException {
-    Map<Project.NameKey, IndexRebuildRequiredException> stale = sweep();
+    Map<RepositoryId, IndexRebuildRequiredException> stale = sweep();
     if (stale.isEmpty()) {
       return;
     }
     rebuildIndexes(stale);
-    Map<Project.NameKey, IndexRebuildRequiredException> stillStale = sweep();
+    Map<RepositoryId, IndexRebuildRequiredException> stillStale = sweep();
     if (!stillStale.isEmpty()) {
       IOException failure =
           new IOException(
@@ -249,24 +259,28 @@ final class IndexEventTailer implements LifecycleListener {
     }
   }
 
-  private Map<Project.NameKey, IndexRebuildRequiredException> sweep() throws IOException {
-    NavigableMap<Project.NameKey, String> heads = repositories.storage().listManifestVersions();
+  private Map<RepositoryId, IndexRebuildRequiredException> sweep() throws IOException {
+    NavigableMap<RepositoryId, String> heads = repositories.storage().listManifestVersions();
     caughtUpVersions.keySet().retainAll(heads.keySet());
-    Map<Project.NameKey, IndexRebuildRequiredException> stale = new LinkedHashMap<>();
+    Map<RepositoryId, IndexRebuildRequiredException> stale = new LinkedHashMap<>();
     Exception firstFailure = null;
-    for (Map.Entry<Project.NameKey, String> head : heads.entrySet()) {
-      Project.NameKey project = head.getKey();
-      if (head.getValue().equals(caughtUpVersions.get(project))) {
+    // The catalog first: a repository's entries are indexed under the name it has now, and that
+    // name may be what the catalog's own entries in this sweep established.
+    List<Map.Entry<RepositoryId, String>> ordered = new ArrayList<>(heads.entrySet());
+    ordered.sort((a, b) -> Boolean.compare(!a.getKey().isCatalog(), !b.getKey().isCatalog()));
+    for (Map.Entry<RepositoryId, String> head : ordered) {
+      RepositoryId id = head.getKey();
+      if (head.getValue().equals(caughtUpVersions.get(id))) {
         // Nothing to replay, but the listing just confirmed the node's view of this manifest.
-        repositories.storage().manifestStore(project).noteListedVersion(head.getValue());
+        repositories.storage().manifestStore(id).noteListedVersion(head.getValue());
         continue;
       }
       try {
-        catchUp(project, head.getValue());
+        catchUp(id, head.getValue());
       } catch (IndexRebuildRequiredException rebuildRequired) {
-        stale.put(project, rebuildRequired);
+        stale.put(id, rebuildRequired);
       } catch (IOException | RuntimeException exception) {
-        logger.error("WalGerrit index-event replay failed for {}", project.get(), exception);
+        logger.error("WalGerrit index-event replay failed for {}", id, exception);
         if (firstFailure == null) {
           firstFailure = exception;
         } else {
@@ -283,8 +297,18 @@ final class IndexEventTailer implements LifecycleListener {
     return stale;
   }
 
+  /** Replays the repository {@code project} is bound to; for tests. */
   int catchUp(Project.NameKey project) throws IOException {
-    return catchUp(project, null);
+    Binding binding =
+        repositories
+            .catalog()
+            .resolve(project, true)
+            .orElseThrow(() -> new IOException("No project " + project.get()));
+    return catchUp(binding.id(), null);
+  }
+
+  int catchUp(RepositoryId id) throws IOException {
+    return catchUp(id, null);
   }
 
   /**
@@ -292,10 +316,15 @@ final class IndexEventTailer implements LifecycleListener {
    * is taken from the node cache when it already holds that version; otherwise, and always without
    * a listed version, one conditional read is made.
    *
+   * <p>Entries are indexed under the name the catalog binds the id to now. An id whose name is in
+   * flight is left where it is and retried, since its entries would be indexed under a name that is
+   * about to change; one with no active name has its entries acknowledged without indexing, the
+   * catalog's own replay having removed or replaced its documents.
+   *
    * @throws IndexRebuildRequiredException when the cursor cannot be advanced by replay
    */
-  int catchUp(Project.NameKey project, String listedVersion) throws IOException {
-    ManifestStore manifestStore = repositories.storage().manifestStore(project);
+  int catchUp(RepositoryId id, String listedVersion) throws IOException {
+    ManifestStore manifestStore = repositories.storage().manifestStore(id);
     IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
     IndexCursor cursor = cursorStore.read();
     if (listedVersion != null
@@ -305,7 +334,7 @@ final class IndexEventTailer implements LifecycleListener {
       // published since, so there is nothing to read or replay. This is what lets a restarted
       // node's first sweep cost one listing rather than one read per repository.
       manifestStore.noteListedVersion(listedVersion);
-      caughtUpVersions.put(project, listedVersion);
+      caughtUpVersions.put(id, listedVersion);
       return 0;
     }
     VersionedManifest versioned =
@@ -320,13 +349,28 @@ final class IndexEventTailer implements LifecycleListener {
             cursor.getTransactionId(),
             manifest,
             repositories.configuration().indexReplayLimit());
+    Project.NameKey project = null;
+    if (id.isCatalog()) {
+      applyCatalog(entries);
+    } else if (!entries.isEmpty()) {
+      Optional<Binding> binding = repositories.catalog().bindingOf(id, false);
+      if (binding.isPresent() && binding.get().pending()) {
+        logger.info(
+            "WalGerrit index-event replay of {} waits: {} {}",
+            id,
+            binding.get().name().get(),
+            Namespace.describe(binding.get()));
+        return 0;
+      }
+      project = binding.filter(Binding::active).map(Binding::name).orElse(null);
+    }
     Set<Integer> reindexedByRefs = changesTouched(entries);
     int applied = 0;
     int replayed = 0;
     int reindexed = 0;
     for (LogEntry entry : entries) {
       boolean foreign = foreignWriter.test(entry.getWriter());
-      if (entry.getKind() == LogEntry.Kind.REF_UPDATE) {
+      if (project != null && entry.getKind() == LogEntry.Kind.REF_UPDATE) {
         if (!entry.hasRefTransaction()) {
           throw new IOException(
               "REF_UPDATE WAL entry "
@@ -338,11 +382,11 @@ final class IndexEventTailer implements LifecycleListener {
         applier.apply(project, entry.getRefTransaction());
         applied++;
       }
-      if (foreign && entry.getEventJsonCount() > 0) {
+      if (project != null && foreign && entry.getEventJsonCount() > 0) {
         replayer.replay(project, entry);
         replayed++;
       }
-      if (foreign && entry.hasIndexUpdate()) {
+      if (project != null && foreign && entry.hasIndexUpdate()) {
         applier.reindex(project, entry.getIndexUpdate(), reindexedByRefs);
         reindexed++;
       }
@@ -350,9 +394,10 @@ final class IndexEventTailer implements LifecycleListener {
     }
     if (!entries.isEmpty()) {
       logger.info(
-          "WalGerrit index-event replay advanced {} from {} to {} ({} ref transactions; {} event"
-              + " entries and {} index updates from other nodes)",
-          project.get(),
+          "WalGerrit index-event replay advanced {} ({}) from {} to {} ({} ref transactions; {}"
+              + " event entries and {} index updates from other nodes)",
+          id,
+          id.isCatalog() ? "the catalog" : project == null ? "no active name" : project.get(),
           cursor.getSequence(),
           manifest.getHeadSeq(),
           applied,
@@ -367,8 +412,44 @@ final class IndexEventTailer implements LifecycleListener {
     // Record the version of the manifest that was actually replayed, never a newer one another
     // handle may have cached meanwhile: the next listing must not skip entries this node has not
     // applied.
-    caughtUpVersions.put(project, versioned.version());
+    caughtUpVersions.put(id, versioned.version());
     return applied;
+  }
+
+  /**
+   * The catalog's ref transactions name the commits that changed bindings; the names those commits
+   * touched are reconciled against what the catalog says now, in one call, so a node that missed
+   * intermediate transitions still converges.
+   */
+  private void applyCatalog(List<LogEntry> entries) throws IOException {
+    Catalog catalog = repositories.catalog();
+    Set<Project.NameKey> touched = new TreeSet<>();
+    for (LogEntry entry : entries) {
+      if (entry.getKind() != LogEntry.Kind.REF_UPDATE) {
+        continue;
+      }
+      for (RefUpdate update : entry.getRefTransaction().getUpdatesList()) {
+        if (!update.getName().equals(Catalog.REF) || !update.getNewSymbolicTarget().isEmpty()) {
+          continue;
+        }
+        touched.addAll(
+            catalog.changedNames(
+                org.eclipse.jgit.lib.ObjectId.fromString(update.getOldObjectId()),
+                org.eclipse.jgit.lib.ObjectId.fromString(update.getNewObjectId())));
+      }
+    }
+    if (touched.isEmpty()) {
+      return;
+    }
+    Catalog.Snapshot now = catalog.snapshot(true);
+    List<NamespaceChange> changes = new ArrayList<>();
+    for (Project.NameKey name : touched) {
+      Binding binding = now.byName().get(name);
+      if (binding != null) {
+        changes.add(new NamespaceChange(name, binding.id(), binding.state(), binding.movedTo()));
+      }
+    }
+    applier.namespaceChanged(changes);
   }
 
   /**
@@ -399,7 +480,7 @@ final class IndexEventTailer implements LifecycleListener {
    * repository had before the rebuild began, so anything published meanwhile is replayed
    * afterwards.
    */
-  private void rebuildIndexes(Map<Project.NameKey, IndexRebuildRequiredException> stale)
+  private void rebuildIndexes(Map<RepositoryId, IndexRebuildRequiredException> stale)
       throws IOException {
     WalGitConfiguration configuration = repositories.configuration();
     if (rebuilder == null || !configuration.indexRebuildOnStaleCursor()) {
@@ -426,8 +507,8 @@ final class IndexEventTailer implements LifecycleListener {
       }
     }
 
-    Map<Project.NameKey, IndexCursor> seeds = new LinkedHashMap<>();
-    for (Map.Entry<Project.NameKey, String> head :
+    Map<RepositoryId, IndexCursor> seeds = new LinkedHashMap<>();
+    for (Map.Entry<RepositoryId, String> head :
         repositories.storage().listManifestVersions().entrySet()) {
       ManifestStore manifestStore = repositories.storage().manifestStore(head.getKey());
       VersionedManifest versioned = manifestStore.currentOrRefresh(head.getValue());
@@ -443,7 +524,7 @@ final class IndexEventTailer implements LifecycleListener {
     long started = System.nanoTime();
     rebuilder.rebuildAll();
 
-    for (Map.Entry<Project.NameKey, IndexCursor> seed : seeds.entrySet()) {
+    for (Map.Entry<RepositoryId, IndexCursor> seed : seeds.entrySet()) {
       new IndexCursorStore(repositories.storage().manifestStore(seed.getKey()).indexCursorPath())
           .write(
               seed.getValue().getSequence(),
@@ -469,22 +550,22 @@ final class IndexEventTailer implements LifecycleListener {
    * replay queues another, since that replay may have read an older manifest. Before start and
    * after stop, wake-ups are ignored and the sweep covers the repository.
    */
-  void wake(Project.NameKey project, String version) {
+  void wake(RepositoryId id, String version) {
     ScheduledExecutorService running = executor;
     if (running == null) {
       return;
     }
     String announced = version == null || version.isEmpty() ? null : version;
-    if (announced != null && announced.equals(caughtUpVersions.get(project))) {
+    if (announced != null && announced.equals(caughtUpVersions.get(id))) {
       return; // This node already replayed exactly that manifest.
     }
-    if (!pendingWakeUps.add(project)) {
+    if (!pendingWakeUps.add(id)) {
       return;
     }
     try {
-      running.execute(() -> replayWakeUp(project));
+      running.execute(() -> replayWakeUp(id));
     } catch (RejectedExecutionException stopped) {
-      pendingWakeUps.remove(project);
+      pendingWakeUps.remove(id);
     }
   }
 
@@ -493,22 +574,22 @@ final class IndexEventTailer implements LifecycleListener {
     return wakeUpsReplayed.get();
   }
 
-  private void replayWakeUp(Project.NameKey project) {
-    pendingWakeUps.remove(project);
+  private void replayWakeUp(RepositoryId id) {
+    pendingWakeUps.remove(id);
     try {
       // A queued hint may have coalesced newer publications. Read the current store state.
-      catchUp(project);
+      catchUp(id);
       wakeUpsReplayed.incrementAndGet();
     } catch (IndexRebuildRequiredException rebuildRequired) {
       // Whether to rebuild is the sweep's decision; it will find the same cursor.
       logger.warn(
           "WalGerrit wake-up for {} cannot be replayed; leaving it to the next sweep: {}",
-          project.get(),
+          id,
           rebuildRequired.getMessage());
     } catch (IOException | RuntimeException failure) {
       logger.warn(
           "WalGerrit wake-up replay failed for {}; the next sweep retries: {}",
-          project.get(),
+          id,
           failure.toString());
     }
   }

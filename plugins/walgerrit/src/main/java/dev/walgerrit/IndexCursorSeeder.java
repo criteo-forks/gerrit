@@ -13,7 +13,6 @@
 // limitations under the License.
 package dev.walgerrit;
 
-import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
@@ -72,8 +71,8 @@ public final class IndexCursorSeeder {
 
   /** Seeds every repository's cursor at its current head; returns how many were written. */
   int seedAll() throws IOException {
-    NavigableMap<Project.NameKey, String> heads = repositories.storage().listManifestVersions();
-    for (Map.Entry<Project.NameKey, String> head : heads.entrySet()) {
+    NavigableMap<RepositoryId, String> heads = repositories.storage().listManifestVersions();
+    for (Map.Entry<RepositoryId, String> head : heads.entrySet()) {
       ManifestStore manifestStore = repositories.storage().manifestStore(head.getKey());
       ManifestCache.VersionedManifest versioned = manifestStore.currentOrRefresh(head.getValue());
       Manifest manifest = versioned.manifest();

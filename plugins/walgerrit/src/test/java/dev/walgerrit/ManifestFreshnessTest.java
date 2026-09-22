@@ -66,7 +66,8 @@ class ManifestFreshnessTest {
                   } catch (InvocationTargetException failure) {
                     throw failure.getCause();
                   }
-                  if (method.getName().equals("getIfChanged")) {
+                  if (method.getName().equals("getIfChanged")
+                      && !((String) args[0]).startsWith("manifests/catalog/")) {
                     Executable action = afterRead.getAndSet(null);
                     if (action != null) {
                       action.execute();
@@ -84,21 +85,21 @@ class ManifestFreshnessTest {
     try (Repository writing = writer.openRepository(project);
         Repository reading = reader.openRepository(project)) {
       if (alreadyExpecting) {
-        reader.storage().expectManifest(project, "unconfirmed", 1);
+        reader.storage().expectManifest(reader.idOf(project), "unconfirmed", 1);
       }
       AtomicReference<ObjectId> commit = new AtomicReference<>();
       afterRead.set(
           () -> {
             commit.set(publishMain(writing, "after the read"));
             VersionedManifest published =
-                writer.storage().manifestStore(project).refreshVersionedManifest();
+                writer.manifestStore(project).refreshVersionedManifest();
             reader
                 .storage()
-                .expectManifest(project, published.version(), published.manifest().getRevision());
+                .expectManifest(reader.idOf(project), published.version(), published.manifest().getRevision());
           });
-      reader.storage().manifestStore(project).refresh();
+      reader.manifestStore(project).refresh();
       assertTrue(
-          reader.storage().manifestStore(project).expectingNewerManifest(),
+          reader.manifestStore(project).expectingNewerManifest(),
           "the earlier response cannot settle a later announcement");
       assertEquals(commit.get(), reading.exactRef(MAIN).getObjectId());
     }
@@ -146,19 +147,19 @@ class ManifestFreshnessTest {
 
       // What node A's gossip endpoint tells node B about the publication.
       VersionedManifest published =
-          nodeA.storage().manifestStore(project).refreshVersionedManifest();
+          nodeA.manifestStore(project).refreshVersionedManifest();
       assertTrue(
           nodeB
               .storage()
-              .expectManifest(project, published.version(), published.manifest().getRevision()));
+              .expectManifest(nodeB.idOf(project), published.version(), published.manifest().getRevision()));
 
       // The open handle's next lookup revalidates, with no open, scan or elapsed interval.
       assertEquals(commit, reader.exactRef(MAIN).getObjectId());
-      assertFalse(nodeB.storage().manifestStore(project).expectingNewerManifest());
+      assertFalse(nodeB.manifestStore(project).expectingNewerManifest());
       assertFalse(
           nodeB
               .storage()
-              .expectManifest(project, published.version(), published.manifest().getRevision()),
+              .expectManifest(nodeB.idOf(project), published.version(), published.manifest().getRevision()),
           "an announcement of what the node already holds changes nothing");
     }
   }

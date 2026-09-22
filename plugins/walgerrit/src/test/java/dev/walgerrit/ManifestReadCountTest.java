@@ -63,13 +63,17 @@ class ManifestReadCountTest {
 
     ObjectId tip;
     try (Repository repository = manager.openRepository(project)) {
-      assertEquals(1, store.manifestReads(), "opening a handle revalidates exactly once");
+      assertEquals(1, store.repositoryManifestReads(), "opening a handle revalidates exactly once");
+      assertEquals(
+          1,
+          store.count("GET-if-changed catalog/manifest.pb"),
+          "and resolves the name with one conditional catalog read");
       store.reset();
 
       tip = insertChain(repository, COMMITS);
       assertEquals(
           0,
-          store.manifestReads(),
+          store.repositoryManifestReads(),
           "object insertion consults JGit's in-memory pack list, not the object store");
       assertEquals(
           0,
@@ -82,7 +86,7 @@ class ManifestReadCountTest {
       assertEquals(RefUpdate.Result.NEW, update.update());
       assertEquals(
           1,
-          store.manifestReads(),
+          store.repositoryManifestReads(),
           "a ref transaction revalidates once before validating expected values");
       assertEquals(1, store.count("CAS manifest.pb"));
       store.reset();
@@ -90,7 +94,7 @@ class ManifestReadCountTest {
       assertEquals(tip, repository.exactRef(Constants.R_HEADS + "main").getObjectId());
       repository.getRefDatabase().getRefs();
       assertEquals(COMMITS, walk(repository, tip));
-      assertEquals(0, store.manifestReads(), "reads on an open handle never touch the store");
+      assertEquals(0, store.repositoryManifestReads(), "reads on an open handle never touch the store");
     }
 
     store.reset();
@@ -101,7 +105,7 @@ class ManifestReadCountTest {
         RevCommit commit = walk.parseCommit(tip);
         assertTrue(fresh.open(commit.getTree()).getBytes().length > 0);
       }
-      assertEquals(1, store.manifestReads(), "a new handle costs exactly one conditional read");
+      assertEquals(1, store.repositoryManifestReads(), "a new handle costs exactly one conditional read");
       assertEquals(0, store.writes());
     }
   }
@@ -123,7 +127,7 @@ class ManifestReadCountTest {
         assertEquals(RefUpdate.Result.NEW, update.update());
       }
     }
-    assertEquals(cycles, store.manifestReads(), "one conditional read per ref transaction");
+    assertEquals(cycles, store.repositoryManifestReads(), "one conditional read per ref transaction");
     assertEquals(cycles, store.count("CAS manifest.pb"), "one CAS per cycle: the reftable carries the pack");
   }
 
@@ -151,13 +155,21 @@ class ManifestReadCountTest {
     store.reset();
     tailer.runOnce();
     assertEquals(1, store.count("LIST-versions manifests/"), "one listing enumerates every repository");
-    assertEquals(0, store.manifestReads(), "manifests this node published are served from its cache");
-    assertEquals(projects.size(), store.count("GET log/*"), "one WAL entry per new repository");
+    assertEquals(0, store.repositoryManifestReads(), "manifests this node published are served from its cache");
+    assertEquals(
+        1,
+        store.count("GET-if-changed catalog/manifest.pb"),
+        "one authoritative catalog read for the names the catalog's own entries touched");
+    assertEquals(
+        3 * projects.size() + 1,
+        store.count("GET log/*"),
+        "one WAL entry per new repository, and its reservation, activation and HEAD in the catalog");
 
     store.reset();
     tailer.runOnce();
     assertEquals(1, store.count("LIST-versions manifests/"));
-    assertEquals(0, store.manifestReads(), "an unchanged repository costs no read at all");
+    assertEquals(0, store.repositoryManifestReads(), "an unchanged repository costs no read at all");
+    assertEquals(0, store.count("GET-if-changed catalog/manifest.pb"), "nor the catalog");
     assertEquals(0, store.count("GET log/*"));
 
     ObjectId commit;
@@ -171,7 +183,7 @@ class ManifestReadCountTest {
     store.reset();
     tailer.runOnce();
     assertEquals(1, store.count("LIST-versions manifests/"));
-    assertEquals(1, store.manifestReads(), "only the repository whose manifest version changed is read");
+    assertEquals(1, store.repositoryManifestReads(), "only the repository whose manifest version changed is read");
     assertEquals(1, store.count("GET log/*"), "its one entry, pack and ref update together, is replayed");
     assertEquals(0, store.writes());
   }
@@ -186,12 +198,12 @@ class ManifestReadCountTest {
     store.reset();
 
     batch.openRepository(project).close();
-    assertEquals(1, store.manifestReads(), "the first open on a node reads once");
+    assertEquals(1, store.repositoryManifestReads(), "the first open on a node reads once");
     store.reset();
     for (int i = 0; i < 5; i++) {
       batch.openRepository(project).close();
     }
-    assertEquals(0, store.manifestReads(), "opens within the interval reuse the node's view");
+    assertEquals(0, store.repositoryManifestReads(), "opens within the interval reuse the node's view");
 
     ObjectId tip;
     try (Repository repository = writer.openRepository(project)) {
@@ -202,13 +214,13 @@ class ManifestReadCountTest {
     }
     store.reset();
     try (Repository stale = batch.openRepository(project)) {
-      assertEquals(0, store.manifestReads());
+      assertEquals(0, store.repositoryManifestReads());
       assertNull(
           stale.exactRef(Constants.R_HEADS + "main"),
           "the trade-off: another node's write stays invisible for up to one interval");
     }
     try (Repository fresh = writer.openRepository(project)) {
-      assertEquals(1, store.manifestReads(), "by default every open revalidates");
+      assertEquals(1, store.repositoryManifestReads(), "by default every open revalidates");
       assertEquals(tip, fresh.exactRef(Constants.R_HEADS + "main").getObjectId());
     }
 
@@ -224,7 +236,7 @@ class ManifestReadCountTest {
     new IndexEventTailer(batch, (ignoredProject, transaction) -> {}, GerritRuntime.DAEMON).runOnce();
     store.reset();
     try (Repository swept = batch.openRepository(project)) {
-      assertEquals(0, store.manifestReads(), "the sweep already validated the manifest");
+      assertEquals(0, store.repositoryManifestReads(), "the sweep already validated the manifest");
       assertEquals(later, swept.exactRef(Constants.R_HEADS + "later").getObjectId());
     }
 
@@ -232,7 +244,7 @@ class ManifestReadCountTest {
     store.reset();
     always.openRepository(project).close();
     always.openRepository(project).close();
-    assertEquals(2, store.manifestReads(), "an interval of 0 keeps every open revalidating");
+    assertEquals(2, store.repositoryManifestReads(), "an interval of 0 keeps every open revalidating");
   }
 
   @Test
@@ -250,13 +262,14 @@ class ManifestReadCountTest {
     IndexEventApplier nothing = (ignoredProject, transaction) -> {};
     new IndexEventTailer(node, nothing, GerritRuntime.DAEMON).runOnce();
     IndexCursor cursor =
-        new IndexCursorStore(node.storage().manifestStore(project).indexCursorPath()).read();
-    assertEquals(node.storage().listManifestVersions().get(project), cursor.getManifestVersion());
+        new IndexCursorStore(node.manifestStore(project).indexCursorPath()).read();
+    assertEquals(
+        node.storage().listManifestVersions().get(node.idOf(project)), cursor.getManifestVersion());
 
     store.reset();
     // A new tailer is what a restarted daemon has: no memory of what it caught up to.
     new IndexEventTailer(node, nothing, GerritRuntime.DAEMON).runOnce();
-    assertEquals(0, store.manifestReads(), "the listing alone proves the cursor is at the head");
+    assertEquals(0, store.repositoryManifestReads(), "the listing alone proves the cursor is at the head");
 
     try (Repository repository = node.openRepository(project)) {
       ObjectId tip = insertChain(repository, 1);
@@ -270,7 +283,7 @@ class ManifestReadCountTest {
             node, (ignoredProject, transaction) -> replayed.incrementAndGet(), GerritRuntime.DAEMON)
         .runOnce();
     assertEquals(1, replayed.get(), "the changed repository is replayed");
-    assertEquals(0, store.manifestReads(), "from the manifest this node itself published");
+    assertEquals(0, store.repositoryManifestReads(), "from the manifest this node itself published");
   }
 
   private WalGitRepositoryManager manager(ObjectStore store, String revalidateInterval) {
@@ -339,7 +352,7 @@ class ManifestReadCountTest {
       this.delegate = delegate;
     }
 
-    long manifestReads() {
+    long repositoryManifestReads() {
       return count("GET manifest.pb") + count("GET-if-changed manifest.pb");
     }
 
@@ -370,7 +383,9 @@ class ManifestReadCountTest {
         return;
       }
       String normalized = key.substring(key.lastIndexOf('/') + 1);
-      if (key.contains("/log/")) {
+      if (key.startsWith("manifests/" + RepositoryId.CATALOG + "/")) {
+        normalized = "catalog/" + normalized;
+      } else if (key.contains("/log/")) {
         normalized = "log/*";
       } else if (key.contains("/wal/")) {
         normalized = "wal/*." + key.substring(key.lastIndexOf('.') + 1);

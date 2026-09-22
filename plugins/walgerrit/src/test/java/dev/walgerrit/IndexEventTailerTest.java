@@ -75,7 +75,7 @@ class IndexEventTailerTest {
     assertEquals(0, first.catchUp(project));
     assertEquals(0, tailer(manager, new RecordingApplier()).catchUp(project));
 
-    ManifestStore store = manager.storage().manifestStore(project);
+    ManifestStore store = manager.manifestStore(project);
     IndexCursor cursor = new IndexCursorStore(store.indexCursorPath()).read();
     assertEquals(store.read().getHeadSeq(), cursor.getSequence());
     assertEquals(store.read().getHeadTransactionId(), cursor.getTransactionId());
@@ -89,7 +89,7 @@ class IndexEventTailerTest {
 
     RecordingApplier seed = new RecordingApplier();
     tailer(manager, seed).catchUp(project);
-    ManifestStore store = manager.storage().manifestStore(project);
+    ManifestStore store = manager.manifestStore(project);
     long cursorBefore = new IndexCursorStore(store.indexCursorPath()).read().getSequence();
 
     try (Repository repository = manager.openRepository(project)) {
@@ -145,8 +145,8 @@ class IndexEventTailerTest {
     Project.NameKey project = Project.nameKey("platform/independent-cursors");
     first.createRepository(project).close();
 
-    ManifestStore firstStore = first.storage().manifestStore(project);
-    ManifestStore secondStore = second.storage().manifestStore(project);
+    ManifestStore firstStore = first.manifestStore(project);
+    ManifestStore secondStore = second.manifestStore(project);
     assertNotEquals(firstStore.indexCursorPath(), secondStore.indexCursorPath());
 
     tailer(first, new RecordingApplier()).catchUp(project);
@@ -189,7 +189,7 @@ class IndexEventTailerTest {
       assertTrue(readiness.isReady());
       assertTrue(Files.isRegularFile(readiness.markerPath()));
 
-      ManifestStore store = manager.storage().manifestStore(project);
+      ManifestStore store = manager.manifestStore(project);
       assertEquals(
           store.read().getHeadSeq(),
           new IndexCursorStore(store.indexCursorPath()).read().getSequence());
@@ -305,7 +305,7 @@ class IndexEventTailerTest {
 
     RecordingApplier applier = new RecordingApplier();
     IndexEventTailer tailer = startingTailer(reader, applier, readiness("wake-up-node"));
-    tailer.wake(project, null); // No tailer thread yet: the startup sweep covers this.
+    tailer.wake(reader.idOf(project), null); // No tailer thread yet: the startup sweep covers this.
     tailer.start();
     try {
       ObjectId commit;
@@ -315,10 +315,10 @@ class IndexEventTailerTest {
         update.setNewObjectId(commit);
         assertEquals(RefUpdate.Result.NEW, update.update());
       }
-      String version = writer.storage().manifestStore(project).refreshVersionedManifest().version();
+      String version = writer.manifestStore(project).refreshVersionedManifest().version();
       assertFalse(applier.sawUpdate(Constants.R_HEADS + "main", commit));
 
-      tailer.wake(project, version);
+      tailer.wake(reader.idOf(project), version);
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
       while (tailer.wakeUpsReplayed() < 1 && System.nanoTime() < deadline) {
         Thread.sleep(10);
@@ -327,12 +327,12 @@ class IndexEventTailerTest {
       assertTrue(applier.sawUpdate(Constants.R_HEADS + "main", commit));
 
       // The node replayed exactly that manifest: another wake-up for it is a no-op.
-      tailer.wake(project, version);
+      tailer.wake(reader.idOf(project), version);
       assertEquals(1, tailer.wakeUpsReplayed());
     } finally {
       tailer.stop();
     }
-    tailer.wake(project, null); // Stopped: ignored rather than rejected.
+    tailer.wake(reader.idOf(project), null); // Stopped: ignored rather than rejected.
     assertEquals(1, tailer.wakeUpsReplayed());
   }
 
@@ -376,17 +376,17 @@ class IndexEventTailerTest {
     try {
       block.set(true);
       publishRef(writer, blocker, "refs/heads/block");
-      tailer.wake(blocker, null);
+      tailer.wake(reader.idOf(blocker), null);
       assertTrue(replayStarted.await(10, TimeUnit.SECONDS));
 
       publishRef(writer, project, "refs/heads/first");
       String firstVersion =
-          reader.storage().manifestStore(project).refreshVersionedManifest().version();
-      tailer.wake(project, firstVersion);
+          reader.manifestStore(project).refreshVersionedManifest().version();
+      tailer.wake(reader.idOf(project), firstVersion);
       ObjectId second = publishRef(writer, project, "refs/heads/second");
-      var latest = writer.storage().manifestStore(project).refreshVersionedManifest();
-      reader.storage().expectManifest(project, latest.version(), latest.manifest().getRevision());
-      tailer.wake(project, latest.version());
+      var latest = writer.manifestStore(project).refreshVersionedManifest();
+      reader.storage().expectManifest(reader.idOf(project), latest.version(), latest.manifest().getRevision());
+      tailer.wake(reader.idOf(project), latest.version());
       releaseReplay.countDown();
 
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
@@ -448,7 +448,7 @@ class IndexEventTailerTest {
       publishRef(nodeA, project, Constants.R_HEADS + "b" + i);
       tailerA.catchUp(project);
     }
-    ManifestStore storeA = nodeA.storage().manifestStore(project);
+    ManifestStore storeA = nodeA.manifestStore(project);
     Manifest head = storeA.read();
     assertTrue(head.getHeadSeq() > 3, "more entries than a fresh node may replay");
 
@@ -470,7 +470,7 @@ class IndexEventTailerTest {
       assertEquals(1, rebuilder.rebuilds.get(), "a fresh node too far behind rebuilds once");
       assertTrue(applierB.transactions.isEmpty(), "history was rebuilt, not replayed");
       IndexCursor cursor =
-          new IndexCursorStore(nodeB.storage().manifestStore(project).indexCursorPath()).read();
+          new IndexCursorStore(nodeB.manifestStore(project).indexCursorPath()).read();
       assertEquals(head.getHeadSeq(), cursor.getSequence());
       assertEquals(head.getHeadTransactionId(), cursor.getTransactionId());
       assertTrue(readiness.isReady());
@@ -547,7 +547,7 @@ class IndexEventTailerTest {
     tailer.runOnce();
     assertEquals(0, rebuilder.rebuilds.get());
 
-    ManifestStore store = manager.storage().manifestStore(project);
+    ManifestStore store = manager.manifestStore(project);
     IndexCursorStore cursorStore = new IndexCursorStore(store.indexCursorPath());
     cursorStore.write(cursorStore.read().getSequence(), "not-the-transaction-that-happened");
 

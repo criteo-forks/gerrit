@@ -62,21 +62,16 @@ for index_name in accounts changes_open changes_closed groups projects; do
 done
 
 run_gerrit init --batch --no-auto-start -d "$site"
-test -f "$site/data/walgerrit/manifests/All-Projects.git/manifest.pb"
-test -f "$site/data/walgerrit/manifests/All-Users.git/manifest.pb"
-test -d "$site/data/walgerrit/repos/All-Projects.git/wal"
-test -d "$site/data/walgerrit/repos/All-Users.git/wal"
+manifests="$site/data/walgerrit/manifests"
+# The catalog binds All-Projects and All-Users to two repository ids.
+test -f "$manifests/catalog/manifest.pb"
+test "$(find "$manifests" -name manifest.pb | wc -l)" -eq 3
+test "$(find "$site/data/walgerrit/repos" -mindepth 2 -maxdepth 2 -name wal -type d | wc -l)" -eq 3
 
-cp "$site/data/walgerrit/manifests/All-Projects.git/manifest.pb" \
-  "$site/home/All-Projects.manifest.before-reinit"
-cp "$site/data/walgerrit/manifests/All-Users.git/manifest.pb" \
-  "$site/home/All-Users.manifest.before-reinit"
+find "$manifests" -name manifest.pb -exec sha256sum {} + | sort >"$site/home/manifests.before-reinit"
 
 run_gerrit init --batch --no-auto-start -d "$site"
-cmp "$site/home/All-Projects.manifest.before-reinit" \
-  "$site/data/walgerrit/manifests/All-Projects.git/manifest.pb"
-cmp "$site/home/All-Users.manifest.before-reinit" \
-  "$site/data/walgerrit/manifests/All-Users.git/manifest.pb"
+find "$manifests" -name manifest.pb -exec sha256sum {} + | sort | cmp - "$site/home/manifests.before-reinit"
 
 run_gerrit reindex -d "$site"
 
@@ -184,13 +179,28 @@ run_gerrit walgerrit-import -d "$site" --source "$import_source" --stage "$site/
   --prune-dangling-refs \
   --threads 1 --verify-closure
 test ! -e "$site/home/import-stage/imported/tools.git"
-test -f "$site/data/walgerrit/manifests/imported/tools.git/manifest.pb"
+test "$(find "$manifests" -name manifest.pb | wc -l)" -eq 4
 import_log="$site/logs/walgerrit-import-smoke.log"
 start_daemon "$import_log"
 curl -fsS "${listen_url}projects/imported%2Ftools" | grep -q '"imported/tools"'
 curl -fsS "${listen_url}projects/imported%2Ftools/branches/main" | grep -q '"refs/heads/main"'
 stop_daemon
 
+# Rename the imported project while no daemon runs; the next daemon replays the catalog and
+# reconciles its project index with it before it becomes ready, without rebuilding.
+git config --file "$site/etc/gerrit.config" --unset walgerrit.indexReplayLimit
+run_gerrit walgerrit-namespace -d "$site" rename imported/tools imported/renamed
+test -z "$(run_gerrit walgerrit-namespace -d "$site" pending)"
+rename_log="$site/logs/walgerrit-rename-smoke.log"
+start_daemon "$rename_log"
+! grep -q "is rebuilding this node's indexes" "$rename_log"
+grep -q "reconciled imported/renamed with the catalog: active" "$rename_log"
+curl -fsS "${listen_url}projects/imported%2Frenamed/branches/main" | grep -q '"refs/heads/main"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' "${listen_url}projects/imported%2Ftools")" = 404
+curl -fsS "${listen_url}projects/?query=name:imported%2Frenamed" | grep -q '"imported/renamed"'
+! curl -fsS "${listen_url}projects/?query=name:imported%2Ftools" | grep -q '"imported/tools"'
+stop_daemon
+
 echo "WalGerrit fork initialized, reindexed, caught up, folded its logs, rebuilt indexes for a" \
-  "replaced node, compacted and reclaimed its repositories, imported a repository, and published" \
-  "readiness successfully."
+  "replaced node, compacted and reclaimed its repositories, imported and renamed a repository," \
+  "and published readiness successfully."

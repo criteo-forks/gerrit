@@ -76,9 +76,13 @@ class WalGitRepositoryManagerTest {
       assertNotNull(reopened.open(commit, Constants.OBJ_COMMIT));
     }
 
-    Path repositoryPath = storagePath.resolve("repos/platform/example.git");
+    RepositoryId repositoryId = manager.idOf(project);
+    Path repositoryPath = storagePath.resolve("repos").resolve(repositoryId.value());
     Path manifestPath =
-        storagePath.resolve("manifests/platform/example.git").resolve(ManifestStore.MANIFEST_FILE);
+        storagePath
+            .resolve("manifests")
+            .resolve(repositoryId.value())
+            .resolve(ManifestStore.MANIFEST_FILE);
     Manifest manifest = Manifest.parseFrom(Files.readAllBytes(manifestPath));
     assertEquals(2, manifest.getHeadSeq(), "creation, then one entry for the pack and its ref");
     assertEquals(2, manifest.getRevision());
@@ -108,27 +112,60 @@ class WalGitRepositoryManagerTest {
   void repositoryDeletedHookDoesNotEraseDurableWal() throws Exception {
     WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/retained");
-    manager.createRepository(project).close();
+    ObjectId commit;
+    try (Repository repository = manager.createRepository(project)) {
+      commit = insertCommit(repository, "retained");
+      RefUpdate update = repository.updateRef(Constants.R_HEADS + "main");
+      update.setNewObjectId(commit);
+      assertEquals(RefUpdate.Result.NEW, update.update());
+    }
 
     manager.repositoryDeleted(project);
 
     assertEquals(GitRepositoryManager.Status.ACTIVE, manager.getRepositoryStatus(project));
+    try (Repository repository = manager.openRepository(project)) {
+      assertEquals(commit, repository.exactRef(Constants.R_HEADS + "main").getObjectId());
+      assertEquals(Constants.OBJ_COMMIT, repository.open(commit).getType());
+    }
   }
 
   @Test
-  void openRecoversInterruptedRepositoryCreation() throws Exception {
+  void createFinishesACreationThatDiedBeforeActivatingTheName() throws Exception {
+    WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/recovered");
-    ManifestStore manifestStore = new StorageLayout(storagePath).manifestStore(project);
+    // A process death after the name was reserved and the manifest created, before HEAD and the
+    // activation: the name is not served, and the next creation finishes under the reserved id.
+    RepositoryId reserved = RepositoryId.random();
+    manager
+        .catalog()
+        .commit(
+            "Create platform/recovered",
+            ignored ->
+                java.util.List.of(
+                    new Catalog.Binding(
+                        project,
+                        reserved,
+                        Catalog.State.PENDING,
+                        0,
+                        new Catalog.Operation("op-1", Catalog.Kind.CREATE, 0, 0, null),
+                        null,
+                        0)));
+    ManifestStore manifestStore = manager.storage().manifestStore(reserved);
     assertTrue(manifestStore.create());
-    assertEquals(0, manifestStore.read().getRevision());
+    assertEquals(GitRepositoryManager.Status.NON_EXISTENT, manager.getRepositoryStatus(project));
+    assertThrows(RepositoryNotFoundException.class, () -> manager.openRepository(project));
+    assertEquals(java.util.Set.of("op-1"), manager.namespace().pending());
 
-    try (Repository repository = manager().openRepository(project)) {
+    try (Repository repository = manager.createRepository(project)) {
       Ref head = repository.exactRef(Constants.HEAD);
       assertTrue(head.isSymbolic());
       assertEquals(Constants.R_HEADS + Constants.MASTER, head.getTarget().getName());
     }
 
+    assertEquals(reserved, manager.idOf(project), "the reservation was finished, not replaced");
     assertEquals(1, manifestStore.read().getRevision());
+    assertEquals(GitRepositoryManager.Status.ACTIVE, manager.getRepositoryStatus(project));
+    assertTrue(manager.namespace().pending().isEmpty());
   }
 
   private WalGitRepositoryManager manager() {

@@ -41,7 +41,7 @@ work itself, but publication can queue or retry; bounded retries can still be ex
 After publication, a daemon evaluates the policy and queues due repositories on one maintenance
 thread. For each repository it:
 
-1. Acquires `leases/<project>.git/compaction`, or skips work if another node holds it.
+1. Acquires `leases/<repository-id>/compaction`, or skips work if another node holds it.
 2. Opens a handle and plans from its manifest view.
 3. Compacts the selected object packs and reftables in separate publications.
 4. Renews the lease after each rewrite and repeats, for at most four passes.

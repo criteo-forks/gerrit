@@ -5,23 +5,27 @@ the committed inventory do not publish refs merely by existing in the store.
 
 ```text
 <store-prefix>/
-  manifests/<project>.git/manifest.pb
-  repos/<project>.git/
+  manifests/catalog/manifest.pb           # the name catalog, a repository with a fixed id
+  manifests/<repository-id>/manifest.pb
+  repos/<repository-id>/
     log/<sequence>-<transaction-id>.pb
     wal/<pack-id>.pack
     wal/<pack-id>.idx
     wal/<pack-id>.ref
-  leases/<project>.git/compaction
+  leases/<repository-id>/compaction
   leases/cluster/sweep
-  cluster/web-session-signing-key       # optional stateless sessions
+  cluster/web-session-signing-key         # optional stateless sessions
 
-<storagePath>/repos/<project>.git/
+<storagePath>/repos/<repository-id>/
   staging/
-  wal/                                # local immutable-file cache
+  wal/                                    # local immutable-file cache
 
-<indexCursorPath>/repos/<project>.git.cursor
+<indexCursorPath>/repos/<repository-id>.cursor
 <indexCursorPath>/READY
 ```
+
+A repository id is an opaque lowercase hexadecimal string chosen at creation. Project names are
+bindings in the [catalog](namespace.md), so renaming or deleting a project moves no files.
 
 Pack families may also contain bitmap and reverse-index files. Large cached S3 packs can have a
 `.chunks` sidecar that records downloaded ranges. Staging files and cursors are node-local.
@@ -32,16 +36,19 @@ the bucket and the cache beneath each node's `storagePath`.
 
 ## The manifest records live data
 
-Format version 3 records the repository name, SHA-1 object format, head sequence and transaction
-ID, overall revision, ref revision, writer, timestamp and live pack families. Each family records
+Format version 4 records the repository id, SHA-1 object format, head sequence and transaction
+ID, overall revision, ref revision, write epoch, the namespace operation that last fenced the
+repository, whether it is deleted, writer, timestamp and live pack families. Each family records
 its source, files and sizes, object/delta counts, reftable update indices and pack checksum.
 The schema is [walgerrit.proto](../src/main/proto/walgerrit.proto).
 
 `revision` advances on every publication. `ref_revision` advances only when the live reftable
-stack changes, including reftable compaction. The object store's version token is separate from
-both: it is the value used for conditional replacement.
+stack changes, including reftable compaction. `write_epoch` advances only when a rename or
+deletion fences the repository; a publication whose writer was admitted under another epoch is
+refused. The object store's version token is separate from all three: it is the value used for
+conditional replacement.
 
-Manifests have a dedicated prefix. A paginated listing discovers repository names and manifest
+Manifests have a dedicated prefix. A paginated listing discovers repository ids and manifest
 versions without enumerating packs or logs. On S3, the listed version is the ETag. An unchanged
 version lets the index tailer skip an already indexed repository.
 
@@ -59,6 +66,7 @@ leave unreferenced log objects.
 | `COMPACT` | Replacement files and the names they supersede. |
 | `EVENT` | Serialized Gerrit notifications, optionally with document IDs to reindex. |
 | `INDEX` | Document IDs to reindex without a ref update or public event. |
+| `FENCE` | No files or refs; the namespace operation that advanced the write epoch. |
 
 A logical ref update records the ref name, old and new object IDs, and a new symbolic target when
 applicable. Several independent local batches can share one entry; their logical updates are
@@ -100,9 +108,10 @@ log objects remain. A lost CAS response requires [outcome recovery](consistency.
 
 ## Format boundaries
 
-Only SHA-1 repositories and manifest format 3 are supported. There is no automatic conversion
-from earlier manifest versions, durable repository deletion, or native GCS backend. Import from
-bare repositories is available through [walgerrit-import](import.md).
+Only SHA-1 repositories and manifest format 4 are supported. There is no automatic conversion
+from earlier manifest versions or native GCS backend. Import from bare repositories is available
+through [walgerrit-import](import.md). Deleting a project retires its name and refuses further
+writes; its files are kept and never reclaimed.
 
 New DFS file names use random pack identifiers; imported packs retain their original names.
 Pack checksums are metadata, not a universal object-store naming scheme. Multi-pack indexes are

@@ -55,17 +55,26 @@ import org.slf4j.LoggerFactory;
  * costs a round trip without a body; {@link #current()} serves the cached manifest without touching
  * the object store at all. Callers choose the freshness boundary; this class never reads the
  * manifest on its own initiative except to establish a CAS base.
+ *
+ * <p>Every publication that changes the repository carries the write epoch its writer was admitted
+ * under, and is refused when the manifest's epoch differs: a namespace operation {@linkplain
+ * #fence fences} the repository by advancing the epoch, which stops every writer admitted before
+ * it, on every node, at the commit point. A publication that carries no epoch ({@link
+ * #UNFENCED}) is node bookkeeping, such as the journal, and only a deleted repository refuses it.
  */
 final class ManifestStore {
   private static final Logger logger = LoggerFactory.getLogger(ManifestStore.class);
   static final String MANIFEST_FILE = "manifest.pb";
 
-  private static final int FORMAT_VERSION = 3;
+  private static final int FORMAT_VERSION = 4;
 
   /** Cached files younger than this are never evicted: they may await their publication. */
   static final java.time.Duration EVICTION_MIN_AGE = java.time.Duration.ofMinutes(10);
 
   private static final int MAX_CAS_ATTEMPTS = 64;
+
+  /** The epoch of a publication that no fence applies to. */
+  static final long UNFENCED = -1;
   private static final String OBJECT_FORMAT = "sha1";
   private static final String LOG_DIRECTORY = "log";
   private static final String STAGING_DIRECTORY = "staging";
@@ -330,38 +339,35 @@ final class ManifestStore {
     return entry;
   }
 
+  /** A publication nothing fences: tests and tools on a repository no operation touches. */
   Manifest publish(
       long expectedRefRevision,
       Collection<PackRef> additions,
       Collection<String> supersedes,
       boolean requireExactRefRevision)
       throws IOException {
-    return publish(expectedRefRevision, additions, supersedes, requireExactRefRevision, null);
-  }
-
-  Manifest publish(
-      long expectedRefRevision,
-      Collection<PackRef> additions,
-      Collection<String> supersedes,
-      boolean requireExactRefRevision,
-      RefTransaction refTransaction)
-      throws IOException {
     return publish(
         expectedRefRevision,
         additions,
         supersedes,
         requireExactRefRevision,
-        refTransaction,
+        null,
+        UNFENCED,
         (sequence, transactionId) -> {});
   }
 
-  /** Registers each attempt before its CAS so local read snapshots can resolve in-flight packs. */
+  /**
+   * Registers each attempt before its CAS so local read snapshots can resolve in-flight packs.
+   *
+   * @param expectedWriteEpoch the epoch the writer was admitted under, or {@link #UNFENCED}
+   */
   Manifest publish(
       long expectedRefRevision,
       Collection<PackRef> additions,
       Collection<String> supersedes,
       boolean requireExactRefRevision,
       RefTransaction refTransaction,
+      long expectedWriteEpoch,
       BiConsumer<Long, String> beforeCas)
       throws IOException {
     return publish(
@@ -373,8 +379,41 @@ final class ManifestStore {
         List.of(),
         null,
         false,
+        null,
+        expectedWriteEpoch,
         beforeCas);
   }
+
+  /**
+   * Advances the write epoch from {@code expectedWriteEpoch} for namespace operation {@code
+   * operation}, and marks the repository deleted when {@code delete}. Repeating the fence of an
+   * operation the manifest already records makes no further change. An epoch other than the
+   * expected one that this operation did not produce means another operation fenced the repository
+   * first.
+   */
+  Manifest fence(long expectedWriteEpoch, String operation, boolean delete) throws IOException {
+    Manifest current = refresh();
+    if (operation.equals(current.getFenceOperation())) {
+      return current;
+    }
+    if (current.getWriteEpoch() != expectedWriteEpoch) {
+      throw new RepositoryFencedException(repositoryName, expectedWriteEpoch, current);
+    }
+    return publish(
+        0,
+        List.of(),
+        List.of(),
+        false,
+        null,
+        List.of(),
+        null,
+        false,
+        new NamespaceFence(operation, delete),
+        expectedWriteEpoch,
+        (sequence, transactionId) -> {});
+  }
+
+  private record NamespaceFence(String operation, boolean delete) {}
 
   Manifest publishEvents(List<String> eventJson) throws IOException {
     return publishJournal(eventJson, null);
@@ -393,7 +432,17 @@ final class ManifestStore {
       return current();
     }
     return publish(
-        0, List.of(), List.of(), false, null, eventJson, indexUpdate, false, (s, id) -> {});
+        0,
+        List.of(),
+        List.of(),
+        false,
+        null,
+        eventJson,
+        indexUpdate,
+        false,
+        null,
+        UNFENCED,
+        (s, id) -> {});
   }
 
   private Manifest publish(
@@ -404,7 +453,9 @@ final class ManifestStore {
       RefTransaction refTransaction,
       List<String> eventJson,
       @Nullable IndexUpdate indexUpdate,
-      boolean fence,
+      boolean recoveryFence,
+      @Nullable NamespaceFence namespaceFence,
+      long expectedWriteEpoch,
       BiConsumer<Long, String> beforeCas)
       throws IOException {
     createCacheDirectories();
@@ -414,6 +465,17 @@ final class ManifestStore {
       VersionedManifest versioned =
           attempt == 0 ? currentVersioned() : refreshVersioned().orElseThrow(this::notFound);
       Manifest current = versioned.manifest();
+      if (namespaceFence != null && namespaceFence.operation().equals(current.getFenceOperation())) {
+        return current; // This fence landed; the lost response or a retry brought us back here.
+      }
+      if (current.getDeleted()) {
+        throw new RepositoryFencedException(repositoryName, expectedWriteEpoch, current);
+      }
+      if (expectedWriteEpoch != UNFENCED && current.getWriteEpoch() != expectedWriteEpoch) {
+        // Checked against the very manifest the CAS is conditional on, and again on every retry,
+        // so a writer admitted before a fence can never land after it.
+        throw new RepositoryFencedException(repositoryName, expectedWriteEpoch, current);
+      }
       if (requireExactRefRevision && current.getRefRevision() != expectedRefRevision) {
         throw new ManifestConflictException(expectedRefRevision, current.getRefRevision());
       }
@@ -432,7 +494,8 @@ final class ManifestStore {
         }
       }
 
-      if (!fence
+      if (!recoveryFence
+          && namespaceFence == null
           && additions.isEmpty()
           && supersedes.isEmpty()
           && refTransaction == null
@@ -444,7 +507,10 @@ final class ManifestStore {
       LogEntry.Builder entry =
           LogEntry.newBuilder()
               .setSeq(sequence)
-              .setKind(entryKind(supersedes, requireExactRefRevision, eventJson, indexUpdate))
+              .setKind(
+                  namespaceFence != null
+                      ? LogEntry.Kind.FENCE
+                      : entryKind(supersedes, requireExactRefRevision, eventJson, indexUpdate))
               .addAllSupersedes(supersedes)
               .addAllEventJson(eventJson)
               .setCreatedAtEpochMillis(now)
@@ -458,6 +524,9 @@ final class ManifestStore {
       if (indexUpdate != null) {
         entry.setIndexUpdate(indexUpdate);
       }
+      if (namespaceFence != null) {
+        entry.setFenceOperation(namespaceFence.operation());
+      }
       for (PackRef addition : additions) {
         PackRef published = addition.toBuilder().setSeq(sequence).build();
         if (livePacks.putIfAbsent(published.getName(), published) != null) {
@@ -468,7 +537,7 @@ final class ManifestStore {
 
       objectStore.putIfAbsent(logKey(sequence, transactionId), entry.build().toByteArray());
 
-      Manifest updated =
+      Manifest.Builder next =
           current.toBuilder()
               .setHeadSeq(sequence)
               .setHeadTransactionId(transactionId)
@@ -477,8 +546,13 @@ final class ManifestStore {
               .setRevision(current.getRevision() + 1)
               .setRefRevision(current.getRefRevision() + (changesRefs ? 1 : 0))
               .setUpdatedAtEpochMillis(now)
-              .setWriter(writer)
-              .build();
+              .setWriter(writer);
+      if (namespaceFence != null) {
+        next.setWriteEpoch(current.getWriteEpoch() + 1)
+            .setFenceOperation(namespaceFence.operation())
+            .setDeleted(namespaceFence.delete());
+      }
+      Manifest updated = next.build();
 
       beforeCas.accept(sequence, transactionId);
       ObjectStore.StoredObject stored;
@@ -533,7 +607,19 @@ final class ManifestStore {
       // Absence from an earlier snapshot is not failure: the timed-out request may still run.
       // A data-free WAL entry fences its version. If the original wins first, the fence's CAS
       // retry follows that history instead. Neither outcome changes refs or adds any pack.
-      fresh = publish(0, List.of(), List.of(), false, null, List.of(), null, true, (seq, id) -> {});
+      fresh =
+          publish(
+              0,
+              List.of(),
+              List.of(),
+              false,
+              null,
+              List.of(),
+              null,
+              true,
+              null,
+              UNFENCED,
+              (seq, id) -> {});
     }
     if (fresh.getHeadSeq() < sequence) {
       throw new IOException("Manifest history precedes unresolved publication " + transactionId);

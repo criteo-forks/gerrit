@@ -56,8 +56,9 @@ Configure `etc/gerrit.config`:
 ```
 
 Paths are relative to the site unless absolute. The local backend stores manifests under
-`data/walgerrit/manifests/` and immutable files under `data/walgerrit/repos/`; it does not use
-`gerrit.basePath`. The cursor directory must remain node-local, beside that node's Lucene indexes.
+`data/walgerrit/manifests/` and immutable files under `data/walgerrit/repos/`, both keyed by
+repository id rather than project name; it does not use `gerrit.basePath`. The cursor directory
+must remain node-local, beside that node's Lucene indexes.
 
 The index tailer requires Lucene and all five `commitWithin = 0` settings. It saves a replay
 cursor only after synchronous index writes. Deferred Lucene commits could preserve the cursor
@@ -167,6 +168,21 @@ for another grace period. Only the sweep-lease holder deletes shared files. Cach
 node-local. Read [Compaction and reclamation](docs/compaction.md) before changing retention or
 cache limits.
 
+## Rename and delete projects
+
+Project names are bindings in a catalog the store holds beside the repositories. Renaming or
+deleting a project rewrites the binding and fences the repository's writers; no files move. Both
+run from any node against the shared store:
+
+```bash
+java -jar gerrit.war walgerrit-namespace -d "$site" rename platform/old platform/new
+java -jar gerrit.war walgerrit-namespace -d "$site" delete platform/gone
+```
+
+Every node's indexes follow the catalog. A name is never reused: pushing to the old name fails
+with the new one. Read [Project names](docs/namespace.md) for the protocol, what a deletion keeps,
+and how to finish an operation whose node died.
+
 ## Verify the integration
 
 From the repository root, initialize the pinned submodules and build the WAR:
@@ -178,7 +194,7 @@ GERRIT_WAR="$PWD/bazel-bin/release.war" plugins/walgerrit/scripts/smoke-test.sh
 ```
 
 The smoke script exercises initialization, reindexing, daemon readiness, compaction, restart,
-index rebuilding and import. The same database module serves daemon and batch programs; adding a
+index rebuilding, import and renaming. The same database module serves daemon and batch programs; adding a
 separate batch database module would bind `GitRepositoryManager` twice.
 
 Run Gerrit's acceptance tests on the local WalGerrit backend with:
@@ -208,6 +224,7 @@ results for the revision being deployed.
 | --- | --- |
 | Components and fork boundary | [Architecture](docs/architecture.md) |
 | Files, manifests and log entries | [Storage format](docs/storage-format.md) |
+| Renaming and deleting projects | [Project names](docs/namespace.md) |
 | Publication, recovery and freshness | [Consistency](docs/consistency.md) |
 | JGit integration and test coverage | [JGit/CAS audit](docs/jgit-cas-deep-dive.md) |
 | Local search and recovery | [Index events](docs/index-events.md) |

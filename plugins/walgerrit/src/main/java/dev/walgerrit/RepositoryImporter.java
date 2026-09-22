@@ -15,7 +15,6 @@ package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.git.GitRepositoryManager;
-import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import java.io.File;
 import java.io.IOException;
@@ -33,6 +32,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
@@ -269,32 +269,54 @@ public final class RepositoryImporter {
   /** Imports one repository; see the class comment for what is checked and what is skipped. */
   public Outcome importOne(String projectName, Path bareDirectory) throws IOException {
     Project.NameKey project = Project.nameKey(projectName);
-    ManifestStore store = repositories.storage().manifestStore(project);
-    boolean created = store.create();
-    if (!created) {
-      Manifest existing = store.refresh();
-      if (existing.getPacksCount() > 0 || existing.getRevision() > 0) {
-        try (Repository original = open(bareDirectory)) {
-          verify(project, sourceRefs(original));
-        }
-        out.printf(Locale.ROOT, "skipped %s: already imported and verified%n", projectName);
-        return Outcome.ALREADY_IMPORTED;
+    Optional<Catalog.Binding> bound = repositories.catalog().resolve(project, true);
+    if (bound.isPresent() && bound.get().active()) {
+      try (Repository original = open(bareDirectory)) {
+        verify(bound.get().id(), project, sourceRefs(original));
       }
-      // Created by an earlier run that died before publishing; publish now.
+      out.printf(Locale.ROOT, "skipped %s: already imported and verified%n", projectName);
+      return Outcome.ALREADY_IMPORTED;
     }
-    if (stage == null) {
-      return publishFrom(project, bareDirectory, store);
+    if (bound.isPresent() && !bound.get().pending()) {
+      throw new IOException(projectName + " " + Namespace.describe(bound.get()));
     }
-    Path copy = stage.resolve(projectName + Constants.DOT_GIT_EXT);
-    try {
-      stageCopy(projectName, bareDirectory, copy);
-      return publishFrom(project, copy, store);
-    } finally {
-      deleteRecursively(copy);
-    }
+    // Absent, or reserved by a run that died before activating it: the name is reserved first,
+    // the repository published under its id, and the name activated once the refs are there.
+    Outcome[] outcome = {Outcome.IMPORTED};
+    repositories
+        .namespace()
+        .create(
+            project,
+            Catalog.Kind.IMPORT,
+            (id, name) -> {
+              ManifestStore store = repositories.storage().manifestStore(id);
+              if (!store.exists()) {
+                store.create();
+              }
+              if (store.refresh().getRevision() > 0) {
+                // Published by the run that died before activating the name.
+                try (Repository original = open(bareDirectory)) {
+                  verify(id, project, sourceRefs(original));
+                }
+                return;
+              }
+              if (stage == null) {
+                outcome[0] = publishFrom(id, project, bareDirectory, store);
+                return;
+              }
+              Path copy = stage.resolve(projectName + Constants.DOT_GIT_EXT);
+              try {
+                stageCopy(projectName, bareDirectory, copy);
+                outcome[0] = publishFrom(id, project, copy, store);
+              } finally {
+                deleteRecursively(copy);
+              }
+            });
+    return outcome[0];
   }
 
-  private Outcome publishFrom(Project.NameKey project, Path bareDirectory, ManifestStore store)
+  private Outcome publishFrom(
+      RepositoryId id, Project.NameKey project, Path bareDirectory, ManifestStore store)
       throws IOException {
     String projectName = project.get();
     try (FileRepository source = open(bareDirectory)) {
@@ -346,8 +368,8 @@ public final class RepositoryImporter {
                         .setExtension(PackExt.REFTABLE.getExtension())
                         .setSize(Files.size(reftable)))
                 .build());
-        store.publish(0, additions, List.of(), false, null);
-        verify(project, refs);
+        store.publish(0, additions, List.of(), false);
+        verify(id, project, refs);
         out.printf(
             Locale.ROOT,
             "imported %s: %d packs, %d bytes, %d refs%n",
@@ -617,8 +639,9 @@ public final class RepositoryImporter {
   }
 
   /** Every source ref must be served identically through WalGerrit; optionally every object too. */
-  private void verify(Project.NameKey project, Map<String, Ref> expected) throws IOException {
-    try (Repository imported = repositories.openRepository(project)) {
+  private void verify(RepositoryId id, Project.NameKey project, Map<String, Ref> expected)
+      throws IOException {
+    try (Repository imported = repositories.openById(id, project, ManifestStore.UNFENCED)) {
       Map<String, Ref> actual = sourceRefs(imported);
       for (Map.Entry<String, Ref> entry : expected.entrySet()) {
         Ref ref = actual.get(entry.getKey());

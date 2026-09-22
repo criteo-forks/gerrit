@@ -23,9 +23,12 @@ import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.git.RepositoryExistsException;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import dev.walgerrit.Catalog.Binding;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.NavigableSet;
+import java.util.Optional;
 import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.internal.storage.dfs.DfsBlockCache;
 import org.eclipse.jgit.internal.storage.dfs.DfsBlockCacheConfig;
@@ -33,13 +36,16 @@ import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Repository;
 
 /**
- * Gerrit's repository-manager entry point for WalGit-backed storage. As the daemon's lifecycle
+ * Gerrit's repository-manager entry point for WalGit-backed storage. Names are resolved through
+ * the {@link Catalog}; everything under a repository is keyed by its id. As the daemon's lifecycle
  * listener it also runs this node's compactor; batch programs never compact.
  */
 @Singleton
 public final class WalGitRepositoryManager implements GitRepositoryManager, LifecycleListener {
   private final WalGitConfiguration configuration;
   private final StorageLayout storage;
+  private final Catalog catalog;
+  private final Namespace namespace;
   private final Compactor compactor;
   private final GerritRuntime runtime;
 
@@ -63,8 +69,16 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     this.configuration = configuration;
     this.storage = storage == null ? storageFor(configuration) : storage;
     this.runtime = runtime;
+    this.catalog = new Catalog(this.storage, configuration.manifestRevalidateInterval());
+    this.namespace =
+        new Namespace(
+            catalog,
+            this.storage,
+            this::initialize,
+            configuration.systemProjects(),
+            Clock.systemUTC());
     this.compactor = new Compactor(this);
-    this.storage.onPublication((name, published) -> compactor.consider(name, published.manifest()));
+    this.storage.onPublication((id, published) -> compactor.consider(id, published.manifest()));
   }
 
   @Override
@@ -97,43 +111,51 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   @Override
   public Status getRepositoryStatus(Project.NameKey name) {
     try {
-      return storage.manifestStore(name).exists() ? Status.ACTIVE : Status.NON_EXISTENT;
+      Optional<Binding> binding = catalog.resolve(name, false);
+      return binding.filter(Binding::active).isPresent() ? Status.ACTIVE : Status.NON_EXISTENT;
     } catch (IOException exception) {
       return Status.UNAVAILABLE;
     }
   }
 
-  /** Opening a handle is the request-level freshness boundary: exactly one conditional read. */
+  /**
+   * Opening a handle is the request-level freshness boundary: one conditional read of the catalog,
+   * which every repository shares, and one of the repository's manifest.
+   */
   @Override
   public Repository openRepository(Project.NameKey name)
       throws RepositoryNotFoundException, IOException {
-    ManifestStore manifestStore = storage.manifestStore(name);
+    boolean revalidate = configuration.manifestRevalidateOnOpen();
+    Binding binding =
+        catalog
+            .resolve(name, revalidate)
+            .orElseThrow(() -> new RepositoryNotFoundException(name.get()));
+    if (!binding.active()) {
+      throw new RepositoryNotFoundException(name.get() + " " + Namespace.describe(binding));
+    }
+    ManifestStore manifestStore = storage.manifestStore(binding.id());
     boolean exists =
-        configuration.manifestRevalidateOnOpen()
+        revalidate
             ? manifestStore.exists()
             : manifestStore.existsUnlessRecentlyValidated(
                 configuration.manifestRevalidateInterval());
     if (!exists) {
-      throw new RepositoryNotFoundException(name.get());
+      throw new IOException(
+          "Catalog binds " + name.get() + " to " + binding.id() + " but it has no manifest");
     }
-    return openInitialized(name, manifestStore);
+    return openInitialized(name, binding.id(), binding.epoch());
   }
 
   @Override
   public Repository createRepository(Project.NameKey name)
       throws RepositoryNotFoundException, RepositoryExistsException, IOException {
-    ManifestStore manifestStore = storage.manifestStore(name);
-    if (!manifestStore.create()) {
-      throw new RepositoryExistsException(name);
-    }
-
-    return openInitialized(name, manifestStore);
+    return openInitialized(name, namespace.create(name), 0);
   }
 
   @Override
   public NavigableSet<Project.NameKey> list() {
     try {
-      return storage.listProjects();
+      return catalog.activeNames();
     } catch (IOException exception) {
       throw new IllegalStateException("Cannot list WalGerrit repositories", exception);
     }
@@ -147,8 +169,13 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
 
   @Override
   public void repositoryDeleted(Project.NameKey name) {
-    // Durable deletion requires a tombstone transaction and is intentionally not inferred from this
-    // hook.
+    // Deletion is a namespace operation with its own protocol; see Namespace#delete. This hook
+    // arrives after a plugin already acted on its own and proves nothing.
+  }
+
+  /** Renames, deletes and resumes; the front end for plugins and the batch program. */
+  public Namespace namespace() {
+    return namespace;
   }
 
   WalGitConfiguration configuration() {
@@ -168,17 +195,77 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     return storage;
   }
 
-  private LocalWalGitRepository openInitialized(Project.NameKey name, ManifestStore manifestStore)
+  Catalog catalog() {
+    return catalog;
+  }
+
+  /** The store of the repository {@code name} is active under, for node bookkeeping. */
+  Optional<ManifestStore> manifestStoreFor(Project.NameKey name) throws IOException {
+    return catalog.resolve(name, false).filter(Binding::active).map(b -> storage.manifestStore(b.id()));
+  }
+
+  /** The id {@code name} is bound to, active or in flight; for tests and tools. */
+  RepositoryId idOf(Project.NameKey name) throws IOException {
+    return catalog
+        .resolve(name, true)
+        .filter(binding -> !binding.retired())
+        .map(Binding::id)
+        .orElseThrow(() -> new RepositoryNotFoundException(name.get()));
+  }
+
+  /** The store of the repository {@code name} is bound to; for tests and tools. */
+  ManifestStore manifestStore(Project.NameKey name) throws IOException {
+    return storage.manifestStore(idOf(name));
+  }
+
+  /**
+   * A handle on a repository by id, for maintenance that works below names: compaction, the index
+   * tailer, the applier removing a deleted project's documents. {@code writeEpoch} is what the
+   * handle's publications carry; maintenance passes the manifest's current epoch, so a fence in
+   * between fails it like any other writer.
+   */
+  LocalWalGitRepository openById(RepositoryId id, Project.NameKey name, long writeEpoch)
       throws IOException {
+    return new LocalWalGitRepository(
+        name, storage.manifestStore(id), configuration.manifestRevalidateInterval(), writeEpoch);
+  }
+
+  /** Whether a binding answers reads: active, or the source of an operation in flight. */
+  /** The name the catalog binds {@code id} to, for handles and logs; the id itself when none. */
+  Project.NameKey nameOf(RepositoryId id) throws IOException {
+    return catalog.bindingOf(id, false).map(Binding::name).orElse(Project.nameKey(id.value()));
+  }
+
+  private void initialize(RepositoryId id, Project.NameKey name) throws IOException {
+    ManifestStore manifestStore = storage.manifestStore(id);
+    if (!manifestStore.exists()) {
+      manifestStore.create();
+    }
+    openInitialized(name, id, 0).close();
+  }
+
+  private LocalWalGitRepository openInitialized(
+      Project.NameKey name, RepositoryId id, long writeEpoch) throws IOException {
+    ManifestStore manifestStore = storage.manifestStore(id);
     LocalWalGitRepository repository =
-        new LocalWalGitRepository(name, manifestStore, configuration.manifestRevalidateInterval());
+        new LocalWalGitRepository(
+            name, manifestStore, configuration.manifestRevalidateInterval(), writeEpoch);
     if (!repository.exists()) {
       if (manifestStore.current().getRevision() != 0) {
         repository.close();
         throw new IOException("Repository has a manifest but no ref state: " + name.get());
       }
-      // Recover a process death between manifest creation and the initial HEAD transaction.
-      repository.create(true);
+      // Recover a process death between manifest creation and the initial HEAD transaction. Of a
+      // creator and a resume doing this at once, the CAS refuses one.
+      try {
+        repository.create(true);
+      } catch (IOException lostRace) {
+        repository.scanForRepoChanges();
+        if (!repository.exists()) {
+          repository.close();
+          throw lostRace;
+        }
+      }
     }
     return repository;
   }

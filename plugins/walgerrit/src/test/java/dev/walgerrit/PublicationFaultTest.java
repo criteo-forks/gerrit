@@ -109,7 +109,7 @@ class PublicationFaultTest {
       RefUpdate.Result later = update(node, "unrelated", ObjectId.zeroId(), commit);
       String detail = "";
       if (later != RefUpdate.Result.NEW) {
-        ManifestStore store = node.storage().manifestStore(PROJECT);
+        ManifestStore store = node.manifestStore(PROJECT);
         try { store.publisher().publish(GroupPublisher.Request.flush(store)); }
         catch (IOException stuck) { detail = "; retry failed with: " + stuck; }
       }
@@ -145,7 +145,7 @@ class PublicationFaultTest {
       Future<RefUpdate.Result> lead = pool.submit(() -> update(node, "lead", ObjectId.zeroId(), old));
       await(inCas);
       Future<RefUpdate.Result> queued = pool.submit(() -> update(node, "target", old, ours));
-      awaitQueued(node.storage().manifestStore(PROJECT).publisher());
+      awaitQueued(node.manifestStore(PROJECT).publisher());
       release.countDown();
       assertEquals(RefUpdate.Result.NEW, lead.get(10, TimeUnit.SECONDS));
       RefUpdate.Result result = queued.get(10, TimeUnit.SECONDS);

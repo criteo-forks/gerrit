@@ -82,7 +82,7 @@ share a host name also ignore one another's hints, as they do for
 
 Hints never supply Git data or authorize a publication. Restrict access to the gossip port to
 cluster peers, especially when running unsigned. The receiver has no rate limit, and the tailer
-queue has no limit on the number of distinct repository names.
+queue has no limit on the number of distinct repository ids.
 
 ## Configuration
 

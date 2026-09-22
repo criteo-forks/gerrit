@@ -60,7 +60,7 @@ import org.junit.jupiter.api.io.TempDir;
  * does not account for.
  */
 class CompactorTest {
-  private static final String WAL = "repos/platform/compact.git/wal/";
+
   private static final Project.NameKey PROJECT = Project.nameKey("platform/compact");
   /** Above 113 refs JGit stops folding a new table into the top of the stack at commit time. */
   private static final int STANDALONE_TABLE_REFS = 120;
@@ -79,8 +79,8 @@ class CompactorTest {
     }
     Manifest before = manifest(nodeA);
     assertTrue(objectPacks(before).size() >= 4, "one pack per write before compaction");
-    Set<String> filesBefore = new HashSet<>(store.list(WAL));
-    Path cache = root.resolve("node-a-cache/repos/platform/compact.git/wal");
+    Set<String> filesBefore = new HashSet<>(store.list(TestStores.wal(store)));
+    Path cache = TestStores.cacheWal(root.resolve("node-a-cache"), store);
     ageCachedFiles(cache, Duration.ofHours(1));
 
     assertEquals(Outcome.COMPACTED, nodeA.compactor().compact(PROJECT));
@@ -105,7 +105,7 @@ class CompactorTest {
     assertEquals(
         objectPackNames(before), new HashSet<>(compaction.getSupersedesList()),
         "the log names every superseded pack");
-    assertTrue(store.list(WAL).containsAll(filesBefore), "superseded files stay in the store");
+    assertTrue(store.list(TestStores.wal(store)).containsAll(filesBefore), "superseded files stay in the store");
     Set<String> live = ManifestStore.liveFileNames(after);
     try (Stream<Path> cached = Files.list(cache)) {
       assertTrue(
@@ -124,13 +124,13 @@ class CompactorTest {
       }
     }
     Set<String> cachedBefore =
-        cachedFiles(root.resolve("node-a-cache/repos/platform/compact.git/wal"));
+        cachedFiles(TestStores.cacheWal(root.resolve("node-a-cache"), store));
 
     assertEquals(Outcome.COMPACTED, node.compactor().compact(PROJECT));
 
     // Superseded, but written seconds ago: an upload awaiting its CAS would look the same.
     assertTrue(
-        cachedFiles(root.resolve("node-a-cache/repos/platform/compact.git/wal"))
+        cachedFiles(TestStores.cacheWal(root.resolve("node-a-cache"), store))
             .containsAll(cachedBefore));
   }
 
@@ -150,7 +150,9 @@ class CompactorTest {
         refs.put(head("b" + i), publish(repository, head("b" + i), "commit " + i));
       }
     }
-    Path wal = root.resolve("local-store/repos/platform/compact.git/wal");
+    Path wal =
+        TestStores.cacheWal(
+            root.resolve("local-store"), new FileObjectStore(root.resolve("local-store")));
     ageCachedFiles(wal, Duration.ofHours(1));
     Set<String> before = cachedFiles(wal);
 
@@ -278,7 +280,7 @@ class CompactorTest {
     }
 
     try (StoreLease.Held byB =
-        nodeB.storage().compactionLease(PROJECT).acquire(Duration.ofMinutes(5)).orElseThrow()) {
+        nodeB.storage().compactionLease(nodeB.idOf(PROJECT)).acquire(Duration.ofMinutes(5)).orElseThrow()) {
       assertEquals(Outcome.LEASED_ELSEWHERE, nodeA.compactor().compact(PROJECT));
       assertTrue(objectPacks(manifest(nodeA)).size() >= 4, "nothing was rewritten");
     }
@@ -340,7 +342,7 @@ class CompactorTest {
     assertEquals(1, lostOutputOfA.size());
     Set<String> live = ManifestStore.liveFileNames(after);
     String lostPack = lostOutputOfA.iterator().next() + ".pack";
-    assertTrue(shared.list(WAL).contains(WAL + lostPack), "the lost output stays for now");
+    assertTrue(shared.list(TestStores.wal(shared)).contains(TestStores.wal(shared) + lostPack), "the lost output stays for now");
     assertFalse(live.contains(lostPack), "but nothing references it");
     SteppingClock later = new SteppingClock(Instant.now().plus(Duration.ofDays(2)));
     Reclaimer reclaimer = new Reclaimer(nodeA, later, Duration.ofDays(1), 0);
@@ -348,7 +350,7 @@ class CompactorTest {
     later.advance(Duration.ofDays(2));
     reclaimer.reclaim(PROJECT);
     assertFalse(
-        shared.list(WAL).contains(WAL + lostPack), "reclamation removes it after the grace period");
+        shared.list(TestStores.wal(shared)).contains(TestStores.wal(shared) + lostPack), "reclamation removes it after the grace period");
     assertEquals(refs, allRefs(nodeA));
     try (Repository repository = nodeA.openRepository(PROJECT)) {
       for (ObjectId id : refs.values()) {
@@ -492,20 +494,21 @@ class CompactorTest {
         refs.put(head("b" + i), publish(repository, head("b" + i), "commit " + i));
       }
     }
-    Set<String> before = new HashSet<>(store.list(WAL));
+    Set<String> before = new HashSet<>(store.list(TestStores.wal(store)));
     assertEquals(Outcome.COMPACTED, node.compactor().compact(PROJECT));
     Path orphan = root.resolve("orphan.pack");
     Files.writeString(orphan, "uploaded but never published");
-    store.uploadIfAbsent(WAL + "pack-orphan.pack", orphan);
+    store.uploadIfAbsent(TestStores.wal(store) + "pack-orphan.pack", orphan);
     Manifest manifest = manifest(node);
     Set<String> live = ManifestStore.liveFileNames(manifest);
-    Set<String> logsBefore = new HashSet<>(store.list("repos/platform/compact.git/log/"));
+    String logs = "repos/" + TestStores.onlyRepository(store) + "/log/";
+    Set<String> logsBefore = new HashSet<>(store.list(logs));
 
     SteppingClock clock = new SteppingClock(Instant.now());
     Reclaimer reclaimer = new Reclaimer(node, clock, Duration.ofHours(1), 0);
     Reclaimer.Report young = reclaimer.reclaim(PROJECT);
     assertEquals(0, young.deleted(), "nothing is younger than the grace period yet");
-    assertTrue(store.list(WAL).containsAll(before));
+    assertTrue(store.list(TestStores.wal(store)).containsAll(before));
 
     clock.advance(Duration.ofHours(2));
     assertEquals(
@@ -513,15 +516,15 @@ class CompactorTest {
     clock.advance(Duration.ofHours(2));
     Reclaimer.Report old = reclaimer.reclaim(PROJECT);
     Set<String> remaining = new HashSet<>();
-    for (String key : store.list(WAL)) {
-      remaining.add(key.substring(WAL.length()));
+    for (String key : store.list(TestStores.wal(store))) {
+      remaining.add(key.substring(TestStores.wal(store).length()));
     }
     assertEquals(live, remaining, "exactly the live files remain");
-    long superseded = before.stream().filter(key -> !live.contains(key.substring(WAL.length()))).count();
+    long superseded = before.stream().filter(key -> !live.contains(key.substring(TestStores.wal(store).length()))).count();
     assertEquals(superseded + 1, old.deleted(), "the superseded files and the orphan were deleted");
     assertEquals(
         logsBefore,
-        new HashSet<>(store.list("repos/platform/compact.git/log/")),
+        new HashSet<>(store.list(logs)),
         "log objects are never touched");
     assertEquals(manifest, manifest(node), "reclamation changes no manifest");
     assertEquals(refs, allRefs(node("node-b", store, ignored -> {})));
@@ -537,7 +540,7 @@ class CompactorTest {
         refs.put(head("b" + i), publish(repository, head("b" + i), "commit " + i));
       }
     }
-    Path cache = root.resolve("node-a-cache/repos/platform/compact.git/wal");
+    Path cache = TestStores.cacheWal(root.resolve("node-a-cache"), store);
     long cachedBefore = totalSize(cache);
     assertTrue(cachedBefore > 0);
     ageCachedFiles(cache, Duration.ofHours(1));
@@ -607,7 +610,7 @@ class CompactorTest {
   }
 
   private static Manifest manifest(WalGitRepositoryManager node) throws IOException {
-    return node.storage().manifestStore(PROJECT).refresh();
+    return node.manifestStore(PROJECT).refresh();
   }
 
   private static Map<String, ObjectId> allRefs(WalGitRepositoryManager node) throws IOException {
@@ -636,7 +639,9 @@ class CompactorTest {
 
   private static LogEntry lastEntry(FileObjectStore store, Manifest manifest) throws IOException {
     String key =
-        "repos/platform/compact.git/"
+        "repos/"
+            + TestStores.onlyRepository(store)
+            + "/"
             + ManifestStore.logKey(manifest.getHeadSeq(), manifest.getHeadTransactionId());
     return LogEntry.parseFrom(store.get(key).orElseThrow().bytes());
   }

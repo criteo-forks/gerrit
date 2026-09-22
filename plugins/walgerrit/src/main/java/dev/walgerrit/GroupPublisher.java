@@ -64,6 +64,8 @@ final class GroupPublisher {
     final RefTransaction refTransaction;
     final long observedRefRevision;
     final long epoch;
+    /** The repository write epoch the handle was admitted under; fixed for the request's life. */
+    final long writeEpoch;
     private boolean taken;
     private boolean done;
     private Manifest landed;
@@ -76,18 +78,23 @@ final class GroupPublisher {
         Collection<String> supersedes,
         RefTransaction refTransaction,
         long observedRefRevision,
-        long epoch) {
+        long epoch,
+        long writeEpoch) {
       this.store = store;
       this.additions = List.copyOf(additions);
       this.supersedes = List.copyOf(supersedes);
       this.refTransaction = refTransaction;
       this.observedRefRevision = observedRefRevision;
       this.epoch = epoch;
+      this.writeEpoch = writeEpoch;
     }
 
-    /** A publication with nothing of its own; it exists to flush pending packs. */
+    /**
+     * A publication with nothing of its own; it exists to flush pending packs, which are objects
+     * no ref names yet, so no fence applies to it.
+     */
     static Request flush(ManifestStore store) {
-      return new Request(store, List.of(), List.of(), null, -1, -1);
+      return new Request(store, List.of(), List.of(), null, -1, -1, ManifestStore.UNFENCED);
     }
 
     boolean isRefTransaction() {
@@ -430,7 +437,7 @@ final class GroupPublisher {
       if (supersedesPending) {
         // A compaction of packs no manifest lists yet (JGit's compactor run over a handle's own
         // flushes): list them first, so an entry only ever supersedes what was live.
-        publishCarrying(store, 0, drained, List.of(), false, null, drained);
+        publishCarrying(store, 0, drained, List.of(), false, null, ManifestStore.UNFENCED, drained);
         settle(drained, true);
         drained = List.of();
         additions.clear();
@@ -441,14 +448,22 @@ final class GroupPublisher {
         live.add(pack.getName());
       }
       Set<String> superseded = new HashSet<>();
+      // Members were admitted under a write epoch each; only those admitted under the epoch the
+      // manifest has now may publish, and the group publishes under that epoch, so a member that a
+      // fence overtook is refused here and once more by the CAS, never carried by a newer member.
+      long writeEpoch = ManifestStore.UNFENCED;
       for (Request member : group) {
-        IOException rejection = rejection(member, groupEpoch, expectedRefRevision, live, superseded);
+        IOException rejection =
+            rejection(member, groupEpoch, expectedRefRevision, live, superseded, before);
         if (rejection != null) {
           complete(List.of(member), null, false, expectedRefRevision, rejection);
           continue;
         }
         superseded.addAll(member.supersedes);
         accepted.add(member);
+        if (member.writeEpoch != ManifestStore.UNFENCED) {
+          writeEpoch = member.writeEpoch;
+        }
         additions.addAll(member.additions);
         supersedes.addAll(member.supersedes);
         if (member.isRefTransaction()) {
@@ -477,6 +492,7 @@ final class GroupPublisher {
               supersedes,
               refUpdate,
               refUpdate ? transaction.build() : null,
+              writeEpoch,
               drained);
       settle(drained, true);
       complete(accepted, updated, accepted.size() > 1 || !drained.isEmpty(), produced, null);
@@ -507,6 +523,7 @@ final class GroupPublisher {
       Collection<String> supersedes,
       boolean refUpdate,
       RefTransaction transaction,
+      long expectedWriteEpoch,
       List<PackRef> carried)
       throws IOException {
     try {
@@ -516,6 +533,7 @@ final class GroupPublisher {
           supersedes,
           refUpdate,
           transaction,
+          expectedWriteEpoch,
           (sequence, transactionId) -> {
             Attempt attempt = new Attempt(sequence, transactionId);
             state.lock();
@@ -613,7 +631,12 @@ final class GroupPublisher {
       long groupEpoch,
       long expectedRefRevision,
       Set<String> live,
-      Set<String> alreadySuperseded) {
+      Set<String> alreadySuperseded,
+      Manifest before) {
+    if (member.writeEpoch != ManifestStore.UNFENCED
+        && (before.getDeleted() || member.writeEpoch != before.getWriteEpoch())) {
+      return new RepositoryFencedException(before.getRepo(), member.writeEpoch, before);
+    }
     if (member.isRefTransaction() && member.epoch != groupEpoch) {
       return new ManifestConflictException(member.observedRefRevision, expectedRefRevision);
     }

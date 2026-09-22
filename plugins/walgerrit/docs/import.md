@@ -17,9 +17,10 @@ Use the matching fork WAR and library. The destination site's `gerrit.config` mu
 Use a consistent backup or a quiescent source tree. Copying a live repository is not a snapshot
 and may combine refs and objects from different moments.
 
-Import into a fresh store or prefix with no daemon serving it. The importer creates an empty
-manifest before uploading, so a repository name can be discoverable before its data is ready.
-Once the data is published, any daemon using that prefix can see it. A prefix is isolated only
+Import into a fresh store or prefix with no daemon serving it. The importer reserves the name in
+the [catalog](namespace.md) and creates an empty manifest before uploading; the name is served
+only once the data is published, and then any daemon using that prefix can see it. A rerun
+finishes an import that died before that point under the same reservation. A prefix is isolated only
 while no serving node points at it.
 
 The importer reads the source without changing it. It writes shared store data, local staging

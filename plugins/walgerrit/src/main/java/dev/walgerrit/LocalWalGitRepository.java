@@ -30,17 +30,23 @@ final class LocalWalGitRepository extends DfsRepository {
   private final DfsRefDatabase refDatabase;
   private volatile String gitwebDescription;
 
-  LocalWalGitRepository(Project.NameKey name, ManifestStore manifestStore) throws IOException {
-    this(name, manifestStore, WalGitConfiguration.DEFAULT_MANIFEST_REVALIDATE_INTERVAL);
-  }
-
+  /**
+   * @param name the name the handle was opened under, for JGit's description and logs
+   * @param writeEpoch the repository write epoch the handle is admitted under, or {@link
+   *     ManifestStore#UNFENCED} for a handle no namespace operation can overtake, such as the
+   *     catalog's own
+   */
   LocalWalGitRepository(
-      Project.NameKey name, ManifestStore manifestStore, Duration revalidateInterval)
+      Project.NameKey name,
+      ManifestStore manifestStore,
+      Duration revalidateInterval,
+      long writeEpoch)
       throws IOException {
     super(
         new Builder()
             .setRepositoryDescription(new DfsRepositoryDescription(name.get())));
-    objectDatabase = new LocalWalGitObjectDatabase(this, manifestStore, revalidateInterval);
+    objectDatabase =
+        new LocalWalGitObjectDatabase(this, manifestStore, revalidateInterval, writeEpoch);
     refDatabase = new LocalWalGitRefDatabase(this, objectDatabase);
   }
 

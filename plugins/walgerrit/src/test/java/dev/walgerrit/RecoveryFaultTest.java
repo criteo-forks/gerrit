@@ -46,7 +46,7 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class RecoveryFaultTest {
   private static final Project.NameKey PROJECT = Project.nameKey("review/recovery");
-  private static final String WAL = "repos/review/recovery.git/wal/";
+
   @TempDir Path root;
 
   @Test
@@ -72,7 +72,7 @@ class RecoveryFaultTest {
     WalGitRepositoryManager b = node("b", shared);
     try (Repository repo = a.openRepository(PROJECT)) {
       ObjectId first = WalGitRepositoryManagerTest.insertCommit(repo, "first");
-      var pending = a.storage().manifestStore(PROJECT).publisher().pending();
+      var pending = a.manifestStore(PROJECT).publisher().pending();
       assertEquals(1, pending.size());
       RefUpdate update = repo.updateRef("refs/heads/first");
       update.setNewObjectId(first);
@@ -87,7 +87,7 @@ class RecoveryFaultTest {
         compactor.compact(NullProgressMonitor.INSTANCE);
       }
       String retired = pending.get(0).getName();
-      assertFalse(b.storage().manifestStore(PROJECT).refresh().getPacksList().stream()
+      assertFalse(b.manifestStore(PROJECT).refresh().getPacksList().stream()
           .anyMatch(pack -> pack.getName().equals(retired)));
       SteppingClock afterGrace = new SteppingClock(Instant.now().plus(Duration.ofDays(2)));
       Reclaimer reclaimer = new Reclaimer(b, afterGrace, Duration.ofDays(1), 0);
@@ -95,7 +95,7 @@ class RecoveryFaultTest {
       afterGrace.advance(Duration.ofDays(2));
       reclaimer.reclaim(PROJECT);
       assertTrue(
-          shared.get(WAL + retired + ".idx").isEmpty(), "retired files are legitimately reclaimed");
+          shared.get(TestStores.wal(shared) + retired + ".idx").isEmpty(), "retired files are legitimately reclaimed");
 
       assertEquals(RefUpdate.Result.NEW, update(a, "unrelated", first));
       org.eclipse.jgit.internal.storage.dfs.DfsBlockCache.reconfigure(
@@ -123,10 +123,10 @@ class RecoveryFaultTest {
     try (Repository writer = a.openRepository(PROJECT)) {
       ObjectId pending =
           WalGitRepositoryManagerTest.insertCommit(writer, "waiting for publication");
-      var packs = a.storage().manifestStore(PROJECT).publisher().pending();
+      var packs = a.manifestStore(PROJECT).publisher().pending();
       for (var pack : packs) {
         for (var file : pack.getFilesList()) {
-          java.nio.file.Files.setLastModifiedTime(root.resolve("store").resolve(WAL)
+          java.nio.file.Files.setLastModifiedTime(root.resolve("store").resolve(TestStores.wal(shared))
               .resolve(pack.getName() + "." + file.getExtension()),
               java.nio.file.attribute.FileTime.from(Instant.now().minus(Duration.ofDays(2))));
         }
@@ -141,7 +141,7 @@ class RecoveryFaultTest {
           catch (Exception e) { throw new RuntimeException(e); }
         });
         for (String file : ManifestStore.fileNames(packs)) {
-          assertTrue(shared.get(WAL + file).isPresent(), "committed file was reclaimed: " + file);
+          assertTrue(shared.get(TestStores.wal(shared) + file).isPresent(), "committed file was reclaimed: " + file);
         }
         assertEquals(RefUpdate.Result.NEW, update(a, "pending", pending));
       } finally { release.countDown(); }

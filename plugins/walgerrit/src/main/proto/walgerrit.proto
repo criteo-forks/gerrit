@@ -9,6 +9,8 @@ option java_outer_classname = "StorageProto";
 // which a transaction becomes visible.
 message Manifest {
   uint32 format_version = 1;
+  // The repository id: the key everything of this repository is stored under.
+  // Names live in the catalog repository, never here.
   string repo = 2;
   string object_format = 3;
   uint64 head_seq = 4;
@@ -24,6 +26,16 @@ message Manifest {
   // it, so a follower walks back from here with deterministic keys,
   // log/<seq>-<transaction_id>.pb, and the manifest needs no table of entries.
   string head_transaction_id = 12;
+  // Advances only when the repository is fenced for a namespace operation. A
+  // publication carries the epoch its writer was admitted under and is refused
+  // when this differs, so a rename or deletion stops every writer admitted
+  // before it, on every node, at the commit point.
+  uint64 write_epoch = 13;
+  // The namespace operation whose fence last advanced write_epoch; lets a
+  // repeated fence recognise its own work.
+  string fence_operation = 14;
+  // Terminal: set by the fence of a deletion. Nothing is published afterwards.
+  bool deleted = 15;
 }
 
 message PackRef {
@@ -61,6 +73,8 @@ message LogEntry {
     // Documents the writing node reindexed without a ref update behind them,
     // for every other node to reindex in its own index.
     INDEX = 5;
+    // A namespace operation's fence: no files, no refs; advances write_epoch.
+    FENCE = 6;
   }
 
   uint64 seq = 1;
@@ -89,6 +103,8 @@ message LogEntry {
   // Present for INDEX, and for an EVENT entry whose batch also reindexed
   // documents. Replayed by every node whose writer host differs.
   IndexUpdate index_update = 12;
+  // Present for FENCE: the namespace operation that fenced the repository.
+  string fence_operation = 13;
 }
 
 // Documents one node reindexed with no ref update behind them: an explicit
@@ -129,7 +145,7 @@ message IndexCursor {
   string manifest_version = 3;
 }
 
-// Stored at leases/<repo>.git/compaction. Holding it only avoids duplicate
+// Stored at leases/<repo-id>/compaction. Holding it only avoids duplicate
 // work: the manifest CAS, with its check that every superseded pack is still
 // live, is what keeps two compactors from corrupting anything. A lease whose
 // expiry has passed, including a released one (expiry 0), may be taken over.
@@ -152,6 +168,7 @@ message PartialFile {
 // to trigger conditional reads and index replay for one repository. Periodic
 // reads and sweeps discover writes whose notifications were lost.
 message GossipHint {
+  // The repository id.
   string repo = 1;
   // The store's version token for the manifest the sender wrote; on S3, its
   // ETag. Compared for equality only, like a listed version.

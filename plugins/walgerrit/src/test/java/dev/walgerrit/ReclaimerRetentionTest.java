@@ -40,7 +40,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 class ReclaimerRetentionTest {
   private static final Project.NameKey PROJECT = Project.nameKey("retention");
-  private static final String WAL = "repos/retention.git/wal/";
+
   @TempDir Path root;
 
   @Test
@@ -54,7 +54,7 @@ class ReclaimerRetentionTest {
       update.setNewObjectId(first);
       assertEquals(RefUpdate.Result.NEW, update.update());
     }
-    Set<String> before = new HashSet<>(shared.list(WAL));
+    Set<String> before = new HashSet<>(shared.list(TestStores.wal(shared)));
     for (String file : before) {
       Files.setLastModifiedTime(
           root.resolve("store").resolve(file),
@@ -71,8 +71,8 @@ class ReclaimerRetentionTest {
       }
       Set<String> retired = new HashSet<>(before);
       for (String live :
-          ManifestStore.liveFileNames(a.storage().manifestStore(PROJECT).refresh())) {
-        retired.remove(WAL + live);
+          ManifestStore.liveFileNames(a.manifestStore(PROJECT).refresh())) {
+        retired.remove(TestStores.wal(shared) + live);
       }
       assertFalse(retired.isEmpty());
       SteppingClock clock = new SteppingClock(Instant.now());
@@ -81,7 +81,7 @@ class ReclaimerRetentionTest {
           0,
           reclaimer.reclaim(PROJECT).deleted(),
           "upload age is not time since retirement; old readers still need these files");
-      assertTrue(shared.list(WAL).containsAll(retired));
+      assertTrue(shared.list(TestStores.wal(shared)).containsAll(retired));
       try (var files = Files.walk(root.resolve("b-cache"))) {
         for (Path path : files.filter(Files::isRegularFile).toList()) Files.delete(path);
       }
@@ -89,7 +89,7 @@ class ReclaimerRetentionTest {
       assertNotNull(oldReader.open(first), "old manifest remains readable during retirement grace");
       clock.advance(Duration.ofDays(2));
       assertTrue(reclaimer.reclaim(PROJECT).deleted() >= retired.size());
-      assertTrue(java.util.Collections.disjoint(shared.list(WAL), retired));
+      assertTrue(java.util.Collections.disjoint(shared.list(TestStores.wal(shared)), retired));
     }
   }
 
@@ -98,7 +98,7 @@ class ReclaimerRetentionTest {
     FileObjectStore shared = new FileObjectStore(root.resolve("store"));
     WalGitRepositoryManager a = node("a", shared);
     a.createRepository(PROJECT).close();
-    shared.putIfAbsent(WAL + "pack-orphan.idx", new byte[] {1});
+    shared.putIfAbsent(TestStores.wal(shared) + "pack-orphan.idx", new byte[] {1});
     SteppingClock clock = new SteppingClock(Instant.now().plus(Duration.ofDays(2)));
     Reclaimer first = new Reclaimer(a, clock, Duration.ofDays(1), 0);
     assertEquals(0, first.reclaim(PROJECT).deleted());
@@ -107,7 +107,7 @@ class ReclaimerRetentionTest {
     assertEquals(0, restarted.reclaim(PROJECT).deleted(), "no timer is inferred from file age");
     clock.advance(Duration.ofDays(2));
     assertEquals(1, restarted.reclaim(PROJECT).deleted());
-    assertTrue(shared.get(WAL + "pack-orphan.idx").isEmpty());
+    assertTrue(shared.get(TestStores.wal(shared) + "pack-orphan.idx").isEmpty());
   }
 
   @Test
@@ -115,7 +115,7 @@ class ReclaimerRetentionTest {
     FileObjectStore shared = new FileObjectStore(root.resolve("store"));
     WalGitRepositoryManager a = node("a", shared);
     a.createRepository(PROJECT).close();
-    shared.putIfAbsent(WAL + "pack-orphan.idx", new byte[] {1});
+    shared.putIfAbsent(TestStores.wal(shared) + "pack-orphan.idx", new byte[] {1});
     SteppingClock clock = new SteppingClock(Instant.now());
     Reclaimer reclaimer = new Reclaimer(a, clock, Duration.ofDays(1), 0);
     assertEquals(0, reclaimer.reclaim(PROJECT).deleted());

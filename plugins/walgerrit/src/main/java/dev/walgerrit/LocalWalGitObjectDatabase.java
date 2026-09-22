@@ -63,6 +63,9 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   private final ManifestStore manifestStore;
   private final GroupPublisher publisher;
 
+  /** The write epoch this handle was admitted under; every publication it makes carries it. */
+  private final long writeEpoch;
+
   /** Packs this handle committed ahead of a ref transaction and has not seen published. */
   private final Set<String> deferredPacks = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
@@ -76,11 +79,15 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   private volatile long lastRevalidationNanos;
 
   LocalWalGitObjectDatabase(
-      DfsRepository repository, ManifestStore manifestStore, Duration revalidateInterval)
+      DfsRepository repository,
+      ManifestStore manifestStore,
+      Duration revalidateInterval,
+      long writeEpoch)
       throws IOException {
     super(repository, new DfsReaderOptions());
     this.manifestStore = manifestStore;
     this.publisher = manifestStore.publisher();
+    this.writeEpoch = writeEpoch;
     this.revalidateIntervalNanos = revalidateInterval.toNanos();
     // JGit 7.7 can synthesize multi-pack-index descriptions. WalGerrit's manifest currently
     // records independent immutable pack families, not MIDX coverage, so keep this representation
@@ -180,7 +187,8 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
             supersedes,
             logicalRefUpdate ? state.transaction : null,
             state == null ? -1 : state.observedRefRevision,
-            state == null ? -1 : state.epoch);
+            state == null ? -1 : state.epoch,
+            writeEpoch);
     GroupPublisher.Result result;
     try {
       result = publisher.publish(request);

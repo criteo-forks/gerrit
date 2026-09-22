@@ -22,6 +22,7 @@ import com.google.gerrit.entities.Project;
 import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.index.project.ProjectIndexer;
 import com.google.gerrit.server.config.AllUsersName;
+import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.index.account.AccountIndexer;
 import com.google.gerrit.server.index.change.ChangeIndexer;
 import com.google.gerrit.server.index.group.GroupIndexer;
@@ -32,23 +33,35 @@ import com.google.gerrit.server.query.change.ChangeData;
 import com.google.gerrit.server.query.change.InternalChangeQuery;
 import com.google.gerrit.server.util.ManualRequestContext;
 import com.google.gerrit.server.util.OneOffRequestContext;
+import com.google.common.cache.Cache;
 import com.google.inject.Inject;
+import com.google.inject.name.Named;
 import com.google.inject.Provider;
 import com.google.inject.Singleton;
 import dev.walgerrit.proto.StorageProto.IndexUpdate;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
 import dev.walgerrit.proto.StorageProto.RefUpdate;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.Repository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Applies one committed WAL ref transaction to Gerrit's node-local derived state. */
 @Singleton
 final class GerritIndexEventApplier implements IndexEventApplier {
+  private static final Logger logger = LoggerFactory.getLogger(GerritIndexEventApplier.class);
   private static final String ZERO_OBJECT_ID = "0000000000000000000000000000000000000000";
 
+  private final WalGitRepositoryManager repositories;
   private final Project.NameKey allUsers;
   private final ChangeIndexer changeIndexer;
   private final AccountIndexer accountIndexer;
@@ -59,9 +72,11 @@ final class GerritIndexEventApplier implements IndexEventApplier {
   private final Provider<InternalChangeQuery> changeQuery;
   private final OneOffRequestContext requestContext;
   private final ReplicatedCacheEvictions evictions;
+  private final Cache<Change.Id, String> changeIdProjectCache;
 
   @Inject
   GerritIndexEventApplier(
+      GitRepositoryManager repositories,
       AllUsersName allUsers,
       ChangeIndexer changeIndexer,
       AccountIndexer accountIndexer,
@@ -71,7 +86,9 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       ChangeNotes.Factory changeNotesFactory,
       Provider<InternalChangeQuery> changeQuery,
       OneOffRequestContext requestContext,
-      ReplicatedCacheEvictions evictions) {
+      ReplicatedCacheEvictions evictions,
+      @Named("changeid_project") Cache<Change.Id, String> changeIdProjectCache) {
+    this.repositories = (WalGitRepositoryManager) repositories;
     this.allUsers = allUsers;
     this.changeIndexer = changeIndexer;
     this.accountIndexer = accountIndexer;
@@ -82,6 +99,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
     this.changeQuery = changeQuery;
     this.requestContext = requestContext;
     this.evictions = evictions;
+    this.changeIdProjectCache = changeIdProjectCache;
   }
 
   @Override
@@ -111,6 +129,62 @@ final class GerritIndexEventApplier implements IndexEventApplier {
         projectIndexer.index(Project.nameKey(name));
       }
     }
+  }
+
+  /**
+   * Caches first, so nothing below reads a stale project; then, per name, what the catalog says:
+   * an active name gets its project document and every change of its repository indexed under it,
+   * which also replaces the documents an old name left, since a change's document is keyed by its
+   * number; a deleted name loses its change documents and its project document; a name in flight
+   * is left to the finalize that follows.
+   */
+  @Override
+  public void namespaceChanged(List<NamespaceChange> changes) {
+    try (ManualRequestContext ignored = requestContext.open();
+        EventReplay.Scope replaying = EventReplay.enter()) {
+      for (NamespaceChange change : changes) {
+        projectCache.evict(change.name());
+      }
+      projectCache.refreshProjectList();
+      changeIdProjectCache.invalidateAll();
+      for (NamespaceChange change : changes) {
+        switch (change.state()) {
+          case PENDING -> {}
+          case ACTIVE -> {
+            projectIndexer.index(change.name());
+            try (Repository repository = repositories.openRepository(change.name())) {
+              for (Change.Id id : changeIds(repository)) {
+                changeIndexer.index(change.name(), id);
+              }
+            } catch (IOException failure) {
+              throw new UncheckedIOException(failure);
+            }
+          }
+          case RETIRED -> {
+            changeIndexer.deleteAllForProject(change.name());
+            projectIndexer.index(change.name());
+          }
+        }
+        logger.info(
+            "WalGerrit reconciled {} with the catalog: {}{}",
+            change.name().get(),
+            change.state().name().toLowerCase(java.util.Locale.ROOT),
+            change.movedTo() == null ? "" : ", moved to " + change.movedTo().get());
+      }
+    }
+  }
+
+  private static List<Change.Id> changeIds(Repository repository) throws IOException {
+    List<Change.Id> ids = new ArrayList<>();
+    for (Ref ref : repository.getRefDatabase().getRefsByPrefix(RefNames.REFS_CHANGES)) {
+      if (ref.getName().endsWith(RefNames.META_SUFFIX)) {
+        Change.Id id = Change.Id.fromRef(ref.getName());
+        if (id != null) {
+          ids.add(id);
+        }
+      }
+    }
+    return ids;
   }
 
   private void applyInContext(Project.NameKey project, RefTransaction transaction) {

@@ -13,7 +13,6 @@
 // limitations under the License.
 package dev.walgerrit;
 
-import com.google.gerrit.entities.Project;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -69,7 +68,7 @@ final class Reclaimer {
   private record Candidate(String version, long modified, long observedAt) {}
 
   // Guarded by this. Lost observations postpone deletion; they never make a file eligible sooner.
-  private final Map<Project.NameKey, Map<String, Candidate>> candidates = new HashMap<>();
+  private final Map<RepositoryId, Map<String, Candidate>> candidates = new HashMap<>();
 
   Reclaimer(WalGitRepositoryManager repositories, Clock clock, Duration grace, long cacheSizeLimit) {
     this.repositories = repositories;
@@ -80,7 +79,7 @@ final class Reclaimer {
 
   /** Every repository from one manifests listing, then the local cache limit. */
   Report reclaimAll() throws IOException {
-    return reclaimAll((project, manifest) -> {});
+    return reclaimAll((id, manifest) -> {});
   }
 
   /**
@@ -88,7 +87,7 @@ final class Reclaimer {
    * fresh manifest is also handed to {@code observer}, which lets the compactor evaluate its
    * policy for repositories nobody has written to since it last ran, at no extra read.
    */
-  Report reclaimAll(BiConsumer<Project.NameKey, Manifest> observer) throws IOException {
+  Report reclaimAll(BiConsumer<RepositoryId, Manifest> observer) throws IOException {
     return reclaimAll(observer, true);
   }
 
@@ -98,48 +97,53 @@ final class Reclaimer {
    * is shared, so one node deleting from it is enough, and the grace period makes it safe to wait.
    */
   synchronized Report reclaimAll(
-      BiConsumer<Project.NameKey, Manifest> observer, boolean deleteFromStore) throws IOException {
+      BiConsumer<RepositoryId, Manifest> observer, boolean deleteFromStore) throws IOException {
     Report total = new Report(0, 0, 0, 0);
-    Set<Project.NameKey> projects = repositories.storage().listProjects();
-    candidates.keySet().retainAll(projects);
-    for (Project.NameKey project : projects) {
+    Set<RepositoryId> ids = repositories.storage().listRepositories();
+    candidates.keySet().retainAll(ids);
+    for (RepositoryId id : ids) {
       try {
-        total = total.plus(reclaim(project, observer, deleteFromStore));
+        total = total.plus(reclaim(id, observer, deleteFromStore));
       } catch (IOException exception) {
-        logger.warn("WalGerrit could not reclaim files of {}", project.get(), exception);
+        logger.warn("WalGerrit could not reclaim files of {}", id.value(), exception);
       }
     }
     return total.plus(new Report(0, 0, 0, enforceCacheLimit()));
   }
 
   /** Reads every repository's manifest for {@code observer} without deleting anything. */
-  Report observeAll(BiConsumer<Project.NameKey, Manifest> observer) throws IOException {
+  Report observeAll(BiConsumer<RepositoryId, Manifest> observer) throws IOException {
     int seen = 0;
-    for (Project.NameKey project : repositories.storage().listProjects()) {
+    for (RepositoryId id : repositories.storage().listRepositories()) {
       try {
-        observer.accept(project, repositories.storage().manifestStore(project).refresh());
+        observer.accept(id, repositories.storage().manifestStore(id).refresh());
         seen++;
       } catch (IOException exception) {
-        logger.warn("WalGerrit could not read the manifest of {}", project.get(), exception);
+        logger.warn("WalGerrit could not read the manifest of {}", id.value(), exception);
       }
     }
     return new Report(seen, 0, 0, 0);
   }
 
   /** One repository: store files past the grace period, then the local cache. */
-  Report reclaim(Project.NameKey project) throws IOException {
-    return reclaim(project, (name, manifest) -> {}, true);
+  Report reclaim(RepositoryId id) throws IOException {
+    return reclaim(id, (name, manifest) -> {}, true);
+  }
+
+  /** The repository {@code project} is bound to; for tests. */
+  Report reclaim(com.google.gerrit.entities.Project.NameKey project) throws IOException {
+    return reclaim(repositories.idOf(project));
   }
 
   private synchronized Report reclaim(
-      Project.NameKey project,
-      BiConsumer<Project.NameKey, Manifest> observer,
+      RepositoryId id,
+      BiConsumer<RepositoryId, Manifest> observer,
       boolean deleteFromStore)
       throws IOException {
-    ManifestStore store = repositories.storage().manifestStore(project);
+    ManifestStore store = repositories.storage().manifestStore(id);
     GroupPublisher.Snapshot snapshot = store.publisher().snapshot(store, true);
     Manifest manifest = snapshot.manifest();
-    observer.accept(project, manifest);
+    observer.accept(id, manifest);
     Set<String> live = new HashSet<>(ManifestStore.liveFileNames(manifest));
     live.addAll(ManifestStore.fileNames(snapshot.unpublished()));
     long now = clock.millis();
@@ -147,7 +151,7 @@ final class Reclaimer {
     int deleted = 0;
     if (deleteFromStore) {
       Map<String, Candidate> observed =
-          candidates.computeIfAbsent(project, ignored -> new HashMap<>());
+          candidates.computeIfAbsent(id, ignored -> new HashMap<>());
       Set<String> eligible = new HashSet<>();
       for (ObjectStore.ObjectSummary object : store.listWalObjects()) {
         if (live.contains(object.key()) || object.lastModifiedEpochMillis() > cutoff) {
@@ -171,11 +175,11 @@ final class Reclaimer {
       }
       observed.keySet().retainAll(eligible);
       if (observed.isEmpty()) {
-        candidates.remove(project);
+        candidates.remove(id);
       }
     } else {
       // A node newly elected to reclaim starts a fresh observation interval.
-      candidates.remove(project);
+      candidates.remove(id);
     }
     int evicted = store.evictLocalFilesExcept(live);
     if (deleted > 0 || evicted > 0) {
@@ -183,15 +187,15 @@ final class Reclaimer {
           "WalGerrit reclaimed {} unreferenced file(s) of {} from the store and {} from the local"
               + " cache",
           deleted,
-          project.get(),
+          repositories.nameOf(id).get(),
           evicted);
     }
     return new Report(1, deleted, evicted, 0);
   }
 
   /** Drops this node's cached copies of files the repository's manifest no longer lists. */
-  int evictLocal(Project.NameKey project) throws IOException {
-    ManifestStore store = repositories.storage().manifestStore(project);
+  int evictLocal(RepositoryId id) throws IOException {
+    ManifestStore store = repositories.storage().manifestStore(id);
     GroupPublisher.Snapshot snapshot = store.publisher().snapshot(store, false);
     Set<String> live = new HashSet<>(ManifestStore.liveFileNames(snapshot.manifest()));
     live.addAll(ManifestStore.fileNames(snapshot.unpublished()));
