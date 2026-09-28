@@ -17,6 +17,7 @@ package dev.walgerrit;
 import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Project;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
@@ -32,6 +33,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import org.eclipse.jgit.dircache.DirCache;
 import org.eclipse.jgit.dircache.DirCacheBuilder;
 import org.eclipse.jgit.dircache.DirCacheEditor;
@@ -72,13 +76,15 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Reads are served from the catalog repository's handle and revalidate the way every handle
  * does: within the revalidation interval, or at once when a peer's hint announced a newer catalog.
- * Writes always start from an authoritative read.
+ * Writes always start from an authoritative read, and one process's writes take turns, so they
+ * race only other nodes' writes.
  */
 final class Catalog {
   private static final Logger logger = LoggerFactory.getLogger(Catalog.class);
   static final String REF = Constants.R_HEADS + "main";
   static final String BINDINGS = "bindings";
   private static final int MAX_COMMIT_ATTEMPTS = 16;
+  private static final long SLOW_COMMIT_NANOS = TimeUnit.SECONDS.toNanos(1);
   private static final Project.NameKey NAME = Project.nameKey(RepositoryId.CATALOG.value());
 
   enum State {
@@ -155,6 +161,25 @@ final class Catalog {
     Optional<Binding> binding(Project.NameKey name) {
       return Optional.ofNullable(byName.get(name));
     }
+
+    /** This catalog with {@code bindings} written over it: the snapshot of the commit {@code tip}. */
+    Snapshot with(ObjectId tip, Collection<Binding> bindings) {
+      Map<Project.NameKey, Binding> names = new TreeMap<>(byName);
+      Map<RepositoryId, Project.NameKey> active = new TreeMap<>(activeNames);
+      for (Binding binding : bindings) {
+        Binding previous = names.put(binding.name(), binding);
+        if (previous != null && previous.active()) {
+          active.remove(previous.id(), previous.name());
+        }
+      }
+      for (Binding binding : bindings) {
+        if (binding.active()) {
+          active.put(binding.id(), binding.name());
+        }
+      }
+      return new Snapshot(
+          tip, Collections.unmodifiableMap(names), Collections.unmodifiableMap(active));
+    }
   }
 
   /** What one commit does to the bindings, given the authoritative catalog. */
@@ -177,6 +202,9 @@ final class Catalog {
   private final Object handleLock = new Object();
   private LocalWalGitRepository repository;
   private volatile Snapshot snapshot = Snapshot.EMPTY;
+  // This process's writers take turns: each commit is built on the tip the previous one left.
+  private final ReentrantLock commitLock = new ReentrantLock(true);
+  private final AtomicLong lostRaces = new AtomicLong();
 
   Catalog(StorageLayout storage, Duration revalidateInterval) {
     this(storage, revalidateInterval, Clock.systemUTC());
@@ -275,78 +303,138 @@ final class Catalog {
   /**
    * Applies {@code change} to the current bindings in one commit. The function sees the
    * authoritative bindings, checks its preconditions, throwing {@link PreconditionException} when
-   * they do not hold, and returns the bindings to write. A commit that loses the catalog's CAS to
-   * another node re-runs the function against the newer catalog.
+   * they do not hold, and returns the bindings to write. This process's commits take turns, so
+   * only another node's commit can move the catalog under one; a commit that loses the catalog's
+   * CAS that way re-runs the function against the newer catalog.
    */
   Snapshot commit(String message, Change change) throws IOException {
-    for (int attempt = 1; attempt <= MAX_COMMIT_ATTEMPTS; attempt++) {
-      Snapshot current = snapshot(true);
-      Collection<Binding> changed = change.apply(current);
-      if (changed.isEmpty()) {
-        return current;
-      }
-      LocalWalGitRepository handle = handle();
-      ObjectId commitId;
-      try (ObjectInserter inserter = handle.newObjectInserter();
-          ObjectReader reader = handle.newObjectReader()) {
-        DirCache index = DirCache.newInCore();
-        if (!current.tip().equals(ObjectId.zeroId())) {
-          DirCacheBuilder builder = index.builder();
-          try (RevWalk walk = new RevWalk(reader)) {
-            builder.addTree(new byte[0], DirCacheEntry.STAGE_0, reader, walk.parseTree(current.tip()));
-          }
-          builder.finish();
-        }
-        DirCacheEditor editor = index.editor();
-        for (Binding binding : changed) {
-          ObjectId blob = inserter.insert(Constants.OBJ_BLOB, serialize(binding));
-          editor.add(
-              new DirCacheEditor.PathEdit(leaf(binding.name())) {
-                @Override
-                public void apply(DirCacheEntry entry) {
-                  entry.setFileMode(FileMode.REGULAR_FILE);
-                  entry.setObjectId(blob);
-                }
-              });
-        }
-        editor.finish();
-        ObjectId tree = index.writeTree(inserter);
-        PersonIdent author =
-            new PersonIdent("WalGerrit", "walgerrit@" + ManifestStore.writerHost(), clock.instant(), java.time.ZoneOffset.UTC);
-        CommitBuilder commit = new CommitBuilder();
-        commit.setTreeId(tree);
-        if (!current.tip().equals(ObjectId.zeroId())) {
-          commit.setParentId(current.tip());
-        }
-        commit.setAuthor(author);
-        commit.setCommitter(author);
-        commit.setMessage(message + "\n");
-        commitId = inserter.insert(commit);
-        inserter.flush();
-      }
-      RefUpdate update = handle.updateRef(REF);
-      update.setExpectedOldObjectId(current.tip());
-      update.setNewObjectId(commitId);
-      update.setRefLogMessage(message, false);
-      RefUpdate.Result result = update.update();
-      switch (result) {
-        case NEW, FAST_FORWARD -> {
-          Snapshot after = load(handle, commitId);
-          snapshot = after;
-          return after;
-        }
-        case LOCK_FAILURE, REJECTED -> {
-          logger.info(
-              "WalGerrit catalog changed while committing '{}'; retrying ({}/{})",
-              message,
-              attempt,
-              MAX_COMMIT_ATTEMPTS);
-        }
-        default -> throw new IOException("Catalog commit '" + message + "' ended in " + result);
-      }
+    long started = System.nanoTime();
+    try {
+      commitLock.lockInterruptibly();
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException("Interrupted before committing '" + message + "'");
     }
-    throw new IOException(
-        "Catalog commit '" + message + "' lost " + MAX_COMMIT_ATTEMPTS + " races in a row");
+    try {
+      long waited = System.nanoTime() - started;
+      long read = 0;
+      long built = 0;
+      long updated = 0;
+      for (int attempt = 1; attempt <= MAX_COMMIT_ATTEMPTS; attempt++) {
+        long phase = System.nanoTime();
+        Snapshot current = snapshot(true);
+        read += System.nanoTime() - phase;
+        phase = System.nanoTime();
+        Collection<Binding> changed = change.apply(current);
+        if (changed.isEmpty()) {
+          return current;
+        }
+        LocalWalGitRepository handle = handle();
+        // The bindings as the commit stores them, parsed back as a load would.
+        List<Binding> written = new ArrayList<>(changed.size());
+        ObjectId commitId;
+        try (ObjectInserter inserter = handle.newObjectInserter();
+            ObjectReader reader = handle.newObjectReader()) {
+          DirCache index = DirCache.newInCore();
+          if (!current.tip().equals(ObjectId.zeroId())) {
+            DirCacheBuilder builder = index.builder();
+            try (RevWalk walk = new RevWalk(reader)) {
+              builder.addTree(new byte[0], DirCacheEntry.STAGE_0, reader, walk.parseTree(current.tip()));
+            }
+            builder.finish();
+          }
+          DirCacheEditor editor = index.editor();
+          for (Binding binding : changed) {
+            byte[] content = serialize(binding);
+            written.add(parse(new ObjectLoader.SmallObject(Constants.OBJ_BLOB, content)));
+            ObjectId blob = inserter.insert(Constants.OBJ_BLOB, content);
+            editor.add(
+                new DirCacheEditor.PathEdit(leaf(binding.name())) {
+                  @Override
+                  public void apply(DirCacheEntry entry) {
+                    entry.setFileMode(FileMode.REGULAR_FILE);
+                    entry.setObjectId(blob);
+                  }
+                });
+          }
+          editor.finish();
+          ObjectId tree = index.writeTree(inserter);
+          PersonIdent author =
+              new PersonIdent("WalGerrit", "walgerrit@" + ManifestStore.writerHost(), clock.instant(), java.time.ZoneOffset.UTC);
+          CommitBuilder commit = new CommitBuilder();
+          commit.setTreeId(tree);
+          if (!current.tip().equals(ObjectId.zeroId())) {
+            commit.setParentId(current.tip());
+          }
+          commit.setAuthor(author);
+          commit.setCommitter(author);
+          commit.setMessage(message + "\n");
+          commitId = inserter.insert(commit);
+          inserter.flush();
+        }
+        built += System.nanoTime() - phase;
+        phase = System.nanoTime();
+        RefUpdate update = handle.updateRef(REF);
+        update.setExpectedOldObjectId(current.tip());
+        update.setNewObjectId(commitId);
+        update.setRefLogMessage(message, false);
+        RefUpdate.Result result = update.update();
+        updated += System.nanoTime() - phase;
+        switch (result) {
+          case NEW, FAST_FORWARD -> {
+            // Built from the bindings just written rather than re-read: a load parses every one.
+            Snapshot after = current.with(commitId, written);
+            snapshot = after;
+            logCommit(message, attempt, System.nanoTime() - started, waited, read, built, updated);
+            return after;
+          }
+          case LOCK_FAILURE, REJECTED -> {
+            lostRaces.incrementAndGet();
+            logger.info(
+                "WalGerrit catalog changed while committing '{}'; retrying ({}/{})",
+                message,
+                attempt,
+                MAX_COMMIT_ATTEMPTS);
+          }
+          default -> throw new IOException("Catalog commit '" + message + "' ended in " + result);
+        }
+      }
+      throw new IOException(
+          "Catalog commit '" + message + "' lost " + MAX_COMMIT_ATTEMPTS + " races in a row");
+    } finally {
+      commitLock.unlock();
+    }
+  }
+
+  /** One line per commit: at info when it was retried or slow, else at debug. */
+  private static void logCommit(
+      String message, int attempts, long total, long waited, long read, long built, long updated) {
+    boolean notable = attempts > 1 || total >= SLOW_COMMIT_NANOS;
+    if (notable ? !logger.isInfoEnabled() : !logger.isDebugEnabled()) {
+      return;
+    }
+    String line =
+        "WalGerrit catalog commit '{}' took {} ms in {} attempt(s): waited {} ms for this node's"
+            + " other commits, read {} ms, built {} ms, updated {} ms";
+    Object[] arguments = {
+      message,
+      TimeUnit.NANOSECONDS.toMillis(total),
+      attempts,
+      TimeUnit.NANOSECONDS.toMillis(waited),
+      TimeUnit.NANOSECONDS.toMillis(read),
+      TimeUnit.NANOSECONDS.toMillis(built),
+      TimeUnit.NANOSECONDS.toMillis(updated)
+    };
+    if (notable) {
+      logger.info(line, arguments);
+    } else {
+      logger.debug(line, arguments);
+    }
+  }
+
+  /** Commit attempts of this process that another writer's commit made it repeat. */
+  long lostRaces() {
+    return lostRaces.get();
   }
 
   /**

@@ -32,6 +32,7 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -291,6 +292,50 @@ class NamespaceTest {
         nodes.get(0).storage().listRepositories().size(),
         "the repository and the catalog; the losers reserved nothing");
     assertTrue(nodes.get(0).namespace().pending().isEmpty());
+  }
+
+  @Test
+  void oneNodesConcurrentCreationsTakeTurnsOnTheCatalog() throws Exception {
+    WalGitRepositoryManager node = node("a");
+    int threads = 8;
+    int perThread = 8;
+    CountDownLatch go = new CountDownLatch(1);
+    ExecutorService pool = Executors.newFixedThreadPool(threads);
+    try {
+      List<Future<Void>> futures = new ArrayList<>();
+      for (int t = 0; t < threads; t++) {
+        String prefix = "platform/t" + t + "-";
+        futures.add(
+            pool.submit(
+                () -> {
+                  go.await();
+                  for (int i = 0; i < perThread; i++) {
+                    node.createRepository(Project.nameKey(prefix + i)).close();
+                  }
+                  return null;
+                }));
+      }
+      go.countDown();
+      for (Future<Void> future : futures) {
+        future.get();
+      }
+    } finally {
+      pool.shutdownNow();
+    }
+    assertEquals(threads * perThread, node.list().size());
+    assertEquals(0, node.catalog().lostRaces(), "no commit of this node lost to another of its own");
+  }
+
+  @Test
+  void theSnapshotACommitLeavesIsTheOneTheStoreServes() throws Exception {
+    WalGitRepositoryManager node = node("a");
+    Project.NameKey doomed = Project.nameKey("platform/doomed");
+    node.createRepository(OLD).close();
+    node.createRepository(doomed).close();
+    node.namespace().rename(OLD, NEW, false);
+    node.namespace().delete(doomed, false);
+
+    assertEquals(node("b").catalog().snapshot(true), node.catalog().snapshot(false));
   }
 
   @Test

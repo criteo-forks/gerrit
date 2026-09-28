@@ -27,7 +27,8 @@ is not listed. Its `refs/heads/main` tree holds one blob per name ever bound, at
 ```
 
 Every commit on the catalog is one namespace transition, made with a compare-and-swap on the
-branch tip and retried against the newer catalog when another node commits first. A commit's
+branch tip and retried against the newer catalog when another node commits first. One node's
+commits take turns, so only another node's commit can make one retry. A commit's
 change function re-checks its preconditions against what it reads, so two nodes cannot bind one
 name to two repositories or rename one name twice.
 
