@@ -80,8 +80,9 @@ import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
  * <p>Every step is idempotent, so the importer is resumable by rerunning it: an uploaded file is
  * recognised by its name and content, a published repository is recognised by its manifest and only
  * verified, and a repository whose manifest exists but is empty, because a run died between
- * creating it and publishing, is published again. The verification compares every source ref with
- * what a WalGerrit handle serves; {@code --verify-closure} additionally walks every object the refs
+ * creating it and publishing, is published again. The verification compares every source ref the
+ * import publishes, so not those {@code --prune-dangling-refs} drops, with what a WalGerrit handle
+ * serves; {@code --verify-closure} additionally walks every object the refs
  * reach through WalGerrit, which reads every pack back.
  */
 public final class RepositoryImporter {
@@ -272,7 +273,7 @@ public final class RepositoryImporter {
     Optional<Catalog.Binding> bound = repositories.catalog().resolve(project, true);
     if (bound.isPresent() && bound.get().active()) {
       try (Repository original = open(bareDirectory)) {
-        verify(bound.get().id(), project, sourceRefs(original));
+        verify(bound.get().id(), project, publishedRefs(original));
       }
       out.printf(Locale.ROOT, "skipped %s: already imported and verified%n", projectName);
       return Outcome.ALREADY_IMPORTED;
@@ -296,7 +297,7 @@ public final class RepositoryImporter {
               if (store.refresh().getRevision() > 0) {
                 // Published by the run that died before activating the name.
                 try (Repository original = open(bareDirectory)) {
-                  verify(id, project, sourceRefs(original));
+                  verify(id, project, publishedRefs(original));
                 }
                 return;
               }
@@ -464,9 +465,14 @@ public final class RepositoryImporter {
 
   /** Refs of the copy whose object, or whose annotated tag's target, the copy does not hold. */
   private static List<String> danglingRefs(Path copy) throws IOException {
+    try (FileRepository repository = open(copy)) {
+      return danglingRefs(repository);
+    }
+  }
+
+  private static List<String> danglingRefs(Repository repository) throws IOException {
     List<String> dangling = new ArrayList<>();
-    try (FileRepository repository = open(copy);
-        RevWalk walk = new RevWalk(repository)) {
+    try (RevWalk walk = new RevWalk(repository)) {
       for (Ref ref : repository.getRefDatabase().getRefsByPrefix(RefDatabase.ALL)) {
         if (ref.isSymbolic() || ref.getObjectId() == null || Constants.HEAD.equals(ref.getName())) {
           continue;
@@ -569,11 +575,30 @@ public final class RepositoryImporter {
     }
   }
 
+  /**
+   * The refs importing {@code source} publishes, to verify a repository imported by an earlier run:
+   * every ref, less those staging prunes. The staged copy holds the source's objects, so its
+   * dangling refs are the source's.
+   */
+  private Map<String, Ref> publishedRefs(Repository source) throws IOException {
+    if (stage == null || !pruneDanglingRefs) {
+      return sourceRefs(source);
+    }
+    return sourceRefs(source, Set.copyOf(danglingRefs(source)));
+  }
+
   private static Map<String, Ref> sourceRefs(Repository source) throws IOException {
+    return sourceRefs(source, Set.of());
+  }
+
+  private static Map<String, Ref> sourceRefs(Repository source, Set<String> excluded)
+      throws IOException {
     Map<String, Ref> refs = new TreeMap<>();
     RefDatabase database = source.getRefDatabase();
     for (Ref ref : database.getRefsByPrefix(RefDatabase.ALL)) {
-      refs.put(ref.getName(), ref.isSymbolic() || ref.isPeeled() ? ref : database.peel(ref));
+      if (!excluded.contains(ref.getName())) {
+        refs.put(ref.getName(), ref.isSymbolic() || ref.isPeeled() ? ref : database.peel(ref));
+      }
     }
     Ref head = source.exactRef(Constants.HEAD);
     if (head != null) {

@@ -63,10 +63,10 @@ such refs from the staged copy and prints their names. This changes the imported
 not repair the missing history. Missing objects deeper in the reachable graph can still fail the
 connectivity check.
 
-Keep the list of removed refs for reconciliation with the source. A later rerun against an
-already published repository verifies the original source directly, without staging or pruning;
-it will fail if that source still contains the removed refs. The importer does not incrementally
-update a published repository.
+Keep the list of removed refs for reconciliation with the source. A later rerun verifies an
+already published repository against the original source without staging it. Given the same
+`--stage` and `--prune-dangling-refs`, it leaves out the refs staging would remove; without
+them, it fails on those refs. The importer does not incrementally update a published repository.
 
 ## Preserve the Gerrit server ID
 
@@ -90,7 +90,7 @@ For each repository, the importer:
 
 Already uploaded files are checked by name and content. A nonempty destination is verified
 instead of overwritten. Rerunning therefore resumes an interrupted import when the source ref
-set is unchanged, subject to the pruning caveat above. It is not a synchronization tool.
+set is unchanged and the rerun passes the same pruning options. It is not a synchronization tool.
 
 | Option | Effect |
 | --- | --- |

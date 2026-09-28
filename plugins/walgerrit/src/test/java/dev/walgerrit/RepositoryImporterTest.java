@@ -281,6 +281,17 @@ class RepositoryImporterTest {
     assertTrue(
         Files.isRegularFile(bareDirectory.resolve("refs/multi-site/version")),
         "the source keeps its dangling refs");
+
+    // A rerun verifies against what the import published, without the pruned refs.
+    log.reset();
+    Report rerun =
+        new RepositoryImporter(manager, new PrintStream(log), true, stage, true)
+            .importAll(source, Set.of(), 1);
+
+    String rerunLog = log.toString(StandardCharsets.UTF_8);
+    assertTrue(rerun.ok(), rerunLog);
+    assertEquals(1, rerun.alreadyImported());
+    assertTrue(rerunLog.contains("skipped torn: already imported and verified"), rerunLog);
   }
 
   private static void git(Path repository, String... arguments) throws Exception {
