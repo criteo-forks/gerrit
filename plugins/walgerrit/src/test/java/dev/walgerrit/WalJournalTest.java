@@ -153,6 +153,34 @@ class WalJournalTest {
     assertEquals(List.of("retried"), journaledProjects(store, before));
   }
 
+  @Test
+  void eventsFiredDuringAnIndexRebuildAreJournaledButItsReindexedDocumentsAreNot() throws Exception {
+    WalGitRepositoryManager node = node("a", new FileObjectStore(root.resolve("store")));
+    node.createRepository(PROJECT).close();
+    ManifestStore store = node.manifestStore(PROJECT);
+    Manifest before = store.read();
+    WalJournal journal = journal(node);
+    journal.start();
+    try {
+      try (EventReplay.Scope rebuilding = EventReplay.enterEverywhere()) {
+        journal.onChangeIndexed(PROJECT.get(), 7);
+        journal.onEvent(created("during-rebuild"));
+      }
+      try (EventReplay.Scope replaying = EventReplay.enter()) {
+        journal.onEvent(created("replayed"));
+      }
+      journal.flush();
+    } finally {
+      journal.stop();
+    }
+    assertEquals(List.of("during-rebuild"), journaledProjects(store, before));
+    for (LogEntry entry :
+        store.readLogEntriesAfter(
+            before.getHeadSeq(), before.getHeadTransactionId(), store.refresh(), 100)) {
+      assertTrue(!entry.hasIndexUpdate(), "the rebuild's own index writes are not journaled");
+    }
+  }
+
   /** A journal CAS: the head advances with neither packs nor refs changing. */
   private static boolean publishesJournal(Manifest current, Manifest proposed) {
     return proposed.getHeadSeq() == current.getHeadSeq() + 1

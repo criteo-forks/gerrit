@@ -57,7 +57,9 @@ import org.slf4j.LoggerFactory;
  * outcome is unknown is settled from the log first, so a batch that did land is not written twice.
  *
  * <p>Work done on another node's behalf, replaying an entry or rebuilding the indexes, runs under
- * {@link EventReplay} and is not journaled again.
+ * {@link EventReplay} and is not journaled again. A rebuild covers the whole process because its
+ * indexers fan out over a pool; it suppresses only reindexed documents, never the events this node
+ * fires meanwhile.
  */
 @Singleton
 final class WalJournal
@@ -95,7 +97,7 @@ final class WalJournal
 
   @Override
   public void onEvent(Event event) {
-    if (!journaling()) {
+    if (!journalingEvents()) {
       return;
     }
     String json;
@@ -143,8 +145,17 @@ final class WalJournal
     }
   }
 
+  /** Whether reindexed documents are journaled: not while this node repeats another's work. */
   private boolean journaling() {
     return executor != null && !EventReplay.isReplaying();
+  }
+
+  /**
+   * Whether events are journaled: not while this thread replays another node's. An index rebuild
+   * does not stop them, so an event fired on this node during a rebuild still reaches the log.
+   */
+  private boolean journalingEvents() {
+    return executor != null && !EventReplay.isReplayingOnThisThread();
   }
 
   private void flushSoon() {

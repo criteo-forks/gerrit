@@ -46,7 +46,10 @@ accounts and groups in `All-Users`, projects in `All-Projects`.
 The tailer reindexes those documents on foreign nodes, skipping a change that a ref transaction in
 the same sweep reindexes anyway: a local write journals both, and followers index the change once.
 A batch whose publication fails keeps its index update for the next batch, unlike its events.
-Replay and index rebuilds run under `EventReplay`, so a reindex is never journaled back.
+Replay and index rebuilds run under `EventReplay`, so a reindex is never journaled back. A rebuild
+marks the whole process, because its indexers run on a pool, but it fires no events: events this
+node fires during a rebuild are still journaled. Only a replaying thread skips the events it
+delivers.
 
 ## Consumers must tolerate loss and duplication
 
