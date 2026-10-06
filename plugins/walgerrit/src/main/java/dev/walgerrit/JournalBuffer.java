@@ -50,6 +50,13 @@ final class JournalBuffer {
     }
   }
 
+  /**
+   * Events one repository may hold while its log cannot be written. A store that refuses writes
+   * also refuses the ref updates behind most events, so this bound is reached only by an outage
+   * long enough that some loss is the lesser harm.
+   */
+  static final int MAX_EVENTS = 10_000;
+
   private final Map<Project.NameKey, Pending> pending = new LinkedHashMap<>();
 
   /** Adds one event and returns how many now wait for that repository. */
@@ -75,13 +82,35 @@ final class JournalBuffer {
     of(allProjects).projects.add(name);
   }
 
-  /** Puts an index update back after a failed publication; it rides with the next batch. */
-  synchronized void requeue(Project.NameKey project, IndexUpdate index) {
+  /**
+   * Puts a batch back after a failed publication; it rides with the next one. Its events go ahead
+   * of any fired since, so the log keeps them in firing order. A repository whose log cannot be
+   * written keeps at most {@link #MAX_EVENTS} events; the oldest beyond that are discarded and
+   * counted in the return value, so a store that stays unreachable cannot exhaust the heap.
+   *
+   * @return how many events were discarded to stay within the bound
+   */
+  synchronized int requeue(Project.NameKey project, List<String> events, @Nullable IndexUpdate index) {
     Pending p = of(project);
-    p.changes.addAll(index.getChangesList());
-    p.accounts.addAll(index.getAccountsList());
-    p.groups.addAll(index.getGroupsList());
-    p.projects.addAll(index.getProjectsList());
+    if (!events.isEmpty()) {
+      List<String> merged = new ArrayList<>(events.size() + p.events.size());
+      merged.addAll(events);
+      merged.addAll(p.events);
+      p.events.clear();
+      p.events.addAll(merged);
+    }
+    int discarded = 0;
+    while (p.events.size() > MAX_EVENTS) {
+      p.events.remove(0);
+      discarded++;
+    }
+    if (index != null) {
+      p.changes.addAll(index.getChangesList());
+      p.accounts.addAll(index.getAccountsList());
+      p.groups.addAll(index.getGroupsList());
+      p.projects.addAll(index.getProjectsList());
+    }
+    return discarded;
   }
 
   /** Takes everything that waits, in arrival order per repository. */

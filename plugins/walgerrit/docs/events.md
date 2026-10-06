@@ -13,9 +13,12 @@ Each batch becomes an `EVENT` entry containing `event_json`.
 
 A notification about a completed ref update enters the log after that update. Other publications
 may intervene: the notification is neither part of the ref transaction nor necessarily the next
-entry. Serialization runs in the listener; storage publication runs in the background. A
-serialization or publication failure is logged and the affected notification or batch is dropped.
-A process crash can also lose buffered events.
+entry. Serialization runs in the listener; storage publication runs in the background. An event
+that cannot be serialized is logged and dropped. A batch whose publication fails is retried with
+the next flush, its events ahead of those fired since; a publication whose response was lost is
+first settled from the log, so a batch that landed is not written twice. While a repository's log
+refuses writes it keeps at most 10,000 events, discarding the oldest beyond that with an error. A
+process crash still loses the events buffered since the last flush, at most 200 ms of them.
 
 ## Each node replays foreign events
 
