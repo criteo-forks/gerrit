@@ -58,8 +58,9 @@ A committed notification reaches foreign nodes through a sweep or a
 fixed latency bound: journal scheduling, sweep duration, backlog and failures all add delay.
 
 Plugins receive replayed events through the normal dispatcher. A plugin that forwards them to an
-external service may therefore send one copy per node. Run such a publisher on a designated node
-or implement deduplication. The sweep lease alone is not an exactly-once delivery mechanism.
+external service may therefore send one copy per node. Such a plugin should read the
+[event log](event-log.md) instead: one copy of each event, in order per repository, with a shared
+cursor and a lease. The sweep lease alone is not an exactly-once delivery mechanism.
 
 ## Configuration
 
