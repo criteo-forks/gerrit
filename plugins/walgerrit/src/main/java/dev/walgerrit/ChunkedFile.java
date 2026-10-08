@@ -133,14 +133,15 @@ final class ChunkedFile {
       }
     }
     if (!resume) {
-      Files.deleteIfExists(sidecar);
+      // A file without a sidecar is complete. Keep the marker until the old data is
+      // gone, and publish the new marker before creating any sparse data.
       Files.deleteIfExists(data);
       Files.createDirectories(data.getParent());
+      present = new BitSet(chunkCount);
+      writeSidecar(sidecar, size, chunkSize, present);
       try (RandomAccessFile file = new RandomAccessFile(data.toFile(), "rw")) {
         file.setLength(size);
       }
-      present = new BitSet(chunkCount);
-      writeSidecar(sidecar, size, chunkSize, present);
     }
     return new ChunkedFile(data, size, chunkSize, fetcher, onComplete, present);
   }

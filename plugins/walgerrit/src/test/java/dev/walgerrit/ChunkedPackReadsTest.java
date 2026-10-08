@@ -33,6 +33,10 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 import org.eclipse.jgit.internal.storage.dfs.DfsBlockCache;
@@ -115,6 +119,45 @@ class ChunkedPackReadsTest {
     assertEquals(0, store.rangeReads.get(), "a complete pack is read locally");
     assertTrue(store.downloads.isEmpty(), "nothing is downloaded again");
     assertEquals(0, cold.storage().packsArrivingInChunks(), "complete packs leave the registry");
+  }
+
+  @Test
+  void concurrentReadersNeverSeeAnUnfetchedChunkAsComplete() throws Exception {
+    FileObjectStore store = new FileObjectStore(root.resolve("store"));
+    StorageLayout layout =
+        new StorageLayout(store, root.resolve("cache"), root.resolve("cursors"), "", CHUNK);
+    ManifestStore manifest = layout.manifestStore(new RepositoryId("test"));
+    byte[] content = new byte[4 * CHUNK];
+    new Random(17).nextBytes(content);
+    int readers = 16;
+    try (var executor = Executors.newFixedThreadPool(readers)) {
+      for (int attempt = 0; attempt < 32; attempt++) {
+        String name = "pack-concurrent-" + attempt + ".pack";
+        store.putIfAbsent("repos/test/wal/" + name, content);
+        CyclicBarrier start = new CyclicBarrier(readers);
+        List<Future<byte[]>> results = new java.util.ArrayList<>();
+        for (int reader = 0; reader < readers; reader++) {
+          results.add(executor.submit(() -> {
+            start.await(10, TimeUnit.SECONDS);
+            try (var channel = manifest.openPackChannel(name, content.length)) {
+              ByteBuffer buffer = ByteBuffer.allocate(128);
+              channel.position(CHUNK + 10);
+              while (buffer.hasRemaining()) {
+                if (channel.read(buffer) < 0) {
+                  throw new IOException("Unexpected end of pack");
+                }
+              }
+              return buffer.array();
+            }
+          }));
+        }
+        for (Future<byte[]> result : results) {
+          assertArrayEquals(
+              java.util.Arrays.copyOfRange(content, CHUNK + 10, CHUNK + 138),
+              result.get(10, TimeUnit.SECONDS));
+        }
+      }
+    }
   }
 
   @Test
