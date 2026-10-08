@@ -65,8 +65,37 @@ class JournalBufferTest {
     assertEquals(List.of("uuid-1"), users.getGroupsList());
     assertTrue(buffer.isEmpty());
 
-    buffer.requeue(project, changes);
+    buffer.requeue(project, List.of(), changes);
     buffer.addChange(project, 11);
     assertEquals(List.of(7, 9, 11), buffer.drain().get(project).index().getChangesList());
+  }
+
+  @Test
+  void requeuedEventsGoAheadOfEventsFiredSince() {
+    JournalBuffer buffer = new JournalBuffer();
+    Project.NameKey project = Project.nameKey("p");
+    buffer.add(project, "e1");
+    buffer.add(project, "e2");
+    JournalBuffer.Batch failed = buffer.drain().get(project);
+
+    buffer.add(project, "e3");
+    assertEquals(0, buffer.requeue(project, failed.events(), failed.index()));
+    assertEquals(List.of("e1", "e2", "e3"), buffer.drain().get(project).events());
+  }
+
+  @Test
+  void aRepositoryThatCannotBeWrittenKeepsOnlyTheNewestEventsWithinTheBound() {
+    JournalBuffer buffer = new JournalBuffer();
+    Project.NameKey project = Project.nameKey("p");
+    List<String> failed = new java.util.ArrayList<>();
+    for (int i = 0; i < JournalBuffer.MAX_EVENTS; i++) {
+      failed.add("old-" + i);
+    }
+    buffer.add(project, "new");
+    assertEquals(1, buffer.requeue(project, failed, null), "one event over the bound");
+    List<String> kept = buffer.drain().get(project).events();
+    assertEquals(JournalBuffer.MAX_EVENTS, kept.size());
+    assertEquals("old-1", kept.get(0), "the oldest is the one discarded");
+    assertEquals("new", kept.get(kept.size() - 1));
   }
 }

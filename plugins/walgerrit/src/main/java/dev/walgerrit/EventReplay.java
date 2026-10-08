@@ -31,13 +31,25 @@ final class EventReplay {
     return REPLAYING.get() || EVERYWHERE.get() > 0;
   }
 
+  /**
+   * True while this thread delivers another node's work. Only a replay delivers events; a rebuild
+   * marks the whole process because its indexers fan out over a pool, but fires no events, so an
+   * event seen during a rebuild was fired by this node and must still be journaled.
+   */
+  static boolean isReplayingOnThisThread() {
+    return REPLAYING.get();
+  }
+
   /** Marks the calling thread until the scope closes. */
   static Scope enter() {
     REPLAYING.set(true);
     return () -> REPLAYING.set(false);
   }
 
-  /** Marks every thread until the scope closes, for work that fans out over a pool. */
+  /**
+   * Marks every thread until the scope closes, for index work that fans out over a pool. Events
+   * are not covered; see {@link #isReplayingOnThisThread}.
+   */
   static Scope enterEverywhere() {
     EVERYWHERE.incrementAndGet();
     return EVERYWHERE::decrementAndGet;

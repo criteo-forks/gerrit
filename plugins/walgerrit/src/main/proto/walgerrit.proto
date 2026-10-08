@@ -145,6 +145,21 @@ message IndexCursor {
   string manifest_version = 3;
 }
 
+// A reader's acknowledgement of one repository's log, shared by every node:
+// cluster/event-log/<reader>/cursors/<repo-id>. Only the reader holding the
+// lease of that name moves it, by a compare-and-swap on its version, so a
+// holder that lost the lease without noticing cannot move it back. See
+// EventLog.
+message LogCursor {
+  uint64 sequence = 1;
+  // transaction_id of the entry at sequence; empty at sequence 0.
+  string transaction_id = 2;
+  // Version of the manifest whose head the cursor reached, when it is at
+  // that head; empty otherwise. A listing that reports the same version means
+  // nothing was published since.
+  string head_version = 3;
+}
+
 // Stored at leases/<repo-id>/compaction. Holding it only avoids duplicate
 // work: the manifest CAS, with its check that every superseded pack is still
 // live, is what keeps two compactors from corrupting anything. A lease whose

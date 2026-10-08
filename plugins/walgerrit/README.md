@@ -233,5 +233,6 @@ results for the revision being deployed.
 | JGit integration and test coverage | [JGit/CAS audit](docs/jgit-cas-deep-dive.md) |
 | Local search and recovery | [Index events](docs/index-events.md) |
 | Cross-node notifications | [Events in the WAL](docs/events.md) |
+| Forwarding events from a plugin | [Event log](docs/event-log.md) |
 | Peer wake-ups over UDP | [Gossip](docs/gossip.md) |
 | Shared login cookies | [Web sessions](docs/web-sessions.md) |

@@ -13,9 +13,12 @@ Each batch becomes an `EVENT` entry containing `event_json`.
 
 A notification about a completed ref update enters the log after that update. Other publications
 may intervene: the notification is neither part of the ref transaction nor necessarily the next
-entry. Serialization runs in the listener; storage publication runs in the background. A
-serialization or publication failure is logged and the affected notification or batch is dropped.
-A process crash can also lose buffered events.
+entry. Serialization runs in the listener; storage publication runs in the background. An event
+that cannot be serialized is logged and dropped. A batch whose publication fails is retried with
+the next flush, its events ahead of those fired since; a publication whose response was lost is
+first settled from the log, so a batch that landed is not written twice. While a repository's log
+refuses writes it keeps at most 10,000 events, discarding the oldest beyond that with an error. A
+process crash still loses the events buffered since the last flush, at most 200 ms of them.
 
 ## Each node replays foreign events
 
@@ -43,7 +46,10 @@ accounts and groups in `All-Users`, projects in `All-Projects`.
 The tailer reindexes those documents on foreign nodes, skipping a change that a ref transaction in
 the same sweep reindexes anyway: a local write journals both, and followers index the change once.
 A batch whose publication fails keeps its index update for the next batch, unlike its events.
-Replay and index rebuilds run under `EventReplay`, so a reindex is never journaled back.
+Replay and index rebuilds run under `EventReplay`, so a reindex is never journaled back. A rebuild
+marks the whole process, because its indexers run on a pool, but it fires no events: events this
+node fires during a rebuild are still journaled. Only a replaying thread skips the events it
+delivers.
 
 ## Consumers must tolerate loss and duplication
 
@@ -52,8 +58,9 @@ A committed notification reaches foreign nodes through a sweep or a
 fixed latency bound: journal scheduling, sweep duration, backlog and failures all add delay.
 
 Plugins receive replayed events through the normal dispatcher. A plugin that forwards them to an
-external service may therefore send one copy per node. Run such a publisher on a designated node
-or implement deduplication. The sweep lease alone is not an exactly-once delivery mechanism.
+external service may therefore send one copy per node. Such a plugin should read the
+[event log](event-log.md) instead: one copy of each event, in order per repository, with a shared
+cursor and a lease. The sweep lease alone is not an exactly-once delivery mechanism.
 
 ## Configuration
 

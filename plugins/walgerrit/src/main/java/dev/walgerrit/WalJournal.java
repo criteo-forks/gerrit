@@ -51,12 +51,15 @@ import org.slf4j.LoggerFactory;
  * <p>Both are collected for a short interval and published as one entry per repository: one object
  * write and one manifest CAS per batch, on a background thread, never on the request that did the
  * work. An event without a project goes into the All-Projects log, accounts and groups into
- * All-Users', projects into All-Projects'. Events are notifications and a batch whose publication
- * fails is logged and dropped; index updates are retried with the next batch, because an index
- * that misses one stays wrong until something else touches the document.
+ * All-Users', projects into All-Projects'. A batch whose publication fails is retried with the next
+ * one, events ahead of those fired since, because the log is what other nodes and any external
+ * publisher read: an event that never reaches it is lost to all of them. A publication whose
+ * outcome is unknown is settled from the log first, so a batch that did land is not written twice.
  *
  * <p>Work done on another node's behalf, replaying an entry or rebuilding the indexes, runs under
- * {@link EventReplay} and is not journaled again.
+ * {@link EventReplay} and is not journaled again. A rebuild covers the whole process because its
+ * indexers fan out over a pool; it suppresses only reindexed documents, never the events this node
+ * fires meanwhile.
  */
 @Singleton
 final class WalJournal
@@ -94,7 +97,7 @@ final class WalJournal
 
   @Override
   public void onEvent(Event event) {
-    if (!journaling()) {
+    if (!journalingEvents()) {
       return;
     }
     String json;
@@ -142,8 +145,17 @@ final class WalJournal
     }
   }
 
+  /** Whether reindexed documents are journaled: not while this node repeats another's work. */
   private boolean journaling() {
     return executor != null && !EventReplay.isReplaying();
+  }
+
+  /**
+   * Whether events are journaled: not while this thread replays another node's. An index rebuild
+   * does not stop them, so an event fired on this node during a rebuild still reaches the log.
+   */
+  private boolean journalingEvents() {
+    return executor != null && !EventReplay.isReplayingOnThisThread();
   }
 
   private void flushSoon() {
@@ -217,18 +229,41 @@ final class WalJournal
               entry.getKey().get());
           continue;
         }
-        store.get().publishJournal(batch.events(), batch.index());
+        publish(store.get(), batch);
       } catch (IOException | RuntimeException failure) {
-        if (batch.index() != null) {
-          buffer.requeue(entry.getKey(), batch.index());
+        int discarded = buffer.requeue(entry.getKey(), batch.events(), batch.index());
+        if (discarded > 0) {
+          logger.error(
+              "WalGerrit discarded the {} oldest unjournaled event(s) for {}: its log has refused"
+                  + " writes for longer than {} events can wait",
+              discarded,
+              entry.getKey().get(),
+              JournalBuffer.MAX_EVENTS);
         }
         logger.warn(
-            "WalGerrit could not journal {} event(s) and {} index update for {}; the events are"
-                + " dropped, the index update is retried",
+            "WalGerrit could not journal {} event(s) and {} index update for {}; both are retried"
+                + " with the next batch",
             batch.events().size(),
             batch.index() == null ? "no" : "an",
             entry.getKey().get(),
             failure);
+      }
+    }
+  }
+
+  /**
+   * Publishes one batch. When the store lost the response, the log says whether the entry landed:
+   * one that did is done, one that did not is retried, and only a log that cannot be read leaves
+   * the outcome open, in which case the batch is retried and may be journaled twice.
+   */
+  private static void publish(ManifestStore store, JournalBuffer.Batch batch) throws IOException {
+    try {
+      store.publishJournal(batch.events(), batch.index());
+    } catch (AmbiguousPublicationException unknown) {
+      ManifestStore.Resolution resolution =
+          store.resolvePublication(unknown.sequence(), unknown.transactionId());
+      if (!resolution.landed()) {
+        throw unknown;
       }
     }
   }
