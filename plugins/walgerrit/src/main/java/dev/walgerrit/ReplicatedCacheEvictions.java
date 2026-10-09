@@ -27,6 +27,7 @@ import com.google.gerrit.server.group.db.GroupConfig;
 import com.google.gerrit.server.ssh.SshKeyCache;
 import com.google.inject.Inject;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.LinkedHashSet;
 import java.util.Optional;
 import java.util.Set;
@@ -34,8 +35,6 @@ import java.util.function.Function;
 import org.eclipse.jgit.errors.ConfigInvalidException;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Repository;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Evicts the Gerrit caches that a ref update replayed from another node makes stale.
@@ -47,9 +46,9 @@ import org.slf4j.LoggerFactory;
  *
  * <ul>
  *   <li>{@code sshkeys}, keyed by username, derived from the user's {@code refs/users/} ref;
- *   <li>the group membership caches ({@code groups_bymember}, {@code groups_bysubgroup},
- *       {@code groups_byname}, {@code groups}), keyed by member, subgroup, name and legacy id and
- *       derived from {@code refs/groups/} refs.
+ *   <li>the group membership caches ({@code groups_bymember}, {@code groups_bysubgroup}, {@code
+ *       groups_byname}, {@code groups}), keyed by member, subgroup, name and legacy id and derived
+ *       from {@code refs/groups/} refs.
  * </ul>
  *
  * <p>For a group the members and subgroups of both the old and the new revision are evicted, so a
@@ -57,8 +56,6 @@ import org.slf4j.LoggerFactory;
  * eviction topic achieves, using the WAL entry itself as the trigger.
  */
 final class ReplicatedCacheEvictions {
-  private static final Logger logger = LoggerFactory.getLogger(ReplicatedCacheEvictions.class);
-
   /** Loads a group as it was at one commit of its {@code refs/groups/} ref. */
   interface GroupSnapshots {
     Optional<InternalGroup> load(AccountGroup.UUID group, ObjectId commit) throws IOException;
@@ -124,7 +121,8 @@ final class ReplicatedCacheEvictions {
 
   /**
    * The group's {@code refs/groups/} ref moved from {@code before} to {@code after}; either may be
-   * null or zero when the group was created or deleted.
+   * null or zero when the group was created or deleted. Call after updating the group index.
+   * Snapshot failures must stop replay so the cursor is retried, including evictions for removals.
    */
   void groupChanged(AccountGroup.UUID group, ObjectId before, ObjectId after) {
     groups.evict(group);
@@ -136,20 +134,21 @@ final class ReplicatedCacheEvictions {
         continue;
       }
       try {
-        snapshots
-            .load(group, commit)
-            .ifPresent(
-                snapshot -> {
-                  groups.evict(snapshot.getId());
-                  groups.evict(snapshot.getNameKey());
-                  members.addAll(snapshot.getMembers());
-                  subgroups.addAll(snapshot.getSubgroups());
-                });
-      } catch (IOException | RuntimeException unreadable) {
-        logger.warn(
-            "WalGerrit cannot read group {} at {} to evict its membership caches",
-            group.get(),
-            commit.name(),
+        InternalGroup snapshot =
+            snapshots
+                .load(group, commit)
+                .orElseThrow(() -> new IOException("Group snapshot contains no group"));
+        groups.evict(snapshot.getId());
+        groups.evict(snapshot.getNameKey());
+        members.addAll(snapshot.getMembers());
+        subgroups.addAll(snapshot.getSubgroups());
+      } catch (IOException unreadable) {
+        throw new UncheckedIOException(
+            "Cannot read group "
+                + group.get()
+                + " at "
+                + commit.name()
+                + " to evict its membership caches; replay must retry",
             unreadable);
       }
     }

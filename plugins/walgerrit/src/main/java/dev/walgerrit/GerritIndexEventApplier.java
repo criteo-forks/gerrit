@@ -257,11 +257,13 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       evictions.accountChanged(account);
     }
     for (Map.Entry<AccountGroup.UUID, RefUpdate> group : groups.entrySet()) {
+      // Membership caches load from the group index. Evict after updating it, or a concurrent
+      // request can refill a cache with the old membership and retain it after replay succeeds.
+      groupIndexer.index(group.getKey());
       evictions.groupChanged(
           group.getKey(),
           objectIdOrNull(group.getValue().getOldObjectId()),
           objectIdOrNull(group.getValue().getNewObjectId()));
-      groupIndexer.index(group.getKey());
     }
 
     Set<Change.Id> alreadyIndexed = projectChanges;

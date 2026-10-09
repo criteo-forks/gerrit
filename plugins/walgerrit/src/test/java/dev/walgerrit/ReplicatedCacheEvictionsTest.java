@@ -14,6 +14,7 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.common.collect.ImmutableSet;
@@ -24,6 +25,7 @@ import com.google.gerrit.server.account.GroupCache;
 import com.google.gerrit.server.account.GroupIncludeCache;
 import com.google.gerrit.server.ssh.SshKeyCache;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.reflect.Proxy;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -41,8 +43,10 @@ class ReplicatedCacheEvictionsTest {
   private final GroupCache groups = recording(GroupCache.class);
   private final GroupIncludeCache groupIncludes = recording(GroupIncludeCache.class);
 
-  private static final ObjectId BEFORE = ObjectId.fromString("1111111111111111111111111111111111111111");
-  private static final ObjectId AFTER = ObjectId.fromString("2222222222222222222222222222222222222222");
+  private static final ObjectId BEFORE =
+      ObjectId.fromString("1111111111111111111111111111111111111111");
+  private static final ObjectId AFTER =
+      ObjectId.fromString("2222222222222222222222222222222222222222");
 
   @Test
   void accountChangeEvictsTheUsersSshKeysByUsername() {
@@ -64,9 +68,19 @@ class ReplicatedCacheEvictionsTest {
   void groupChangeEvictsOldAndNewMembersSubgroupsNamesAndIds() {
     AccountGroup.UUID uuid = AccountGroup.uuid("group-uuid");
     InternalGroup before =
-        group(uuid, 7, "old-name", ImmutableSet.of(Account.id(1), Account.id(2)), ImmutableSet.of(AccountGroup.uuid("sub-a")));
+        group(
+            uuid,
+            7,
+            "old-name",
+            ImmutableSet.of(Account.id(1), Account.id(2)),
+            ImmutableSet.of(AccountGroup.uuid("sub-a")));
     InternalGroup after =
-        group(uuid, 7, "new-name", ImmutableSet.of(Account.id(2), Account.id(3)), ImmutableSet.of(AccountGroup.uuid("sub-b")));
+        group(
+            uuid,
+            7,
+            "new-name",
+            ImmutableSet.of(Account.id(2), Account.id(3)),
+            ImmutableSet.of(AccountGroup.uuid("sub-b")));
     ReplicatedCacheEvictions evictions =
         new ReplicatedCacheEvictions(
             id -> Optional.empty(),
@@ -78,23 +92,28 @@ class ReplicatedCacheEvictionsTest {
     evictions.groupChanged(uuid, BEFORE, AFTER);
 
     assertTrue(calls.contains("GroupCache.evict[group-uuid]"), calls.toString());
-    assertTrue(calls.contains("GroupIncludeCache.evictParentGroupsOf[group-uuid]"), calls.toString());
+    assertTrue(
+        calls.contains("GroupIncludeCache.evictParentGroupsOf[group-uuid]"), calls.toString());
     assertTrue(calls.contains("GroupCache.evict[old-name]"), calls.toString());
     assertTrue(calls.contains("GroupCache.evict[new-name]"), calls.toString());
     assertTrue(calls.contains("GroupCache.evict[7]"), calls.toString());
     for (int member : new int[] {1, 2, 3}) {
-      assertTrue(calls.contains("GroupIncludeCache.evictGroupsWithMember[" + member + "]"), calls.toString());
+      assertTrue(
+          calls.contains("GroupIncludeCache.evictGroupsWithMember[" + member + "]"),
+          calls.toString());
     }
     assertTrue(calls.contains("GroupIncludeCache.evictParentGroupsOf[sub-a]"), calls.toString());
     assertTrue(calls.contains("GroupIncludeCache.evictParentGroupsOf[sub-b]"), calls.toString());
     // Member 2 is in both revisions and is evicted once.
-    assertEquals(1, calls.stream().filter("GroupIncludeCache.evictGroupsWithMember[2]"::equals).count());
+    assertEquals(
+        1, calls.stream().filter("GroupIncludeCache.evictGroupsWithMember[2]"::equals).count());
   }
 
   @Test
   void deletedGroupUsesOnlyTheOldRevision() {
     AccountGroup.UUID uuid = AccountGroup.uuid("gone");
-    InternalGroup before = group(uuid, 9, "gone-name", ImmutableSet.of(Account.id(5)), ImmutableSet.of());
+    InternalGroup before =
+        group(uuid, 9, "gone-name", ImmutableSet.of(Account.id(5)), ImmutableSet.of());
     List<ObjectId> asked = new ArrayList<>();
     ReplicatedCacheEvictions evictions =
         new ReplicatedCacheEvictions(
@@ -115,7 +134,7 @@ class ReplicatedCacheEvictionsTest {
   }
 
   @Test
-  void unreadableSnapshotStillEvictsWhatIsKnown() {
+  void unreadableSnapshotFailsReplayInsteadOfAcknowledgingIncompleteEviction() {
     AccountGroup.UUID uuid = AccountGroup.uuid("broken");
     ReplicatedCacheEvictions evictions =
         new ReplicatedCacheEvictions(
@@ -127,10 +146,29 @@ class ReplicatedCacheEvictionsTest {
               throw new IOException("corrupt");
             });
 
-    evictions.groupChanged(uuid, BEFORE, AFTER);
+    UncheckedIOException failure =
+        assertThrows(UncheckedIOException.class, () -> evictions.groupChanged(uuid, BEFORE, AFTER));
+    assertTrue(failure.getMessage().contains(BEFORE.name()));
+    assertEquals("corrupt", failure.getCause().getMessage());
+  }
 
-    assertEquals(
-        List.of("GroupCache.evict[broken]", "GroupIncludeCache.evictParentGroupsOf[broken]"), calls);
+  @Test
+  void absentNonzeroSnapshotAndRuntimeFailureCannotSilentlyAcknowledgeReplay() {
+    AccountGroup.UUID uuid = AccountGroup.uuid("missing");
+    ReplicatedCacheEvictions missing =
+        new ReplicatedCacheEvictions(
+            id -> Optional.empty(), null, groups, groupIncludes, (g, commit) -> Optional.empty());
+    assertThrows(UncheckedIOException.class, () -> missing.groupChanged(uuid, BEFORE, AFTER));
+    ReplicatedCacheEvictions broken =
+        new ReplicatedCacheEvictions(
+            id -> Optional.empty(),
+            null,
+            groups,
+            groupIncludes,
+            (g, commit) -> {
+              throw new IllegalStateException("snapshot decoding failed");
+            });
+    assertThrows(IllegalStateException.class, () -> broken.groupChanged(uuid, BEFORE, AFTER));
   }
 
   private static InternalGroup group(
