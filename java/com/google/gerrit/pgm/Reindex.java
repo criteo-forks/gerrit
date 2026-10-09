@@ -22,6 +22,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.google.gerrit.common.Die;
+import com.google.gerrit.common.SiteLibraryLoaderUtil;
 import com.google.gerrit.extensions.config.FactoryModule;
 import com.google.gerrit.extensions.registration.DynamicMap;
 import com.google.gerrit.index.Index;
@@ -42,6 +43,8 @@ import com.google.gerrit.server.cache.CacheInfoFactory;
 import com.google.gerrit.server.cache.h2.CacheOptions;
 import com.google.gerrit.server.change.ChangeResource;
 import com.google.gerrit.server.config.GerritServerConfig;
+import com.google.gerrit.server.config.SitePaths;
+import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.git.WorkQueue.WorkQueueModule;
 import com.google.gerrit.server.index.IndexModule;
 import com.google.gerrit.server.index.change.ChangeSchemaDefinitions;
@@ -68,6 +71,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
@@ -108,6 +112,11 @@ public class Reindex extends SiteProgram {
       usage = "Don't update H2 disk caches.")
   private boolean readOnlyDiskCaches;
 
+  @Option(
+      name = "--walgerrit",
+      usage = "Capture WalGerrit replay cursors before a full reindex and save them after flushing")
+  private boolean walGitCursors;
+
   private Boolean reuseExistingDocumentsOption;
 
   private Injector dbInjector;
@@ -138,31 +147,71 @@ public class Reindex extends SiteProgram {
         reuseExistingDocumentsOption != null
             ? reuseExistingDocumentsOption
             : globalConfig.getBoolean("index", null, "reuseExistingDocuments", false);
+    if (walGitCursors
+        && (list || !indices.isEmpty() || changesVersion != null || reuseExistingDocuments)) {
+      throw die(
+          "--walgerrit requires a full reindex without --list, --index, --changes-schema-version or"
+              + " --reuse");
+    }
     LifecycleManager dbManager = new LifecycleManager();
     dbManager.add(dbInjector);
     dbManager.start();
 
+    try {
+      boolean ok = walGitCursors ? reindexWithWalGitCursors() : reindexWithLifecycle();
+      return ok ? 0 : 1;
+    } catch (Exception e) {
+      throw die(e.getMessage(), e);
+    } finally {
+      dbManager.stop();
+    }
+  }
+
+  private boolean reindexWithLifecycle() throws Exception {
     sysInjector = createSysInjector();
     sysInjector.getInstance(PluginGuiceEnvironment.class).setDbCfgInjector(dbInjector, cfgInjector);
     LifecycleManager sysManager = new LifecycleManager();
     sysManager.add(sysInjector);
     sysManager.start();
-
-    sysInjector.injectMembers(this);
-    checkIndicesOption();
-    isDiskCacheReadOnly.set(readOnlyDiskCaches);
-
     try {
+      sysInjector.injectMembers(this);
+      checkIndicesOption();
+      isDiskCacheReadOnly.set(readOnlyDiskCaches);
       boolean ok = list ? list() : reindex();
+      if (walGitCursors && ok) {
+        // Reindex disables auto-commit. Cursors must never be durable ahead of index documents.
+        for (IndexDefinition<?, ?, ?> def : indexDefs) {
+          requireNonNull(def.getIndexCollection().getSearchIndex()).flushAndCommit();
+        }
+      }
       if (showCacheStats) {
         printCacheStats();
       }
-      return ok ? 0 : 1;
-    } catch (Exception e) {
-      throw die(e.getMessage(), e);
+      return ok;
     } finally {
       sysManager.stop();
-      dbManager.stop();
+    }
+  }
+
+  private boolean reindexWithWalGitCursors() throws Exception {
+    SiteLibraryLoaderUtil.loadSiteLib(dbInjector.getInstance(SitePaths.class).lib_dir);
+    Class<?> seeder =
+        Class.forName(
+            "dev.walgerrit.IndexCursorSeeder",
+            true,
+            Thread.currentThread().getContextClassLoader());
+    Method entry = seeder.getMethod("reindex", GitRepositoryManager.class, Callable.class);
+    // Capture before creating the indexers or any of their caches. The callback flushes and closes
+    // the indexes before the seeder acknowledges the captured heads.
+    Callable<Boolean> rebuild = this::reindexWithLifecycle;
+    try {
+      return (Boolean)
+          entry.invoke(null, dbInjector.getInstance(GitRepositoryManager.class), rebuild);
+    } catch (InvocationTargetException failure) {
+      if (failure.getCause() instanceof Exception cause) {
+        throw cause;
+      }
+      throw failure;
     }
   }
 

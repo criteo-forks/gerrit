@@ -179,10 +179,12 @@ The work can be as expensive as a full offline reindex. A fresh node may need it
 is the log-distance and history check, whether or not the volume is new.
 
 With `indexRebuildOnStaleCursor = false`, stale cursors prevent readiness. For manual recovery,
-stop all destination writers, complete an offline `reindex`, then run `walgerrit-mark-indexed`
-for the affected node before restarting it. Removing cursors alone can immediately trigger the
-same replay-limit failure. See [Import: after the import](import.md#after-the-import) for why
-seeding requires a quiescent store.
+stop the affected node and run `reindex --walgerrit` before restarting it. This captures heads
+before rebuilding and saves them only after successful index flushes, so other nodes can keep
+writing during the rebuild. Removing cursors alone can immediately trigger the same replay-limit
+failure. See [Import: after the import](import.md#after-the-import). Snapshot reads needed for
+group membership cache invalidation must also succeed before a replay cursor advances; failures
+are retried instead of leaving removed members cached indefinitely.
 
 An interrupted rebuild can leave an index marked not ready. Complete an offline reindex before
 restarting in that case. Automatic rebuilds recover index state, not historical public events:

@@ -73,7 +73,28 @@ find "$manifests" -name manifest.pb -exec sha256sum {} + | sort >"$site/home/man
 run_gerrit init --batch --no-auto-start -d "$site"
 find "$manifests" -name manifest.pb -exec sha256sum {} + | sort | cmp - "$site/home/manifests.before-reinit"
 
-run_gerrit reindex -d "$site"
+run_gerrit reindex --walgerrit -d "$site"
+
+# Full offline reindex must seed cursors, while partial rebuilds and the unsafe old command refuse.
+find "$site/data/walgerrit-index-events" -name '*.cursor' -exec sha256sum {} + | sort \
+  > "$site/home/cursors.after-reindex"
+test -s "$site/home/cursors.after-reindex"
+for rejected in 'reindex --walgerrit --index changes' 'reindex --walgerrit --reuse' \
+    'reindex --walgerrit --list' 'reindex --walgerrit --changes-schema-version 1' \
+    'walgerrit-mark-indexed'; do
+  read -r -a rejected_args <<< "$rejected"
+  if run_gerrit "${rejected_args[@]}" -d "$site" > "$site/home/rejected-command.log" 2>&1; then
+    echo "Unsafe cursor command unexpectedly succeeded: $rejected" >&2
+    exit 1
+  fi
+  if ! grep -Eq -- 'requires a full reindex|Standalone cursor seeding' "$site/home/rejected-command.log"; then
+    cat "$site/home/rejected-command.log" >&2
+    echo "Command failed for an unexpected reason: $rejected" >&2
+    exit 1
+  fi
+done
+find "$site/data/walgerrit-index-events" -name '*.cursor' -exec sha256sum {} + | sort \
+  | cmp - "$site/home/cursors.after-reindex"
 
 git config --file "$site/etc/gerrit.config" sshd.listenAddress off
 http_port="${GERRIT_HTTP_PORT:-$((20000 + RANDOM % 20000))}"
@@ -162,7 +183,7 @@ start_daemon "$restart_log"
 curl -fsS "${listen_url}projects/" | grep -q '"All-Projects"'
 curl -fsS "${listen_url}accounts/?q=is:active&n=1" >/dev/null
 stop_daemon
-run_gerrit reindex -d "$site"
+run_gerrit reindex --walgerrit -d "$site"
 
 # Import: a bare repository from a basePath-like tree, loose objects and all, becomes a WalGerrit
 # project through the walgerrit-import program's staged mode, and the daemon then serves it.

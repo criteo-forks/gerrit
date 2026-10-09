@@ -14,6 +14,7 @@ _java_ -jar gerrit.war _reindex_
   [--list]
   [--index]
   [--read-only-disk-caches]
+  [--walgerrit]
 --
 
 == DESCRIPTION
@@ -60,6 +61,17 @@ Rebuilds the secondary index.
     Use read-only disk caches for the reindexing process. This option
     can be used to avoid writing old data into caches, which might
     cause performance issues and a lot of disk space being used.
+
+--walgerrit::
+    For the WalGerrit storage backend, capture repository heads before building
+    the indexes, then persist those heads as replay cursors after all indexes
+    have been flushed. The local daemon must be stopped; writes from other
+    nodes during reindexing are replayed on startup.
+    Requires a full rebuild without `--list`, `--index`,
+    `--changes-schema-version` or `--reuse`. If rebuilding or flushing fails,
+    rerun successfully before starting this node. This replaces the unsafe
+    standalone `walgerrit-mark-indexed` command and requires the matching
+    WalGerrit library in the site's `lib/` directory.
 
 == CONTEXT
 The secondary index must be enabled. See

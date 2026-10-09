@@ -14,6 +14,7 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -21,8 +22,11 @@ import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.config.GerritRuntime;
 import dev.walgerrit.proto.StorageProto.IndexCursor;
 import dev.walgerrit.proto.StorageProto.Manifest;
+import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.internal.storage.file.FileRepository;
@@ -43,7 +47,10 @@ class IndexCursorSeederTest {
     // An imported repository written to afterwards: the case that made a daemon rebuild everything.
     Path source = root.resolve("basePath");
     try (Repository bare =
-        Git.init().setBare(true).setDirectory(source.resolve("imported.git").toFile()).call()
+        Git.init()
+            .setBare(true)
+            .setDirectory(source.resolve("imported.git").toFile())
+            .call()
             .getRepository()) {
       publish(bare, Constants.R_HEADS + "main", "imported history");
       GC gc = new GC((FileRepository) bare);
@@ -71,10 +78,7 @@ class IndexCursorSeederTest {
         () -> tailer.catchUp(project),
         "without a cursor the log is further behind than the node may replay");
 
-    assertEquals(
-        2,
-        new IndexCursorSeeder(fresh, new PrintStream(System.out)).seedAll(),
-        "the imported repository and the catalog");
+    assertTrue(IndexCursorSeeder.reindex(fresh, () -> true));
 
     Manifest head = fresh.manifestStore(project).read();
     IndexCursor cursor =
@@ -91,9 +95,96 @@ class IndexCursorSeederTest {
       publish(repository, Constants.R_HEADS + "later", "published after seeding");
     }
     assertEquals(1, tailer.catchUp(project), "only what follows the seed is replayed");
-    assertEquals(0, IndexCursorSeeder.run(fresh, new String[0]));
+    assertThrows(IllegalArgumentException.class, () -> IndexCursorSeeder.run(fresh, new String[0]));
     assertThrows(
         IllegalArgumentException.class, () -> IndexCursorSeeder.run(fresh, new String[] {"--x"}));
+  }
+
+  @Test
+  void writesDuringAndAfterReindexAreReplayedIncludingNewRepositories() throws Exception {
+    WalGitRepositoryManager writer = node("writer");
+    Project.NameKey project = Project.nameKey("bootstrap");
+    String ref = "refs/changes/01/1/meta";
+    ObjectId first;
+    try (Repository repository = writer.createRepository(project)) {
+      first = publish(repository, ref, "indexed baseline");
+    }
+    WalGitRepositoryManager joining = node("joining");
+    List<String> expected = new ArrayList<>();
+    Project.NameKey added = Project.nameKey("created-during-reindex");
+    assertTrue(
+        IndexCursorSeeder.reindex(
+            joining,
+            () -> {
+              // Model the offline index reading this project, then a remote writer publishing
+              // before the
+              // other indexes finish. The post-reindex heads must not acknowledge this unseen
+              // write.
+              try (Repository repository = joining.openRepository(project)) {
+                assertEquals(first, repository.exactRef(ref).getObjectId());
+              }
+              try (Repository repository = writer.openRepository(project)) {
+                expected.add(publish(repository, ref, "concurrent update").name());
+              }
+              try (Repository repository = writer.createRepository(added)) {
+                expected.add(publish(repository, ref, "concurrent new project").name());
+              }
+              assertEquals(
+                  IndexCursor.getDefaultInstance(),
+                  cursor(joining, project).read(),
+                  "no cursor before indexes are flushed");
+              return true;
+            }));
+    try (Repository repository = writer.openRepository(project)) {
+      expected.add(publish(repository, ref, "after reindex").name());
+    }
+    List<String> replayed = new ArrayList<>();
+    IndexEventTailer tailer =
+        new IndexEventTailer(
+            joining,
+            (p, transaction) ->
+                transaction
+                    .getUpdatesList()
+                    .forEach(update -> replayed.add(update.getNewObjectId())),
+            GerritRuntime.DAEMON);
+    tailer.catchUp(project);
+    tailer.catchUp(added);
+    assertTrue(replayed.containsAll(expected), replayed.toString());
+    assertEquals(0, tailer.catchUp(project));
+    assertEquals(0, tailer.catchUp(added));
+  }
+
+  @Test
+  void failedReindexAndFailedFlushLeaveExistingCursorsUntouchedAndCanRetry() throws Exception {
+    WalGitRepositoryManager writer = node("writer");
+    Project.NameKey project = Project.nameKey("retry");
+    try (Repository repository = writer.createRepository(project)) {
+      publish(repository, "refs/heads/main", "initial");
+    }
+    WalGitRepositoryManager joining = node("joining");
+    assertTrue(IndexCursorSeeder.reindex(joining, () -> true));
+    IndexCursor original = cursor(joining, project).read();
+    try (Repository repository = writer.openRepository(project)) {
+      publish(repository, "refs/heads/main", "new baseline");
+    }
+    assertFalse(IndexCursorSeeder.reindex(joining, () -> false));
+    assertEquals(original, cursor(joining, project).read());
+    assertThrows(
+        IOException.class,
+        () ->
+            IndexCursorSeeder.reindex(
+                joining,
+                () -> {
+                  throw new IOException("index flush failed");
+                }));
+    assertEquals(original, cursor(joining, project).read());
+    assertTrue(IndexCursorSeeder.reindex(joining, () -> true));
+    assertTrue(cursor(joining, project).read().getSequence() > original.getSequence());
+  }
+
+  private static IndexCursorStore cursor(WalGitRepositoryManager node, Project.NameKey project)
+      throws IOException {
+    return new IndexCursorStore(node.manifestStore(project).indexCursorPath());
   }
 
   private static ObjectId publish(Repository repository, String ref, String message)
@@ -103,8 +194,7 @@ class IndexCursorSeederTest {
     update.setNewObjectId(commit);
     update.setForceUpdate(true);
     RefUpdate.Result result = update.update();
-    assertTrue(
-        result == RefUpdate.Result.NEW || result == RefUpdate.Result.FORCED, result.name());
+    assertTrue(result == RefUpdate.Result.NEW || result == RefUpdate.Result.FORCED, result.name());
     return commit;
   }
 
@@ -116,7 +206,8 @@ class IndexCursorSeederTest {
     Config config = new Config();
     config.setLong("walgerrit", null, "indexReplayLimit", replayLimit);
     config.setString("walgerrit", null, "storagePath", root.resolve("store").toString());
-    config.setString("walgerrit", null, "indexCursorPath", root.resolve(name + "-cursors").toString());
+    config.setString(
+        "walgerrit", null, "indexCursorPath", root.resolve(name + "-cursors").toString());
     config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
     WalGitConfiguration configuration = WalGitConfiguration.from(config, root.resolve(name));
     StorageLayout layout =

@@ -106,23 +106,24 @@ that nothing was published.
 
 ## After the import
 
-Keep every writer to the destination stopped through initialization or schema migration,
-offline reindexing and cursor seeding. For each node's local indexes, finish reindexing and then
-run:
+Keep writers stopped during import, initialization and schema migration. Once that is complete,
+stop the local daemon and build each node's indexes with:
 
 ```bash
-java -jar gerrit.war reindex -d "$site"
-java -jar gerrit.war walgerrit-mark-indexed -d "$site"
+java -jar gerrit.war reindex --walgerrit -d "$site"
 ```
 
-`walgerrit-mark-indexed` records the current repository heads. It does not inspect the indexes or
-recover the heads observed by the preceding reindex. A write between those two operations could
-be marked indexed without being indexed; stopping only this node is insufficient if other nodes
-can still write to the destination.
+This captures repository heads **before** reindexing, flushes all indexes, then saves the captured
+heads as node-local replay cursors. Other nodes may write during reindexing: startup replay applies
+those writes, including writes published after a project was indexed. The legacy
+`walgerrit-mark-indexed` command now refuses to run because capturing heads after reindex can skip
+such writes. Deploy the matching WAR and WalGerrit library together.
 
 An import entry contains files and refs but no logical ref-update payload for the index tailer.
-Do not rely on replay to index the imported baseline. Seed cursors only after the offline reindex
-succeeds. Subsequent publications are then replayed by the daemon.
+Do not rely on replay to index the imported baseline. `--walgerrit` requires a complete reindex,
+without `--index`, `--changes-schema-version` or `--reuse`. A failed reindex or flush does not
+advance cursors. Retry the full command successfully before starting the local daemon; replay
+retention limits still apply to writes made during a long rebuild.
 
 For a large offline reindex, a larger heap, relaxed `commitWithin` and
 `manifestRevalidateOnOpen = false` can reduce cost. Budget disk space for persistent caches and

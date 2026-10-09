@@ -14,34 +14,30 @@
 package dev.walgerrit;
 
 import com.google.gerrit.server.git.GitRepositoryManager;
-import dev.walgerrit.proto.StorageProto.Manifest;
+import dev.walgerrit.proto.StorageProto.IndexCursor;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.NavigableMap;
+import java.util.concurrent.Callable;
 
 /**
- * Records on this node that its indexes reflect the current head of every repository.
+ * Seeds node-local index cursors around a full offline reindex.
  *
- * <p>The index-event tailer replays, from each repository's node-local cursor, the ref
- * transactions the node's indexes have not seen yet. A repository without a cursor counts as never
- * indexed, and when its log cannot be replayed from the very start, which is the case for every
- * imported repository that has been written to since (an import publishes no ref transaction, so
- * the chain does not reach back to the beginning), the daemon falls back to rebuilding every index
- * on startup, with one thread per index and the daemon's own configuration. Running this after an
- * offline {@code reindex} seeds every cursor at the head that reindex saw, so the daemon only
- * replays what is published afterwards. It writes node-local cursor files and nothing else.
+ * <p>Capture heads before indexing, then persist those exact heads only after all indexes have been
+ * rebuilt and flushed. Writes from other nodes during indexing remain available for replay. A
+ * failed or interrupted reindex never acknowledges the captured heads; retry the full reindex
+ * before starting this node. Like Gerrit's reindex command, this requires the local daemon stopped.
  */
 public final class IndexCursorSeeder {
   private static final String USAGE =
       """
-      Usage: walgerrit-mark-indexed -d SITE
+Use: reindex --walgerrit -d SITE
 
-      Records on this node that its indexes reflect the current head of every repository. Run it
-      after an offline reindex, before the daemon starts; anything published in between is replayed
-      by the daemon when it starts.
-      """;
+Standalone walgerrit-mark-indexed is unsafe with concurrent writers and is no longer supported.
+Reindex captures replay cursors before indexing and saves them after successful index flushes.
+""";
 
   private final WalGitRepositoryManager repositories;
   private final PrintStream out;
@@ -51,7 +47,7 @@ public final class IndexCursorSeeder {
     this.out = out;
   }
 
-  /** Command-line entry point used by Gerrit's {@code walgerrit-mark-indexed} program. */
+  /** Refuse the unsafe standalone command, including when called from an older Gerrit WAR. */
   public static int run(GitRepositoryManager manager, String[] args) throws IOException {
     for (String arg : args) {
       if (arg.equals("--help") || arg.equals("-h")) {
@@ -60,30 +56,49 @@ public final class IndexCursorSeeder {
       }
       throw new IllegalArgumentException("Unknown argument: " + arg + "\n" + USAGE);
     }
+    throw new IllegalArgumentException(USAGE);
+  }
+
+  /**
+   * Called by Gerrit's full offline reindex; the callback must flush its indexes before success.
+   */
+  public static boolean reindex(GitRepositoryManager manager, Callable<Boolean> reindex)
+      throws Exception {
     if (!(manager instanceof WalGitRepositoryManager walGit)) {
       throw new IllegalStateException(
           "gerrit.installDbModule must install dev.walgerrit.WalGitModule; found "
               + manager.getClass().getName());
     }
-    new IndexCursorSeeder(walGit, System.out).seedAll();
-    return 0;
+    return new IndexCursorSeeder(walGit, System.out).reindex(reindex);
   }
 
-  /** Seeds every repository's cursor at its current head; returns how many were written. */
-  int seedAll() throws IOException {
-    NavigableMap<RepositoryId, String> heads = repositories.storage().listManifestVersions();
-    for (Map.Entry<RepositoryId, String> head : heads.entrySet()) {
+  boolean reindex(Callable<Boolean> reindex) throws Exception {
+    Map<RepositoryId, IndexCursor> seeds = new LinkedHashMap<>();
+    for (Map.Entry<RepositoryId, String> head :
+        repositories.storage().listManifestVersions().entrySet()) {
       ManifestStore manifestStore = repositories.storage().manifestStore(head.getKey());
       ManifestCache.VersionedManifest versioned = manifestStore.currentOrRefresh(head.getValue());
-      Manifest manifest = versioned.manifest();
-      new IndexCursorStore(manifestStore.indexCursorPath())
-          .write(manifest.getHeadSeq(), manifest.getHeadTransactionId(), versioned.version());
+      seeds.put(
+          head.getKey(),
+          IndexCursor.newBuilder()
+              .setSequence(versioned.manifest().getHeadSeq())
+              .setTransactionId(versioned.manifest().getHeadTransactionId())
+              .setManifestVersion(versioned.version())
+              .build());
+    }
+    if (!reindex.call()) {
+      return false;
+    }
+    for (Map.Entry<RepositoryId, IndexCursor> seed : seeds.entrySet()) {
+      IndexCursor cursor = seed.getValue();
+      new IndexCursorStore(repositories.storage().manifestStore(seed.getKey()).indexCursorPath())
+          .write(cursor.getSequence(), cursor.getTransactionId(), cursor.getManifestVersion());
     }
     out.printf(
         Locale.ROOT,
-        "Marked %d repositories as indexed at their current heads under %s%n",
-        heads.size(),
+        "Marked %d repositories as indexed at their pre-reindex heads under %s%n",
+        seeds.size(),
         repositories.configuration().indexCursorPath());
-    return heads.size();
+    return true;
   }
 }
