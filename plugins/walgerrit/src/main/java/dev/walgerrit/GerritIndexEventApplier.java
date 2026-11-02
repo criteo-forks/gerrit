@@ -116,7 +116,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
         EventReplay.Scope replaying = EventReplay.enter()) {
       for (int number : update.getChangesList()) {
         if (!alreadyReindexed.contains(number)) {
-          changeIndexer.index(project, Change.id(number));
+          indexOrDelete(project, Change.id(number));
         }
       }
       for (int id : update.getAccountsList()) {
@@ -154,7 +154,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
             projectIndexer.index(change.name());
             try (Repository repository = repositories.openRepository(change.name())) {
               for (Change.Id id : changeIds(repository)) {
-                changeIndexer.index(change.name(), id);
+                indexOrDelete(change.name(), id);
               }
             } catch (IOException failure) {
               throw new UncheckedIOException(failure);
@@ -235,7 +235,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       if (deletedProjectChanges.contains(change)) {
         changeIndexer.delete(change);
       } else {
-        changeIndexer.index(project, change);
+        indexOrDelete(project, change);
       }
     }
     for (Map.Entry<Change.Id, Boolean> change : allUsersChanges.entrySet()) {
@@ -270,17 +270,36 @@ final class GerritIndexEventApplier implements IndexEventApplier {
     for (BranchNameKey branch : branches) {
       for (ChangeData change : changeQuery.get().byBranchNew(branch)) {
         if (!alreadyIndexed.contains(change.getId())) {
-          changeIndexer.index(change.project(), change.getId());
+          indexOrDelete(change.project(), change.getId());
         }
       }
     }
     if (projectConfigChanged) {
       for (ChangeData change : changeQuery.get().byProjectOpen(project)) {
         if (!alreadyIndexed.contains(change.getId())) {
-          changeIndexer.index(change.project(), change.getId());
+          indexOrDelete(change.project(), change.getId());
         }
       }
     }
+  }
+
+  /**
+   * Indexes a change of {@code project} as the repository holds it now. A change with no meta ref
+   * loses its document, as in Gerrit's asynchronous index task.
+   */
+  private void indexOrDelete(Project.NameKey project, Change.Id id) {
+    ChangeNotes notes;
+    try {
+      notes = changeNotesFactory.createChecked(project, id);
+    } catch (NoSuchChangeException missing) {
+      logger.warn(
+          "WalGerrit replay found no meta ref for change {} of {}; deleting its document",
+          id,
+          project.get());
+      changeIndexer.delete(id);
+      return;
+    }
+    changeIndexer.index(notes);
   }
 
   private static void collectAllUsersUpdate(
