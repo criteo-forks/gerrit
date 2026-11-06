@@ -68,7 +68,8 @@ message LogEntry {
     COMPACT = 3;
     // Gerrit events fired on the writing node, carried as JSON for every other
     // node to deliver to its own stream-events subscribers and plugins. May
-    // also carry index_update.
+    // also carry index_update. Or events another Gerrit fired, relayed for
+    // event-log readers only (relayed_event_json).
     EVENT = 4;
     // Documents the writing node reindexed without a ref update behind them,
     // for every other node to reindex in its own index.
@@ -105,6 +106,11 @@ message LogEntry {
   IndexUpdate index_update = 12;
   // Present for FENCE: the namespace operation that fenced the repository.
   string fence_operation = 13;
+  // Present for an EVENT entry written through EventLog.relay: events another
+  // Gerrit fired, one JSON document each, in the order the relaying plugin
+  // received them. Event-log readers see them like event_json; no node replays
+  // them into its event dispatcher, because nothing happened on this cluster.
+  repeated string relayed_event_json = 14;
 }
 
 // Documents one node reindexed with no ref update behind them: an explicit

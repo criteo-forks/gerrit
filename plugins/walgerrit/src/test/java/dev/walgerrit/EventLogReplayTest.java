@@ -175,6 +175,25 @@ class EventLogReplayTest {
     assertEquals(2, replayedElsewhere.get(0).getEventJsonCount());
     foreign.catchUp(project);
     assertEquals(1, replayedElsewhere.size(), "an acknowledged entry is not replayed again");
+
+    // Events relayed from another Gerrit are for event-log readers: no node replays them.
+    Manifest beforeRelay = store.read();
+    store.publishRelayed(List.of("{\"type\":\"comment-added\"}"));
+    LogEntry relayed =
+        store
+            .readLogEntriesAfter(
+                beforeRelay.getHeadSeq(), beforeRelay.getHeadTransactionId(), store.read(), 10)
+            .get(0);
+    assertEquals(LogEntry.Kind.EVENT, relayed.getKind());
+    assertEquals(1, relayed.getRelayedEventJsonCount());
+    foreign.catchUp(project);
+    home.catchUp(project);
+    assertEquals(1, replayedElsewhere.size(), "relayed events are not replayed");
+    assertTrue(replayed.isEmpty());
+    assertEquals(
+        store.read().getHeadSeq(),
+        new IndexCursorStore(other.manifestStore(project).indexCursorPath()).read().getSequence(),
+        "the foreign tailer still moves past the entry");
   }
 
   private org.eclipse.jgit.lib.Config localConfig() {

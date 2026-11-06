@@ -211,6 +211,42 @@ class WalEventLogTest {
   }
 
   @Test
+  void relayedEventsAreReadInTheLogLikeJournaledOnes() throws Exception {
+    FileObjectStore shared = new FileObjectStore(root.resolve("store"));
+    WalGitRepositoryManager node = node("a", shared);
+    node.createRepository(PROJECT).close();
+    String id = node.idOf(PROJECT).value();
+    WalEventLog log = new WalEventLog(node, java.time.Clock.systemUTC());
+    Head start = log.head(id);
+
+    node.manifestStore(PROJECT).publishEvents(List.of(event("fired")));
+    assertTrue(log.relay(PROJECT.get(), List.of(event("relayed-1"), event("relayed-2"))));
+    long headBefore = log.head(id).position().sequence();
+    assertTrue(log.relay(PROJECT.get(), List.of()), "nothing to relay");
+    assertEquals(headBefore, log.head(id).position().sequence(), "no entry for no events");
+
+    Entries entries = log.readAfter(id, start.position());
+    assertEquals(2, entries.entries().size());
+    assertEquals(List.of(event("fired")), entries.entries().get(0).events());
+    assertEquals(
+        List.of(event("relayed-1"), event("relayed-2")), entries.entries().get(1).events());
+    assertEquals(entries.head().position(), entries.entries().get(1).position());
+
+    var stored =
+        node.manifestStore(PROJECT)
+            .readLogEntriesAfter(
+                entries.entries().get(0).position().sequence(),
+                entries.entries().get(0).position().transactionId(),
+                node.manifestStore(PROJECT).read(),
+                10)
+            .get(0);
+    assertEquals(0, stored.getEventJsonCount(), "never in event_json, which nodes replay");
+    assertEquals(2, stored.getRelayedEventJsonCount());
+
+    assertFalse(log.relay("platform/missing", List.of(event("lost"))), "no such repository");
+  }
+
+  @Test
   void readerNamesAndIdsAreValidated() throws Exception {
     WalEventLog log =
         new WalEventLog(node("a", new FileObjectStore(root.resolve("store"))), java.time.Clock.systemUTC());

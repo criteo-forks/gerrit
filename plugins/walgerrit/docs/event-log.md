@@ -27,6 +27,19 @@ A reader has a name, for example `kafka-gerrit-events`. The name keys its lease 
    Announcements from other nodes travel by [gossip](gossip.md) and may be lost; the listing
    is the backstop.
 
+## Relaying another Gerrit's events
+
+A node that follows another Gerrit, such as a shadow fed by the walgerrit-follower plugin, fires
+no events of its own: it fetches refs, and Gerrit fires nothing for a fetch. To let a publisher
+on that cluster forward the followed Gerrit's events, the follower calls `relay` with the events
+it applied, after applying them. Each call writes one EVENT entry to the repository's log, with
+the events in `relayed_event_json`, and returns once the entry is in the log.
+
+Readers get relayed events from `readAfter` exactly like fired ones. No node replays them into
+its event dispatcher: they describe nothing that happened on this cluster, so stream-events
+subscribers, webhooks and plugins such as automerger never see them. A relay whose outcome the
+store leaves unknown throws, and a retry may write the events twice.
+
 ## Guarantees and limits
 
 A cursor write names the version of the cursor it replaces. A holder that lost its lease without
