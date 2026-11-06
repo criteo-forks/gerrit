@@ -20,10 +20,12 @@ import static com.googlesource.gerrit.plugins.oidc.FakeProvider.OTHER_ISSUER;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -44,12 +46,25 @@ import com.google.gerrit.server.account.externalids.ExternalId;
 import com.google.gerrit.server.auth.AuthenticationUnavailableException;
 import com.google.gerrit.server.config.AuthConfig;
 import com.google.gerrit.server.query.account.InternalAccountQuery;
+import com.googlesource.gerrit.plugins.oidc.PasswordMemory.Answer;
 import java.io.IOException;
+import java.lang.Thread.State;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.eclipse.jgit.lib.Config;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.ArgumentMatchers;
@@ -64,7 +79,18 @@ public class OidcLoginProviderTest {
   private AuthConfig authConfig;
   private OidcLoginProvider.Passwords passwords;
   private LdapPasswordAuthenticator directory;
-  private Cache<String, HashedPassword> records;
+  private Cache<String, HashedPassword> accepted;
+  private Cache<String, HashedPassword> rejected;
+  private Cache<String, HashedPassword> unavailable;
+  private PasswordMemory memory;
+  private final List<Thread> requestThreads = new CopyOnWriteArrayList<>();
+  private final ExecutorService requests =
+      Executors.newCachedThreadPool(
+          work -> {
+            Thread thread = new Thread(work);
+            requestThreads.add(thread);
+            return thread;
+          });
   private final AtomicLong nanos = new AtomicLong();
 
   @Before
@@ -78,6 +104,11 @@ public class OidcLoginProviderTest {
     authConfig = mock(AuthConfig.class);
     passwords = mock(OidcLoginProvider.Passwords.class);
     when(accountCache.getByUsername(anyString())).thenReturn(Optional.empty());
+  }
+
+  @After
+  public void stopRequests() {
+    requests.shutdownNow();
   }
 
   @Test
@@ -208,7 +239,7 @@ public class OidcLoginProviderTest {
 
   @Test
   public void acceptedPasswordIsNotCheckedAgainWithinAMinute() throws Exception {
-    rememberAcceptedPasswords();
+    useTheDirectory();
     when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
 
     for (int i = 0; i < 5; i++) {
@@ -220,7 +251,7 @@ public class OidcLoginProviderTest {
 
   @Test
   public void usingARememberedPasswordDoesNotExtendItsLife() throws Exception {
-    rememberAcceptedPasswords();
+    useTheDirectory();
     when(directory.authenticate("jdoe", "s3cret")).thenReturn(true, false);
 
     provider(true).login("jdoe", "s3cret");
@@ -233,8 +264,8 @@ public class OidcLoginProviderTest {
   }
 
   @Test
-  public void wrongPasswordsAlwaysReachTheDirectory() throws Exception {
-    rememberAcceptedPasswords();
+  public void wrongPasswordIsNotCheckedAgainWithinAMinute() throws Exception {
+    useTheDirectory();
     when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
 
     assertThrows(IOException.class, () -> provider(true).login("jdoe", "wrong"));
@@ -243,13 +274,305 @@ public class OidcLoginProviderTest {
     assertThrows(IOException.class, () -> provider(true).login("jdoe", "wrong"));
     provider(true).login("jdoe", "s3cret");
 
-    verify(directory, times(3)).authenticate("jdoe", "wrong");
+    verify(directory, times(1)).authenticate("jdoe", "wrong");
+    verify(directory, times(1)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void passwordThatBecomesValidWorksOnceItsRejectionExpires() throws Exception {
+    useTheDirectory();
+    when(directory.authenticate("jdoe", "new")).thenReturn(false, true);
+
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "new"));
+    advance(Duration.ofSeconds(59));
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "new"));
+    advance(Duration.ofSeconds(2));
+
+    assertThat(provider(true).login("jdoe", "new").getExternalId()).isEqualTo("gerrit:jdoe");
+  }
+
+  @Test
+  public void eachDifferentWrongPasswordReachesTheDirectory() throws Exception {
+    useTheDirectory();
+
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "guess1"));
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "guess2"));
+
+    verify(directory).authenticate("jdoe", "guess1");
+    verify(directory).authenticate("jdoe", "guess2");
+  }
+
+  @Test
+  public void clientsWithDifferentStalePasswordsAreEachRemembered() throws Exception {
+    useTheDirectory();
+
+    for (int i = 0; i < 5; i++) {
+      assertThrows(IOException.class, () -> provider(true).login("jdoe", "stale1"));
+      assertThrows(IOException.class, () -> provider(true).login("jdoe", "stale2"));
+    }
+
+    verify(directory, times(1)).authenticate("jdoe", "stale1");
+    verify(directory, times(1)).authenticate("jdoe", "stale2");
+  }
+
+  @Test
+  public void clientsWithDifferentPasswordsDuringAnOutageAreEachRemembered() throws Exception {
+    useTheDirectory();
+    when(directory.authenticate(anyString(), anyString()))
+        .thenThrow(new AuthenticationUnavailableException("down", new IOException()));
+
+    for (int i = 0; i < 5; i++) {
+      assertThrows(IOException.class, () -> provider(true).login("jdoe", "one"));
+      assertThrows(IOException.class, () -> provider(true).login("jdoe", "two"));
+    }
+
+    verify(directory, times(1)).authenticate("jdoe", "one");
+    verify(directory, times(1)).authenticate("jdoe", "two");
+  }
+
+  @Test
+  public void moreWrongPasswordsThanTheMemoryHoldsAreStillRejected() throws Exception {
+    useTheDirectory();
+
+    for (int i = 0; i < 10; i++) {
+      String password = "guess" + i;
+      assertThrows(IOException.class, () -> provider(true).login("jdoe", password));
+    }
+
+    verify(directory, times(10)).authenticate(eq("jdoe"), anyString());
+  }
+
+  @Test
+  public void anotherUserIsNotRejectedByARememberedRejection() throws Exception {
+    useTheDirectory();
+    account("other", true, gerrit("other"));
+    when(directory.authenticate("other", "same")).thenReturn(true);
+
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "same"));
+
+    assertThat(provider(true).login("other", "same").getExternalId()).isEqualTo("gerrit:other");
+  }
+
+  @Test
+  public void directoryIsNotAskedAgainForFiveSecondsAfterFailing() throws Exception {
+    useTheDirectory();
+    when(directory.authenticate("jdoe", "s3cret"))
+        .thenThrow(new AuthenticationUnavailableException("down", new IOException()))
+        .thenReturn(true);
+
+    for (int i = 0; i < 3; i++) {
+      IOException e = assertThrows(IOException.class, () -> provider(true).login("jdoe", "s3cret"));
+      assertThat(e).hasCauseThat().isInstanceOf(AuthenticationUnavailableException.class);
+    }
+    verify(directory, times(1)).authenticate("jdoe", "s3cret");
+    advance(Duration.ofSeconds(6));
+
+    assertThat(provider(true).login("jdoe", "s3cret").getExternalId()).isEqualTo("gerrit:jdoe");
+    verify(directory, times(2)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void directoryFailureForOnePasswordDoesNotStopAnother() throws Exception {
+    useTheDirectory();
+    when(directory.authenticate("jdoe", "wrong"))
+        .thenThrow(new AuthenticationUnavailableException("down", new IOException()));
+    when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
+
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "wrong"));
+
+    assertThat(provider(true).login("jdoe", "s3cret").getExternalId()).isEqualTo("gerrit:jdoe");
+  }
+
+  @Test
+  public void waitingRequestsShareAnAcceptance() throws Exception {
+    useTheDirectory();
+    Gate gate = holdDirectory("jdoe", "s3cret", () -> true);
+    OidcLoginProvider provider = provider(true);
+
+    List<Future<OAuthUserInfo>> logins = loginsDuring(gate, provider, "jdoe", "s3cret");
+
+    for (Future<OAuthUserInfo> login : logins) {
+      assertThat(login.get(10, TimeUnit.SECONDS).getExternalId()).isEqualTo("gerrit:jdoe");
+    }
+    verify(directory, times(1)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void waitingRequestsShareARejection() throws Exception {
+    useTheDirectory();
+    Gate gate = holdDirectory("jdoe", "wrong", () -> false);
+    OidcLoginProvider provider = provider(true);
+
+    List<Future<OAuthUserInfo>> logins = loginsDuring(gate, provider, "jdoe", "wrong");
+
+    for (Future<OAuthUserInfo> login : logins) {
+      ExecutionException e =
+          assertThrows(ExecutionException.class, () -> login.get(10, TimeUnit.SECONDS));
+      assertThat(e).hasCauseThat().hasMessageThat().contains("Invalid credentials");
+    }
+    verify(directory, times(1)).authenticate("jdoe", "wrong");
+  }
+
+  @Test
+  public void waitingRequestsShareAFailure() throws Exception {
+    useTheDirectory();
+    Gate gate =
+        holdDirectory(
+            "jdoe",
+            "s3cret",
+            () -> {
+              throw new AuthenticationUnavailableException("down", new IOException());
+            });
+    OidcLoginProvider provider = provider(true);
+
+    List<Future<OAuthUserInfo>> logins = loginsDuring(gate, provider, "jdoe", "s3cret");
+
+    for (Future<OAuthUserInfo> login : logins) {
+      ExecutionException e =
+          assertThrows(ExecutionException.class, () -> login.get(10, TimeUnit.SECONDS));
+      assertThat(e)
+          .hasCauseThat()
+          .hasCauseThat()
+          .isInstanceOf(AuthenticationUnavailableException.class);
+    }
+    verify(directory, times(1)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void wrongPasswordInProgressDoesNotHoldUpTheRightOne() throws Exception {
+    useTheDirectory();
+    Gate gate = holdDirectory("jdoe", "wrong", () -> false);
+    when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
+    OidcLoginProvider provider = provider(true);
+
+    Future<OAuthUserInfo> wrong = requests.submit(() -> provider.login("jdoe", "wrong"));
+    gate.asked.await();
+
+    assertThat(provider.login("jdoe", "s3cret").getExternalId()).isEqualTo("gerrit:jdoe");
+    assertThat(wrong.isDone()).isFalse();
+    gate.answer.countDown();
+    assertThrows(ExecutionException.class, () -> wrong.get(10, TimeUnit.SECONDS));
+  }
+
+  @Test
+  public void waitIsCappedWhenTheDirectoryHangs() throws Exception {
+    useTheDirectory();
+    passwords = new LdapPasswords(directory, memory, Duration.ofMillis(50));
+    Gate gate = holdDirectory("jdoe", "s3cret", () -> true);
+    OidcLoginProvider provider = provider(true);
+
+    Future<OAuthUserInfo> first = requests.submit(() -> provider.login("jdoe", "s3cret"));
+    gate.asked.await();
+
+    IOException e = assertThrows(IOException.class, () -> provider.login("jdoe", "s3cret"));
+    assertThat(e).hasCauseThat().isInstanceOf(AuthenticationUnavailableException.class);
+
+    gate.answer.countDown();
+    assertThat(first.get(10, TimeUnit.SECONDS).getExternalId()).isEqualTo("gerrit:jdoe");
+    assertThat(provider.login("jdoe", "s3cret").getExternalId()).isEqualTo("gerrit:jdoe");
+    verify(directory, times(1)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void requestsArrivingAfterTheWaitEndsFailAtOnce() throws Exception {
+    useTheDirectory();
+    passwords = new LdapPasswords(directory, memory, Duration.ofSeconds(1));
+    Gate gate = holdDirectory("jdoe", "s3cret", () -> true);
+    OidcLoginProvider provider = provider(true);
+
+    Future<OAuthUserInfo> first = requests.submit(() -> provider.login("jdoe", "s3cret"));
+    gate.asked.await();
+    Thread.sleep(1100);
+
+    long before = System.nanoTime();
+    IOException e = assertThrows(IOException.class, () -> provider.login("jdoe", "s3cret"));
+    assertThat(e).hasCauseThat().isInstanceOf(AuthenticationUnavailableException.class);
+    assertThat(Duration.ofNanos(System.nanoTime() - before).toMillis()).isLessThan(900L);
+
+    gate.answer.countDown();
+    first.get(10, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void attemptThatThrowsReleasesWaitersAndIsNotRemembered() throws Exception {
+    useTheDirectory();
+    passwords = new LdapPasswords(directory, memory, Duration.ofMinutes(5));
+    Gate gate = new Gate();
+    AtomicInteger calls = new AtomicInteger();
+    when(directory.authenticate("jdoe", "s3cret"))
+        .thenAnswer(
+            invocation -> {
+              if (calls.incrementAndGet() > 1) {
+                return true;
+              }
+              gate.asked.countDown();
+              assertThat(gate.answer.await(20, TimeUnit.SECONDS)).isTrue();
+              throw new IllegalStateException("bug");
+            });
+    OidcLoginProvider provider = provider(true);
+
+    Future<OAuthUserInfo> first = requests.submit(() -> provider.login("jdoe", "s3cret"));
+    gate.asked.await();
+    Future<OAuthUserInfo> waiting = requests.submit(() -> provider.login("jdoe", "s3cret"));
+    waitForParkedRequests(2);
+    gate.answer.countDown();
+
+    ExecutionException thrown =
+        assertThrows(ExecutionException.class, () -> first.get(10, TimeUnit.SECONDS));
+    assertThat(thrown).hasCauseThat().isInstanceOf(IllegalStateException.class);
+    ExecutionException released =
+        assertThrows(ExecutionException.class, () -> waiting.get(10, TimeUnit.SECONDS));
+    assertThat(released)
+        .hasCauseThat()
+        .hasCauseThat()
+        .isInstanceOf(AuthenticationUnavailableException.class);
+    assertThat(provider.login("jdoe", "s3cret").getExternalId()).isEqualTo("gerrit:jdoe");
+    verify(directory, times(2)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void answerThatArrivesJustAfterTheFirstLookIsUsed() throws Exception {
+    useTheDirectory();
+    memory.remember("jdoe", "s3cret", Answer.ACCEPTED);
+    PasswordMemory lateAnswer = spy(memory);
+    doReturn(Optional.empty()).doCallRealMethod().when(lateAnswer).recall("jdoe", "s3cret");
+    passwords = new LdapPasswords(directory, lateAnswer);
+
+    assertThat(provider(true).login("jdoe", "s3cret").getExternalId()).isEqualTo("gerrit:jdoe");
+
+    verify(directory, never()).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void manyRequestsAtOnceAskTheDirectoryOnce() throws Exception {
+    useTheDirectory();
+    when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
+    OidcLoginProvider provider = provider(true);
+    CountDownLatch start = new CountDownLatch(1);
+    List<Future<?>> workers = new ArrayList<>();
+    for (int i = 0; i < 16; i++) {
+      workers.add(
+          requests.submit(
+              () -> {
+                start.await();
+                for (int j = 0; j < 20; j++) {
+                  provider.login("jdoe", "s3cret");
+                }
+                return null;
+              }));
+    }
+
+    start.countDown();
+
+    for (Future<?> worker : workers) {
+      worker.get(60, TimeUnit.SECONDS);
+    }
     verify(directory, times(1)).authenticate("jdoe", "s3cret");
   }
 
   @Test
   public void newPasswordReplacesTheOldOne() throws Exception {
-    rememberAcceptedPasswords();
+    useTheDirectory();
     when(directory.authenticate("jdoe", "old")).thenReturn(true, false);
     when(directory.authenticate("jdoe", "new")).thenReturn(true);
 
@@ -261,7 +584,7 @@ public class OidcLoginProviderTest {
 
   @Test
   public void anotherUserCannotUseARememberedPassword() throws Exception {
-    rememberAcceptedPasswords();
+    useTheDirectory();
     account("other", true, gerrit("other"));
     when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
 
@@ -273,7 +596,7 @@ public class OidcLoginProviderTest {
 
   @Test
   public void rememberedPasswordWorksThroughADirectoryOutageUntilItExpires() throws Exception {
-    rememberAcceptedPasswords();
+    useTheDirectory();
     when(directory.authenticate("jdoe", "s3cret"))
         .thenReturn(true)
         .thenThrow(new AuthenticationUnavailableException("down", new IOException()));
@@ -289,7 +612,7 @@ public class OidcLoginProviderTest {
 
   @Test
   public void passwordsBcryptWouldConfuseAreToldApart() throws Exception {
-    rememberAcceptedPasswords();
+    useTheDirectory();
     String longPassword = "x".repeat(100);
     when(directory.authenticate("jdoe", longPassword + "a")).thenReturn(true);
     when(directory.authenticate("jdoe", "ABC")).thenReturn(true);
@@ -302,35 +625,86 @@ public class OidcLoginProviderTest {
 
   @Test
   public void recordsAreSaltedAndUselessToAnotherProcess() throws Exception {
-    rememberAcceptedPasswords();
-    AcceptedPasswords accepted = new AcceptedPasswords(records);
+    useTheDirectory();
 
-    accepted.add("jdoe", "s3cret");
-    String first = records.getIfPresent("jdoe").encode();
-    accepted.add("jdoe", "s3cret");
-    String second = records.getIfPresent("jdoe").encode();
+    memory.remember("jdoe", "s3cret", Answer.ACCEPTED);
+    String first = accepted.getIfPresent("jdoe").encode();
+    memory.remember("jdoe", "s3cret", Answer.ACCEPTED);
+    String second = accepted.getIfPresent("jdoe").encode();
 
     assertThat(first).startsWith("bcrypt0:");
     assertThat(first).isNotEqualTo(second);
-    assertThat(accepted.contains("jdoe", "s3cret")).isTrue();
-    assertThat(new AcceptedPasswords(records).contains("jdoe", "s3cret")).isFalse();
+    assertThat(memory.recall("jdoe", "s3cret")).isEqualTo(Optional.of(Answer.ACCEPTED));
+    assertThat(new PasswordMemory(accepted, rejected, unavailable).recall("jdoe", "s3cret"))
+        .isEqualTo(Optional.empty());
   }
 
-  private void rememberAcceptedPasswords() {
+  private void useTheDirectory() {
     account("jdoe", true, gerrit("jdoe"));
     directory = mock(LdapPasswordAuthenticator.class);
-    records =
-        CacheBuilder.newBuilder()
-            .expireAfterWrite(Duration.ofMinutes(1))
-            .ticker(
-                new Ticker() {
-                  @Override
-                  public long read() {
-                    return nanos.get();
-                  }
-                })
-            .build();
-    passwords = new OidcLoginProvider.LdapPasswords(directory, new AcceptedPasswords(records));
+    accepted = cache(PasswordMemory.ACCEPTED_LIFETIME);
+    rejected = cache(PasswordMemory.REJECTED_LIFETIME);
+    unavailable = cache(PasswordMemory.UNAVAILABLE_LIFETIME);
+    memory = new PasswordMemory(accepted, rejected, unavailable);
+    // Long enough that only tests about the wait ever reach it.
+    passwords = new LdapPasswords(directory, memory, Duration.ofMinutes(1));
+  }
+
+  private Cache<String, HashedPassword> cache(Duration lifetime) {
+    return CacheBuilder.newBuilder()
+        .expireAfterWrite(lifetime)
+        .ticker(
+            new Ticker() {
+              @Override
+              public long read() {
+                return nanos.get();
+              }
+            })
+        .build();
+  }
+
+  private static class Gate {
+    final CountDownLatch asked = new CountDownLatch(1);
+    final CountDownLatch answer = new CountDownLatch(1);
+  }
+
+  private interface DirectoryAnswer {
+    boolean get() throws Exception;
+  }
+
+  private Gate holdDirectory(String username, String password, DirectoryAnswer directoryAnswer)
+      throws Exception {
+    Gate gate = new Gate();
+    when(directory.authenticate(username, password))
+        .thenAnswer(
+            invocation -> {
+              gate.asked.countDown();
+              assertThat(gate.answer.await(20, TimeUnit.SECONDS)).isTrue();
+              return directoryAnswer.get();
+            });
+    return gate;
+  }
+
+  /** Waits for the check holding the directory and the requests waiting for it to be asleep. */
+  private void waitForParkedRequests(int count) throws Exception {
+    long giveUp = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+    while (requestThreads.stream().filter(t -> t.getState() == State.TIMED_WAITING).count()
+        < count) {
+      assertThat(System.nanoTime() - giveUp).isLessThan(0L);
+      Thread.sleep(5);
+    }
+  }
+
+  private List<Future<OAuthUserInfo>> loginsDuring(
+      Gate gate, OidcLoginProvider provider, String username, String password) throws Exception {
+    List<Future<OAuthUserInfo>> logins = new ArrayList<>();
+    for (int i = 0; i < 8; i++) {
+      logins.add(requests.submit(() -> provider.login(username, password)));
+    }
+    gate.asked.await();
+    waitForParkedRequests(logins.size());
+    gate.answer.countDown();
+    return logins;
   }
 
   private void advance(Duration duration) {

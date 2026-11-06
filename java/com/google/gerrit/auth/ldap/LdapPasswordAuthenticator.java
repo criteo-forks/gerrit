@@ -25,6 +25,7 @@ import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import java.io.IOException;
 import java.util.Locale;
+import javax.naming.AuthenticationException;
 import javax.naming.NamingException;
 import javax.naming.directory.DirContext;
 import javax.security.auth.login.LoginException;
@@ -57,7 +58,8 @@ public class LdapPasswordAuthenticator {
    * Returns whether {@code password} binds as the directory account of {@code username}. An empty
    * password never matches: many directories accept it as an anonymous bind.
    *
-   * @throws AuthenticationUnavailableException when the directory cannot be queried
+   * @throws AuthenticationUnavailableException when the directory cannot be queried, or fails the
+   *     bind for any reason other than invalid credentials
    */
   public boolean authenticate(String username, String password)
       throws AuthenticationUnavailableException {
@@ -76,14 +78,24 @@ public class LdapPasswordAuthenticator {
       } finally {
         helper.close(ctx);
       }
-    } catch (NoSuchUserException | AuthenticationFailedException e) {
+    } catch (NoSuchUserException e) {
       return false;
+    } catch (AuthenticationFailedException e) {
+      // Helper reports every failed bind this way; only this cause is the directory saying no.
+      if (e.getCause() instanceof AuthenticationException) {
+        return false;
+      }
+      throw unavailable(username, e);
     } catch (AccountException e) {
       logger.atWarning().withCause(e).log("Cannot check the LDAP password of %s", username);
       return false;
     } catch (IOException | NamingException | LoginException e) {
-      logger.atSevere().withCause(e).log("Cannot query LDAP to authenticate %s", username);
-      throw new AuthenticationUnavailableException("Cannot query LDAP for account", e);
+      throw unavailable(username, e);
     }
+  }
+
+  private static AuthenticationUnavailableException unavailable(String username, Exception e) {
+    logger.atSevere().withCause(e).log("Cannot query LDAP to authenticate %s", username);
+    return new AuthenticationUnavailableException("Cannot query LDAP for account", e);
   }
 }

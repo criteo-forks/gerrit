@@ -63,8 +63,25 @@ plugin.@PLUGIN@.ldapPasswords
 	password, checked against the `ldap` section. Only applies when
 	`auth.type` is `OAUTH` and `ldap.server` is set. Defaults to `true`.
 
-	Accepted passwords are cached for one minute per server, so a changed or
-	disabled password may work for that long. Other passwords are checked
-	against the directory. Only a keyed, salted bcrypt hash is kept in memory.
-	Set `maxAge` in `[cache "oidc.ldap_password_checks"]` to change the
-	lifetime, or `memoryLimit = 0` to disable the cache.
+	Each server remembers the directory's last answers, per user, in these
+	caches:
+
+	* `oidc.ldap_password_checks`: the accepted password, for one minute. A
+	  changed or disabled password may work for that long.
+	* `oidc.ldap_password_rejections`: up to four rejected passwords, for one
+	  minute each. A password that becomes valid may fail for that long. Any
+	  other password goes to the directory at once, and counts towards lockout.
+	* `oidc.ldap_password_unavailable`: up to four passwords being checked when
+	  the directory failed, for five seconds each.
+
+	Only a keyed, salted bcrypt hash is kept in memory. Set `maxAge` in
+	`[cache "<name>"]` to change a lifetime, or `memoryLimit = 0` to disable a
+	cache.
+
+	Only one check of a given username and password runs at a time. Other
+	requests for that pair wait for its answer until two seconds after it began,
+	then fail as if the directory were unavailable.
+
+	These checks never use `ldap.useConnectionPooling`, because a pooled
+	connection can skip the bind that proves a password. `ldap.readTimeout` and
+	`ldap.connectTimeout` default to 10 seconds here.

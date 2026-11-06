@@ -43,8 +43,8 @@ public class Module extends AbstractModule {
         .to(OidcLoginProvider.class);
     if (ldapPasswords) {
       install(new LdapPasswordModule());
-      install(AcceptedPasswords.module());
-      bind(OidcLoginProvider.Passwords.class).to(OidcLoginProvider.LdapPasswords.class);
+      install(PasswordMemory.module());
+      bind(OidcLoginProvider.Passwords.class).to(LdapPasswords.class);
     }
   }
 }

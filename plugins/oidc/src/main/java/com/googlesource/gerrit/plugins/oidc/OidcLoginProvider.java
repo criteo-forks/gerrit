@@ -15,7 +15,6 @@
 package com.googlesource.gerrit.plugins.oidc;
 
 import com.google.common.base.Strings;
-import com.google.gerrit.auth.ldap.LdapPasswordAuthenticator;
 import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.extensions.auth.oauth.OAuthLoginProvider;
@@ -56,30 +55,6 @@ class OidcLoginProvider implements OAuthLoginProvider {
     @Override
     public boolean check(String username, String password) {
       return false;
-    }
-  }
-
-  static class LdapPasswords implements Passwords {
-    private final LdapPasswordAuthenticator ldap;
-    private final AcceptedPasswords accepted;
-
-    @Inject
-    LdapPasswords(LdapPasswordAuthenticator ldap, AcceptedPasswords accepted) {
-      this.ldap = ldap;
-      this.accepted = accepted;
-    }
-
-    @Override
-    public boolean check(String username, String password)
-        throws AuthenticationUnavailableException {
-      if (accepted.contains(username, password)) {
-        return true;
-      }
-      if (!ldap.authenticate(username, password)) {
-        return false;
-      }
-      accepted.add(username, password);
-      return true;
     }
   }
 
