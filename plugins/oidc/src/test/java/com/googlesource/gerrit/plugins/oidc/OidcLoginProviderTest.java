@@ -24,23 +24,31 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.common.base.Ticker;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
+import com.google.gerrit.auth.ldap.LdapPasswordAuthenticator;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.extensions.auth.oauth.OAuthUserInfo;
 import com.google.gerrit.index.query.Predicate;
 import com.google.gerrit.server.account.AccountCache;
 import com.google.gerrit.server.account.AccountState;
 import com.google.gerrit.server.account.AuthTokenVerifier;
+import com.google.gerrit.server.account.HashedPassword;
 import com.google.gerrit.server.account.externalids.ExternalId;
 import com.google.gerrit.server.auth.AuthenticationUnavailableException;
 import com.google.gerrit.server.config.AuthConfig;
 import com.google.gerrit.server.query.account.InternalAccountQuery;
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import org.eclipse.jgit.lib.Config;
 import org.junit.Before;
 import org.junit.Test;
@@ -55,6 +63,9 @@ public class OidcLoginProviderTest {
   private AuthTokenVerifier authTokens;
   private AuthConfig authConfig;
   private OidcLoginProvider.Passwords passwords;
+  private LdapPasswordAuthenticator directory;
+  private Cache<String, HashedPassword> records;
+  private final AtomicLong nanos = new AtomicLong();
 
   @Before
   public void setUp() throws Exception {
@@ -193,6 +204,137 @@ public class OidcLoginProviderTest {
 
     IOException e = assertThrows(IOException.class, () -> provider(true).login("jdoe", "s3cret"));
     assertThat(e).hasCauseThat().isInstanceOf(AuthenticationUnavailableException.class);
+  }
+
+  @Test
+  public void acceptedPasswordIsNotCheckedAgainWithinAMinute() throws Exception {
+    rememberAcceptedPasswords();
+    when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
+
+    for (int i = 0; i < 5; i++) {
+      assertThat(provider(true).login("jdoe", "s3cret").getExternalId()).isEqualTo("gerrit:jdoe");
+    }
+
+    verify(directory, times(1)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void usingARememberedPasswordDoesNotExtendItsLife() throws Exception {
+    rememberAcceptedPasswords();
+    when(directory.authenticate("jdoe", "s3cret")).thenReturn(true, false);
+
+    provider(true).login("jdoe", "s3cret");
+    advance(Duration.ofSeconds(40));
+    provider(true).login("jdoe", "s3cret");
+    advance(Duration.ofSeconds(40));
+
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "s3cret"));
+    verify(directory, times(2)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void wrongPasswordsAlwaysReachTheDirectory() throws Exception {
+    rememberAcceptedPasswords();
+    when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
+
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "wrong"));
+    provider(true).login("jdoe", "s3cret");
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "wrong"));
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "wrong"));
+    provider(true).login("jdoe", "s3cret");
+
+    verify(directory, times(3)).authenticate("jdoe", "wrong");
+    verify(directory, times(1)).authenticate("jdoe", "s3cret");
+  }
+
+  @Test
+  public void newPasswordReplacesTheOldOne() throws Exception {
+    rememberAcceptedPasswords();
+    when(directory.authenticate("jdoe", "old")).thenReturn(true, false);
+    when(directory.authenticate("jdoe", "new")).thenReturn(true);
+
+    provider(true).login("jdoe", "old");
+    provider(true).login("jdoe", "new");
+
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "old"));
+  }
+
+  @Test
+  public void anotherUserCannotUseARememberedPassword() throws Exception {
+    rememberAcceptedPasswords();
+    account("other", true, gerrit("other"));
+    when(directory.authenticate("jdoe", "s3cret")).thenReturn(true);
+
+    provider(true).login("jdoe", "s3cret");
+
+    assertThrows(IOException.class, () -> provider(true).login("other", "s3cret"));
+    verify(directory).authenticate("other", "s3cret");
+  }
+
+  @Test
+  public void rememberedPasswordWorksThroughADirectoryOutageUntilItExpires() throws Exception {
+    rememberAcceptedPasswords();
+    when(directory.authenticate("jdoe", "s3cret"))
+        .thenReturn(true)
+        .thenThrow(new AuthenticationUnavailableException("down", new IOException()));
+
+    provider(true).login("jdoe", "s3cret");
+    advance(Duration.ofSeconds(59));
+    provider(true).login("jdoe", "s3cret");
+    advance(Duration.ofSeconds(2));
+
+    IOException e = assertThrows(IOException.class, () -> provider(true).login("jdoe", "s3cret"));
+    assertThat(e).hasCauseThat().isInstanceOf(AuthenticationUnavailableException.class);
+  }
+
+  @Test
+  public void passwordsBcryptWouldConfuseAreToldApart() throws Exception {
+    rememberAcceptedPasswords();
+    String longPassword = "x".repeat(100);
+    when(directory.authenticate("jdoe", longPassword + "a")).thenReturn(true);
+    when(directory.authenticate("jdoe", "ABC")).thenReturn(true);
+
+    provider(true).login("jdoe", longPassword + "a");
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", longPassword + "b"));
+    provider(true).login("jdoe", "ABC");
+    assertThrows(IOException.class, () -> provider(true).login("jdoe", "ABCABC"));
+  }
+
+  @Test
+  public void recordsAreSaltedAndUselessToAnotherProcess() throws Exception {
+    rememberAcceptedPasswords();
+    AcceptedPasswords accepted = new AcceptedPasswords(records);
+
+    accepted.add("jdoe", "s3cret");
+    String first = records.getIfPresent("jdoe").encode();
+    accepted.add("jdoe", "s3cret");
+    String second = records.getIfPresent("jdoe").encode();
+
+    assertThat(first).startsWith("bcrypt0:");
+    assertThat(first).isNotEqualTo(second);
+    assertThat(accepted.contains("jdoe", "s3cret")).isTrue();
+    assertThat(new AcceptedPasswords(records).contains("jdoe", "s3cret")).isFalse();
+  }
+
+  private void rememberAcceptedPasswords() {
+    account("jdoe", true, gerrit("jdoe"));
+    directory = mock(LdapPasswordAuthenticator.class);
+    records =
+        CacheBuilder.newBuilder()
+            .expireAfterWrite(Duration.ofMinutes(1))
+            .ticker(
+                new Ticker() {
+                  @Override
+                  public long read() {
+                    return nanos.get();
+                  }
+                })
+            .build();
+    passwords = new OidcLoginProvider.LdapPasswords(directory, new AcceptedPasswords(records));
+  }
+
+  private void advance(Duration duration) {
+    nanos.addAndGet(duration.toNanos());
   }
 
   private OidcLoginProvider provider(boolean acceptsAuthTokens) {

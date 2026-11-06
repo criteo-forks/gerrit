@@ -62,3 +62,9 @@ plugin.@PLUGIN@.ldapPasswords
 :	Whether Git and REST requests may authenticate with the user's LDAP
 	password, checked against the `ldap` section. Only applies when
 	`auth.type` is `OAUTH` and `ldap.server` is set. Defaults to `true`.
+
+	Accepted passwords are cached for one minute per server, so a changed or
+	disabled password may work for that long. Other passwords are checked
+	against the directory. Only a keyed, salted bcrypt hash is kept in memory.
+	Set `maxAge` in `[cache "oidc.ldap_password_checks"]` to change the
+	lifetime, or `memoryLimit = 0` to disable the cache.

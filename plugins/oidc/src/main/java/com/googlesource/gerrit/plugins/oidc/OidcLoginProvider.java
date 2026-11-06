@@ -61,16 +61,25 @@ class OidcLoginProvider implements OAuthLoginProvider {
 
   static class LdapPasswords implements Passwords {
     private final LdapPasswordAuthenticator ldap;
+    private final AcceptedPasswords accepted;
 
     @Inject
-    LdapPasswords(LdapPasswordAuthenticator ldap) {
+    LdapPasswords(LdapPasswordAuthenticator ldap, AcceptedPasswords accepted) {
       this.ldap = ldap;
+      this.accepted = accepted;
     }
 
     @Override
     public boolean check(String username, String password)
         throws AuthenticationUnavailableException {
-      return ldap.authenticate(username, password);
+      if (accepted.contains(username, password)) {
+        return true;
+      }
+      if (!ldap.authenticate(username, password)) {
+        return false;
+      }
+      accepted.add(username, password);
+      return true;
     }
   }
 
