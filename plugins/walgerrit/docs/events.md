@@ -31,6 +31,10 @@ context. The dispatcher applies its normal listener visibility checks.
 identity includes the host name; stable, distinct host names preserve origin filtering across
 restarts. Nodes sharing a host name will treat one another's events as local.
 
+Events a plugin relayed from another Gerrit through `EventLog.relay` travel in
+`relayed_event_json` and are never replayed; only event-log readers see them (see
+[Reading the event log](event-log.md)).
+
 Replay failures are logged and skipped, allowing the cursor to advance. A crash after delivery
 but before cursor persistence can cause duplicate delivery. A full index rebuild seeds cursors
 at captured heads and skips older notifications; it does not reconstruct them from Git.

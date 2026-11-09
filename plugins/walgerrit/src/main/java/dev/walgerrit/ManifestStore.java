@@ -377,6 +377,7 @@ final class ManifestStore {
         requireExactRefRevision,
         refTransaction,
         List.of(),
+        false,
         null,
         false,
         null,
@@ -406,6 +407,7 @@ final class ManifestStore {
         false,
         null,
         List.of(),
+        false,
         null,
         false,
         new NamespaceFence(operation, delete),
@@ -438,7 +440,32 @@ final class ManifestStore {
         false,
         null,
         eventJson,
+        false,
         indexUpdate,
+        false,
+        null,
+        UNFENCED,
+        (s, id) -> {});
+  }
+
+  /**
+   * Appends an EVENT entry carrying events another Gerrit fired, relayed for event-log readers
+   * such as a Kafka publisher. No node replays them into its event dispatcher: they describe
+   * nothing that happened on this cluster, so this cluster's listeners must not act on them.
+   */
+  Manifest publishRelayed(List<String> eventJson) throws IOException {
+    if (eventJson.isEmpty()) {
+      return current();
+    }
+    return publish(
+        0,
+        List.of(),
+        List.of(),
+        false,
+        null,
+        eventJson,
+        true,
+        null,
         false,
         null,
         UNFENCED,
@@ -452,6 +479,7 @@ final class ManifestStore {
       boolean requireExactRefRevision,
       RefTransaction refTransaction,
       List<String> eventJson,
+      boolean relayed,
       @Nullable IndexUpdate indexUpdate,
       boolean recoveryFence,
       @Nullable NamespaceFence namespaceFence,
@@ -512,12 +540,16 @@ final class ManifestStore {
                       ? LogEntry.Kind.FENCE
                       : entryKind(supersedes, requireExactRefRevision, eventJson, indexUpdate))
               .addAllSupersedes(supersedes)
-              .addAllEventJson(eventJson)
               .setCreatedAtEpochMillis(now)
               .setWriter(writer)
               .setBaseRevision(current.getRevision())
               .setTransactionId(transactionId)
               .setPreviousTransactionId(current.getHeadTransactionId());
+      if (relayed) {
+        entry.addAllRelayedEventJson(eventJson);
+      } else {
+        entry.addAllEventJson(eventJson);
+      }
       if (refTransaction != null) {
         entry.setRefTransaction(refTransaction);
       }
@@ -615,6 +647,7 @@ final class ManifestStore {
               false,
               null,
               List.of(),
+              false,
               null,
               true,
               null,

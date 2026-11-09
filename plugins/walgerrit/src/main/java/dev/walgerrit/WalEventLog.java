@@ -14,6 +14,7 @@
 
 package dev.walgerrit;
 
+import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
@@ -101,16 +102,38 @@ final class WalEventLog implements EventLog {
     }
     List<Entry> entries = new ArrayList<>();
     for (LogEntry entry : read) {
-      if (entry.getEventJsonCount() > 0) {
+      if (entry.getEventJsonCount() > 0 || entry.getRelayedEventJsonCount() > 0) {
+        List<String> events = new ArrayList<>(entry.getEventJsonList());
+        events.addAll(entry.getRelayedEventJsonList());
         entries.add(
             new Entry(
                 new Position(entry.getSeq(), entry.getTransactionId()),
                 entry.getCreatedAtEpochMillis(),
                 entry.getWriter(),
-                List.copyOf(entry.getEventJsonList())));
+                List.copyOf(events)));
       }
     }
     return new Entries(repositoryId, nameOf(id), List.copyOf(entries), head(versioned));
+  }
+
+  @Override
+  public boolean relay(String projectName, List<String> eventsJson) throws IOException {
+    if (eventsJson.isEmpty()) {
+      return true;
+    }
+    Optional<ManifestStore> store = repositories.manifestStoreFor(Project.nameKey(projectName));
+    if (store.isEmpty()) {
+      return false;
+    }
+    try {
+      store.get().publishRelayed(List.copyOf(eventsJson));
+    } catch (AmbiguousPublicationException unknown) {
+      // Settled from the log as the journal does: an entry that landed is done.
+      if (!store.get().resolvePublication(unknown.sequence(), unknown.transactionId()).landed()) {
+        throw unknown;
+      }
+    }
+    return true;
   }
 
   @Override

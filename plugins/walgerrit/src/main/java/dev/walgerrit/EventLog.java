@@ -27,7 +27,8 @@ import java.util.function.Consumer;
  * them elsewhere. Bound in the system injector by {@link WalGitIndexModule}.
  *
  * <p>Each repository's log holds every Gerrit event fired by any node, once, in the order that
- * node fired them, as the JSON {@code stream-events} prints. Log entries are never deleted, so a
+ * node fired them, as the JSON {@code stream-events} prints, and any events a plugin {@link
+ * #relay relayed} from another Gerrit. Log entries are never deleted, so a
  * reader that falls behind loses nothing. A reader keeps a {@link Cursor} per repository in the
  * shared store and moves it after it has dealt with the entries before it; a reader that runs on
  * several nodes elects one holder with a {@link Lease} of the same name, and the compare-and-swap
@@ -164,6 +165,20 @@ public interface EventLog {
 
   /** Who holds {@code reader}'s lease now ({@code host:pid}), if anyone does. */
   Optional<String> leaseOwner(String reader) throws IOException;
+
+  /**
+   * Appends events another Gerrit fired to the log of the repository named {@code projectName},
+   * as one entry, for this log's readers: a node that follows another Gerrit relays the events it
+   * applied, so a publisher reading this log forwards them as if they had been fired here. No
+   * node delivers relayed events to its own event dispatcher, so stream-events subscribers,
+   * webhooks and other plugins never act on them. Returns once the entry is in the log.
+   *
+   * <p>A call whose outcome the store leaves unknown throws, and repeating it may relay the events
+   * twice; readers already tolerate duplicates.
+   *
+   * @return false when no active repository has that name, and nothing was written
+   */
+  boolean relay(String projectName, List<String> eventsJson) throws IOException;
 
   /**
    * Calls {@code listener} with a repository id when this node publishes to that repository, or a
