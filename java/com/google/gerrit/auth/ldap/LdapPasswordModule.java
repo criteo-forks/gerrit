@@ -15,7 +15,6 @@
 package com.google.gerrit.auth.ldap;
 
 import com.google.common.cache.Cache;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.gerrit.metrics.MetricMaker;
 import com.google.gerrit.server.cache.CacheModule;
@@ -33,6 +32,9 @@ import org.eclipse.jgit.lib.Config;
  * {@link LdapModule}, which already binds the LDAP helper and its cache.
  */
 public class LdapPasswordModule extends CacheModule {
+  private static final ImmutableSet<String> TIMEOUTS =
+      ImmutableSet.of("readTimeout", "connectTimeout");
+
   @Override
   protected void configure() {
     cache(LdapModule.PARENT_GROUPS_CACHE, String.class, new TypeLiteral<ImmutableSet<String>>() {})
@@ -49,16 +51,30 @@ public class LdapPasswordModule extends CacheModule {
     return new Helper(passwordCheckConfig(config), parentGroups, metricMaker);
   }
 
+  /** Reads every setting from {@code config}; {@code new Config(config)} misses secure.config. */
   private static Config passwordCheckConfig(Config config) {
-    Config checks = new Config(config);
-    // A pooled connection can skip the bind that proves a password, and its pool key holds it.
-    checks.setBoolean("ldap", null, "useConnectionPooling", false);
-    // Helper applies no timeout unless one is set, and a hung check must end.
-    for (String timeout : ImmutableList.of("readTimeout", "connectTimeout")) {
-      if (checks.getString("ldap", null, timeout) == null) {
-        checks.setString("ldap", null, timeout, "10 s");
+    return new Config() {
+      @Override
+      public String getString(String section, String subsection, String name) {
+        String value = config.getString(section, subsection, name);
+        if (!"ldap".equalsIgnoreCase(section) || subsection != null) {
+          return value;
+        }
+        // A pooled connection can skip the bind that proves a password, and its pool key holds it.
+        if ("useConnectionPooling".equalsIgnoreCase(name)) {
+          return "false";
+        }
+        // Helper applies no timeout unless one is set, and a hung check must end.
+        if (value == null && TIMEOUTS.contains(name)) {
+          return "10 s";
+        }
+        return value;
       }
-    }
-    return checks;
+
+      @Override
+      public String[] getStringList(String section, String subsection, String name) {
+        return config.getStringList(section, subsection, name);
+      }
+    };
   }
 }

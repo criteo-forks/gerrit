@@ -19,6 +19,10 @@ import static org.junit.Assert.assertThrows;
 
 import com.google.gerrit.extensions.annotations.PluginName;
 import com.google.gerrit.server.auth.AuthenticationUnavailableException;
+import com.google.gerrit.server.config.GerritServerConfigProvider;
+import com.google.gerrit.server.config.SitePaths;
+import com.google.gerrit.server.securestore.SecureStore;
+import com.google.gerrit.server.securestore.testing.InMemorySecureStore;
 import com.google.gerrit.testing.InMemoryModule;
 import com.google.inject.AbstractModule;
 import com.google.inject.Guice;
@@ -35,10 +39,14 @@ import java.util.concurrent.TimeUnit;
 import org.eclipse.jgit.lib.Config;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 /** The plugin's real wiring and JNDI, against a directory listening on a socket. */
 public class LdapPasswordsTest {
+  @Rule public final TemporaryFolder site = new TemporaryFolder();
+
   private FakeDirectory directory;
   private final ExecutorService requests = Executors.newCachedThreadPool();
 
@@ -68,6 +76,26 @@ public class LdapPasswordsTest {
     assertThat(passwords.check("jdoe", "s3cret")).isTrue();
 
     assertThat(directory.userBindCount()).isEqualTo(1);
+  }
+
+  @Test
+  public void serviceAccountCanComeFromSecureConfig() throws Exception {
+    InMemorySecureStore secureConfig = new InMemorySecureStore();
+    secureConfig.set("ldap", null, "username", FakeDirectory.SERVICE_DN);
+    secureConfig.set("ldap", null, "password", FakeDirectory.SERVICE_PASSWORD);
+
+    assertThat(passwords(siteConfig(secureConfig)).check("jdoe", "s3cret")).isTrue();
+  }
+
+  @Test
+  public void wrongServicePasswordIsUnavailable() throws Exception {
+    Config cfg = new Config();
+    cfg.setString("ldap", null, "username", FakeDirectory.SERVICE_DN);
+    cfg.setString("ldap", null, "password", "wrong");
+    OidcLoginProvider.Passwords passwords = passwords(cfg);
+
+    assertThrows(AuthenticationUnavailableException.class, () -> passwords.check("jdoe", "s3cret"));
+    assertThat(directory.userBindCount()).isEqualTo(0);
   }
 
   @Test
@@ -265,6 +293,20 @@ public class LdapPasswordsTest {
     return cfg;
   }
 
+  private Config siteConfig(SecureStore secureStore) throws Exception {
+    SitePaths sitePaths = new SitePaths(site.getRoot().toPath());
+    return Guice.createInjector(
+            new AbstractModule() {
+              @Override
+              protected void configure() {
+                bind(SitePaths.class).toInstance(sitePaths);
+                bind(SecureStore.class).toInstance(secureStore);
+              }
+            })
+        .getInstance(GerritServerConfigProvider.class)
+        .get();
+  }
+
   private OidcLoginProvider.Passwords passwords(Config cfg) {
     return injector(cfg).getInstance(OidcLoginProvider.Passwords.class);
   }
@@ -273,8 +315,10 @@ public class LdapPasswordsTest {
     cfg.setString("auth", null, "type", "OAUTH");
     cfg.setString("ldap", null, "server", directory.url());
     cfg.setString("ldap", null, "accountBase", FakeDirectory.ACCOUNT_BASE);
-    cfg.setString("ldap", null, "username", "cn=svc-gerrit,dc=example");
-    cfg.setString("ldap", null, "password", "service-password");
+    if (cfg.getString("ldap", null, "username") == null) {
+      cfg.setString("ldap", null, "username", FakeDirectory.SERVICE_DN);
+      cfg.setString("ldap", null, "password", FakeDirectory.SERVICE_PASSWORD);
+    }
     return Guice.createInjector(
         new InMemoryModule(cfg),
         new AbstractModule() {

@@ -49,6 +49,7 @@ java_library(
     exports = PLUGIN_DEPS + PLUGIN_TEST_DEPS + [
         ":oidc__plugin",
         "//java/com/google/gerrit/auth",
+        "//java/com/google/gerrit/server/securestore/testing",
         "//lib/mockito",
     ],
 )

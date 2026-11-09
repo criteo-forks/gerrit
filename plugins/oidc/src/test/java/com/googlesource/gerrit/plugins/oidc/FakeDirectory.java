@@ -29,9 +29,12 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** An LDAP server on a loopback port, speaking just enough of the protocol for a password check. */
+/**
+ * An LDAP server on a loopback port, speaking just enough of the protocol for a password check.
+ * Like Active Directory, it answers searches only after the service account binds.
+ */
 class FakeDirectory implements AutoCloseable {
-  /** How the directory treats a bind as a user; the service account's binds always work. */
+  /** How the directory treats a bind as a user. */
   enum UserBinds {
     ANSWER,
     DROP_CONNECTION,
@@ -40,6 +43,8 @@ class FakeDirectory implements AutoCloseable {
   }
 
   static final String ACCOUNT_BASE = "ou=people,dc=example";
+  static final String SERVICE_DN = "cn=svc-gerrit,dc=example";
+  static final String SERVICE_PASSWORD = "service-password";
 
   private static final int SEQUENCE = 0x30;
   private static final int INTEGER = 0x02;
@@ -52,6 +57,7 @@ class FakeDirectory implements AutoCloseable {
   private static final int SEARCH_ENTRY = 0x64;
   private static final int SEARCH_DONE = 0x65;
   private static final int SUCCESS = 0;
+  private static final int OPERATIONS_ERROR = 1;
   private static final int INVALID_CREDENTIALS = 49;
   private static final int BUSY = 51;
 
@@ -106,7 +112,8 @@ class FakeDirectory implements AutoCloseable {
     try (Socket c = connection) {
       DataInputStream in = new DataInputStream(c.getInputStream());
       OutputStream out = c.getOutputStream();
-      while (handle(in, out)) {
+      Session session = new Session();
+      while (handle(session, in, out)) {
         out.flush();
       }
     } catch (IOException clientLeft) {
@@ -116,15 +123,19 @@ class FakeDirectory implements AutoCloseable {
     }
   }
 
+  private static class Session {
+    boolean serviceBound;
+  }
+
   /** Answers one request, returning whether to keep the connection. */
-  private boolean handle(DataInputStream in, OutputStream out) throws IOException {
+  private boolean handle(Session session, DataInputStream in, OutputStream out) throws IOException {
     DataInputStream message = contentOf(read(in));
     Element id = read(message);
     Element operation = read(message);
     return switch (operation.tag()) {
-      case BIND_REQUEST -> bind(operation, id, out);
+      case BIND_REQUEST -> bind(session, operation, id, out);
       case SEARCH_REQUEST -> {
-        search(operation, id, out);
+        search(session, operation, id, out);
         yield true;
       }
       case UNBIND_REQUEST -> false;
@@ -132,7 +143,8 @@ class FakeDirectory implements AutoCloseable {
     };
   }
 
-  private boolean bind(Element request, Element id, OutputStream out) throws IOException {
+  private boolean bind(Session session, Element request, Element id, OutputStream out)
+      throws IOException {
     DataInputStream fields = contentOf(request);
     read(fields); // version
     String name = text(read(fields));
@@ -151,13 +163,24 @@ class FakeDirectory implements AutoCloseable {
           userBinds == UserBinds.BUSY
               ? BUSY
               : password.equals(passwords.get(username)) ? SUCCESS : INVALID_CREDENTIALS;
+    } else if (!name.isEmpty()) {
+      result =
+          name.equals(SERVICE_DN) && password.equals(SERVICE_PASSWORD)
+              ? SUCCESS
+              : INVALID_CREDENTIALS;
     }
+    session.serviceBound = name.equals(SERVICE_DN) && result == SUCCESS;
     respond(out, id, element(BIND_RESPONSE, result(result)));
     return true;
   }
 
-  private void search(Element request, Element id, OutputStream out) throws IOException {
+  private void search(Session session, Element request, Element id, OutputStream out)
+      throws IOException {
     String base = text(read(contentOf(request)));
+    if (!session.serviceBound) {
+      respond(out, id, element(SEARCH_DONE, result(OPERATIONS_ERROR)));
+      return;
+    }
     if (base.isEmpty()) {
       respond(out, id, entry(""));
     } else {
