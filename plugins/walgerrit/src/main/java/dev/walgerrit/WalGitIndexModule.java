@@ -20,6 +20,7 @@ import com.google.gerrit.extensions.events.GroupIndexedListener;
 import com.google.gerrit.extensions.events.ProjectIndexedListener;
 import com.google.gerrit.extensions.registration.DynamicSet;
 import com.google.gerrit.lifecycle.LifecycleModule;
+import com.google.gerrit.server.RequestListener;
 import com.google.gerrit.server.events.EventListener;
 
 /** Installs WAL-driven secondary-index convergence in Gerrit's system injector. */
@@ -29,6 +30,7 @@ public final class WalGitIndexModule extends LifecycleModule {
     // Peers' wake-ups let the tailer replay a repository before its next sweep finds it.
     listener().to(GossipEndpoint.class);
     listener().to(IndexEventTailer.class);
+    DynamicSet.bind(binder(), RequestListener.class).to(IndexBarrier.class);
     // What this node does travels in the WAL to the other nodes' tailers: the events it fires and
     // the documents it reindexes with no ref update behind them.
     DynamicSet.bind(binder(), EventListener.class).to(WalJournal.class);

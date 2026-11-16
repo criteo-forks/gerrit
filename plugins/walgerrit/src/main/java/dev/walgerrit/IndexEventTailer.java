@@ -31,20 +31,30 @@ import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.RefUpdate;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.NavigableSet;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -63,7 +73,10 @@ import org.slf4j.LoggerFactory;
  * from the one this node last caught up to, so an unchanged repository costs nothing beyond its
  * share of the listing. A peer's wake-up (see {@link GossipEndpoint}) replays one repository ahead
  * of the sweep, on the same thread and through the same {@link #catchUp} path. One thread replays
- * at a time. Catalog replay blocks repository replay.
+ * at a time. Catalog replay blocks repository replay, and a rebuild blocks both.
+ *
+ * <p>Before a change lookup, {@link #awaitIndexed} waits for other nodes' repository writes to be
+ * indexed, subject to a timeout; see {@link IndexBarrier}.
  *
  * <p>A cursor that cannot be advanced by replay, because it is too far behind, ahead of a
  * rolled-back head, or names a transaction the manifest no longer does, makes the node rebuild all
@@ -98,13 +111,67 @@ final class IndexEventTailer implements LifecycleListener {
   /** Manifest version at which this node last confirmed each repository's cursor was at head. */
   private final Map<RepositoryId, String> caughtUpVersions = new ConcurrentHashMap<>();
 
+  /** Threads that read the store and replay for the requests waiting in {@link #awaitIndexed}. */
+  private static final int BARRIER_THREADS = 16;
+
+  /** Own publications remembered per repository ahead of its cursor. */
+  private static final int OWN_SEQUENCES_REMEMBERED = 4096;
+
+  /** What {@link #awaitIndexed} found or did. */
+  enum Indexed {
+    /** The index already held every entry other nodes wrote. */
+    NOT_BEHIND,
+    /** The index was behind, and a replay caught it up while the caller waited. */
+    REPLAYED,
+    /** The allowed time ran out first. */
+    TIMED_OUT,
+    /** Reading the store or replaying failed. */
+    FAILED,
+    /** Nothing was awaited. */
+    SKIPPED
+  }
+
+  private record Head(RepositoryId id, long sequence, boolean indexed) {}
+
+  /** A replay on another thread did not end within {@link #replayLockWait}. */
+  private static final class ReplayBusyException extends IOException {
+    private static final long serialVersionUID = 1L;
+
+    ReplayBusyException(String message) {
+      super(message);
+    }
+  }
+
+  /** Sequence of the last log entry applied per repository; what its cursor file holds. */
+  private final Map<RepositoryId, Long> appliedSequences = new ConcurrentHashMap<>();
+
+  /**
+   * Sequences this node published and its cursor has not passed, per repository. The request that
+   * published one indexes its own work, so a lookup on this node need not wait for their replay.
+   * Each set is guarded by its own monitor.
+   */
+  private final Map<RepositoryId, NavigableSet<Long>> ownSequences = new ConcurrentHashMap<>();
+
+  /** Replays running for waiting requests, at most one per repository. */
+  private final Map<RepositoryId, CompletableFuture<Void>> requestedReplays =
+      new ConcurrentHashMap<>();
+
+  private volatile ExecutorService barrierPool;
+  private volatile boolean rebuilding;
+
+  /** Longest a replay or a rebuild waits for the replays other threads are running. */
+  private volatile Duration replayLockWait = Duration.ofMinutes(1);
+
   /**
    * Held by the thread that replays or seeds cursors. Entries of different repositories can index
    * the same change, so replays of different repositories do not run side by side either.
    */
   private final ReentrantLock replayLock = new ReentrantLock();
 
-  /** Blocks repository replay during catalog replay so entries use reconciled repository names. */
+  /**
+   * Blocks repository replay during catalog replay, so entries use reconciled repository names,
+   * and every replay during a rebuild.
+   */
   private final ReadWriteLock namespaceLock = new ReentrantReadWriteLock();
 
   /** Repositories a peer's wake-up queued for replay that the tailer thread has not started. */
@@ -185,6 +252,7 @@ final class IndexEventTailer implements LifecycleListener {
     this.serverConfig = serverConfig;
     this.readiness = readiness;
     this.rebuilder = rebuilder;
+    repositories.storage().onPublication(this::notePublished);
   }
 
   @Override
@@ -209,6 +277,7 @@ final class IndexEventTailer implements LifecycleListener {
               });
       executor.scheduleWithFixedDelay(
           this::runBackgroundSweep, pollMillis, pollMillis, TimeUnit.MILLISECONDS);
+      barrierPool = newBarrierPool();
       readiness.markReady();
       logger.info(
           "WalGerrit index-event tailer is ready after synchronous catch-up; poll interval {}, "
@@ -220,6 +289,10 @@ final class IndexEventTailer implements LifecycleListener {
         executor.shutdownNow();
         executor = null;
       }
+      if (barrierPool != null) {
+        barrierPool.shutdownNow();
+        barrierPool = null;
+      }
       participating = false;
       readiness.markNotReady();
       throw new IllegalStateException(
@@ -230,6 +303,7 @@ final class IndexEventTailer implements LifecycleListener {
   @Override
   public void stop() {
     ScheduledExecutorService runningExecutor;
+    ExecutorService runningBarrierPool;
     synchronized (this) {
       if (!participating) {
         return;
@@ -238,18 +312,251 @@ final class IndexEventTailer implements LifecycleListener {
       readiness.markNotReady();
       runningExecutor = executor;
       executor = null;
+      runningBarrierPool = barrierPool;
+      barrierPool = null;
+    }
+    if (runningBarrierPool != null) {
+      // Running reads and replays finish; they are interrupted only if they outlast the wait below.
+      runningBarrierPool.shutdown();
     }
     if (runningExecutor == null) {
       return;
     }
     runningExecutor.shutdownNow();
     try {
-      if (!runningExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+      boolean stopped = runningExecutor.awaitTermination(10, TimeUnit.SECONDS);
+      if (runningBarrierPool != null
+          && !runningBarrierPool.awaitTermination(
+              Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+        runningBarrierPool.shutdownNow();
+        stopped = false;
+      }
+      if (!stopped) {
         logger.warn("WalGerrit index-event tailer did not stop within 10 seconds");
       }
     } catch (InterruptedException interrupted) {
+      if (runningBarrierPool != null) {
+        runningBarrierPool.shutdownNow();
+      }
       Thread.currentThread().interrupt();
     }
+  }
+
+  private static ExecutorService newBarrierPool() {
+    AtomicInteger threads = new AtomicInteger();
+    // No queue: requests skip the wait when all threads are busy.
+    return new ThreadPoolExecutor(
+        0,
+        BARRIER_THREADS,
+        30,
+        TimeUnit.SECONDS,
+        new SynchronousQueue<>(),
+        runnable -> {
+          Thread thread =
+              new Thread(runnable, "WalGerrit-Index-Barrier-" + threads.incrementAndGet());
+          thread.setDaemon(true);
+          return thread;
+        });
+  }
+
+  Duration indexBarrierTimeout() {
+    return repositories.configuration().indexBarrierTimeout();
+  }
+
+  /**
+   * Waits up to {@code timeout} for this node's indexes to hold the log entries other nodes
+   * published to {@code project}'s repository before the call. Entries this node published are
+   * not waited for.
+   *
+   * <p>The store is read and the log replayed on the barrier's threads. Callers for one repository
+   * share a replay, and a replay continues when its callers time out. Never throws.
+   */
+  Indexed awaitIndexed(Project.NameKey project, Duration timeout) {
+    ExecutorService pool = barrierPool;
+    if (pool == null || rebuilding) {
+      return Indexed.SKIPPED;
+    }
+    long deadline = System.nanoTime() + timeout.toNanos();
+    try {
+      Future<Head> reading = pool.submit(() -> head(project));
+      Head head = reading.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+      if (head == null) {
+        return Indexed.SKIPPED;
+      }
+      if (head.indexed()) {
+        return Indexed.NOT_BEHIND;
+      }
+      // A replay already running may have read the store before this caller did; the one after
+      // it has not.
+      for (int attempt = 0; attempt < 2; attempt++) {
+        CompletableFuture<Void> replay =
+            requestedReplays.computeIfAbsent(head.id(), id -> startReplay(pool, id));
+        if (replay == null) {
+          return Indexed.SKIPPED;
+        }
+        replay.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        // From memory only: this thread reads neither the store nor the cursor file.
+        Long applied = appliedSequences.get(head.id());
+        if (applied != null && indexed(head.id(), applied, head.sequence())) {
+          return Indexed.REPLAYED;
+        }
+      }
+      // Replay made no progress: the name is in flight, or the catalog is being replayed.
+      return Indexed.SKIPPED;
+    } catch (RejectedExecutionException busy) {
+      return Indexed.SKIPPED;
+    } catch (TimeoutException late) {
+      return Indexed.TIMED_OUT;
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      return Indexed.SKIPPED;
+    } catch (ExecutionException | RuntimeException failure) {
+      Throwable cause = failure instanceof ExecutionException ? failure.getCause() : failure;
+      if (cause instanceof IndexRebuildRequiredException) {
+        return Indexed.SKIPPED;
+      }
+      logger.warn(
+          "WalGerrit index barrier failed for {}; the request continues: {}",
+          project.get(),
+          String.valueOf(cause));
+      return Indexed.FAILED;
+    }
+  }
+
+  /**
+   * The head of the repository {@code project} is active under; null when it has none, or when
+   * this node has not replayed the catalog it knows.
+   */
+  private Head head(Project.NameKey project) throws IOException {
+    Optional<Binding> binding = repositories.catalog().resolve(project, false);
+    if (binding.filter(Binding::active).isEmpty()) {
+      return null;
+    }
+    // The catalog this node read the binding from; cached, since opening a repository refreshes it.
+    long catalog =
+        repositories.storage().manifestStore(RepositoryId.CATALOG).current().getHeadSeq();
+    if (appliedSequence(RepositoryId.CATALOG) < catalog) {
+      // Until the catalog, including this node's entries, is replayed, the index may hold the
+      // repository under another name.
+      wake(RepositoryId.CATALOG, null);
+      return null;
+    }
+    RepositoryId id = binding.get().id();
+    long sequence =
+        repositories.storage().manifestStore(id).refreshVersionedManifest().manifest().getHeadSeq();
+    return new Head(id, sequence, indexed(id, sequence));
+  }
+
+  /**
+   * Whether the indexes hold every entry up to {@code sequence} that another node wrote: the
+   * cursor reached it, or this node published every entry between the cursor and it.
+   */
+  private boolean indexed(RepositoryId id, long sequence) throws IOException {
+    return indexed(id, appliedSequence(id), sequence);
+  }
+
+  private boolean indexed(RepositoryId id, long applied, long sequence) {
+    if (applied >= sequence) {
+      return true;
+    }
+    NavigableSet<Long> own = ownSequences.get(id);
+    if (own == null) {
+      return false;
+    }
+    synchronized (own) {
+      return own.subSet(applied, false, sequence, true).size() == sequence - applied;
+    }
+  }
+
+  private long appliedSequence(RepositoryId id) throws IOException {
+    Long known = appliedSequences.get(id);
+    if (known != null) {
+      return known;
+    }
+    long stored =
+        new IndexCursorStore(repositories.storage().manifestStore(id).indexCursorPath())
+            .read()
+            .getSequence();
+    // Keep any later sequence recorded by replay.
+    Long raced = appliedSequences.putIfAbsent(id, stored);
+    return raced == null ? stored : raced;
+  }
+
+  /** Records that the cursor of {@code id} is at {@code sequence}; the replay lock is held. */
+  private void noteApplied(RepositoryId id, long sequence) {
+    appliedSequences.put(id, sequence);
+    NavigableSet<Long> own = ownSequences.get(id);
+    if (own != null) {
+      synchronized (own) {
+        own.headSet(sequence, true).clear();
+      }
+    }
+  }
+
+  /** Remembers the log entry this node just published as its own. */
+  private void notePublished(RepositoryId id, VersionedManifest published) {
+    Manifest manifest = published.manifest();
+    // After a lost response the manifest handed over can have a head another node wrote. Nothing
+    // is remembered while the tailer is not running.
+    if (barrierPool == null || foreignWriter.test(manifest.getWriter())) {
+      return;
+    }
+    NavigableSet<Long> own = ownSequences.computeIfAbsent(id, ignored -> new TreeSet<>());
+    synchronized (own) {
+      own.add(manifest.getHeadSeq());
+      if (own.size() > OWN_SEQUENCES_REMEMBERED) {
+        own.pollFirst();
+      }
+    }
+  }
+
+  /** Replays {@code id} unless the catalog is being replayed; requests do not wait for that. */
+  private void replayUnlessCatalogIs(RepositoryId id) throws IOException {
+    Lock namespace = namespaceLock.readLock();
+    try {
+      if (!namespace.tryLock(0, TimeUnit.SECONDS)) {
+        return;
+      }
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted before replaying " + id, interrupted);
+    }
+    try {
+      replayExclusively(id, null);
+    } finally {
+      namespace.unlock();
+    }
+  }
+
+  /** Replays {@code id} on a barrier thread; null when none is free. */
+  private CompletableFuture<Void> startReplay(ExecutorService pool, RepositoryId id) {
+    CompletableFuture<Void> done = new CompletableFuture<>();
+    try {
+      pool.execute(
+          () -> {
+            Throwable failure = null;
+            try {
+              replayUnlessCatalogIs(id);
+            } catch (IOException | RuntimeException thrown) {
+              failure = thrown;
+            } catch (Error fatal) {
+              failure = fatal;
+              throw fatal;
+            } finally {
+              // Remove the replay before allowing waiters to start another.
+              requestedReplays.remove(id, done);
+              if (failure == null) {
+                done.complete(null);
+              } else {
+                done.completeExceptionally(failure);
+              }
+            }
+          });
+    } catch (RejectedExecutionException busy) {
+      return null;
+    }
+    return done;
   }
 
   /**
@@ -276,6 +583,8 @@ final class IndexEventTailer implements LifecycleListener {
   private Map<RepositoryId, IndexRebuildRequiredException> sweep() throws IOException {
     NavigableMap<RepositoryId, String> heads = repositories.storage().listManifestVersions();
     caughtUpVersions.keySet().retainAll(heads.keySet());
+    appliedSequences.keySet().retainAll(heads.keySet());
+    ownSequences.keySet().retainAll(heads.keySet());
     Map<RepositoryId, IndexRebuildRequiredException> stale = new LinkedHashMap<>();
     Exception firstFailure = null;
     // The catalog first: a repository's entries are indexed under the name it has now, and that
@@ -293,6 +602,9 @@ final class IndexEventTailer implements LifecycleListener {
         catchUp(id, head.getValue());
       } catch (IndexRebuildRequiredException rebuildRequired) {
         stale.put(id, rebuildRequired);
+      } catch (ReplayBusyException busy) {
+        // Every other repository would wait as long.
+        throw busy;
       } catch (IOException | RuntimeException exception) {
         logger.error("WalGerrit index-event replay failed for {}", id, exception);
         if (firstFailure == null) {
@@ -339,7 +651,7 @@ final class IndexEventTailer implements LifecycleListener {
    */
   int catchUp(RepositoryId id, String listedVersion) throws IOException {
     Lock namespace = id.isCatalog() ? namespaceLock.writeLock() : namespaceLock.readLock();
-    lockForReplay(namespace, id);
+    lockForReplay(namespace, "replaying " + id);
     try {
       return replayExclusively(id, listedVersion);
     } finally {
@@ -358,16 +670,21 @@ final class IndexEventTailer implements LifecycleListener {
   }
 
   private ReentrantLock lockForReplay(RepositoryId id) throws IOException {
-    lockForReplay(replayLock, id);
+    lockForReplay(replayLock, "replaying " + id);
     return replayLock;
   }
 
-  private static void lockForReplay(Lock lock, RepositoryId id) throws IOException {
+  /** Waits up to {@link #replayLockWait} for {@code lock}; fails when it is not free by then. */
+  private void lockForReplay(Lock lock, String work) throws IOException {
+    Duration wait = replayLockWait;
     try {
-      lock.lockInterruptibly();
+      if (!lock.tryLock(wait.toNanos(), TimeUnit.NANOSECONDS)) {
+        throw new ReplayBusyException(
+            "Waited " + wait.toMillis() + " ms for replays on other threads before " + work);
+      }
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
-      throw new IOException("Interrupted while waiting to replay " + id, interrupted);
+      throw new IOException("Interrupted before " + work, interrupted);
     }
   }
 
@@ -375,6 +692,7 @@ final class IndexEventTailer implements LifecycleListener {
     ManifestStore manifestStore = repositories.storage().manifestStore(id);
     IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
     IndexCursor cursor = cursorStore.read();
+    noteApplied(id, cursor.getSequence());
     if (listedVersion != null
         && !cursor.getManifestVersion().isEmpty()
         && cursor.getManifestVersion().equals(listedVersion)) {
@@ -439,6 +757,7 @@ final class IndexEventTailer implements LifecycleListener {
         reindexed++;
       }
       cursorStore.write(entry.getSeq(), entry.getTransactionId());
+      noteApplied(id, entry.getSeq());
     }
     if (!entries.isEmpty()) {
       logger.info(
@@ -554,7 +873,22 @@ final class IndexEventTailer implements LifecycleListener {
         readiness.markNotReady();
       }
     }
+    rebuilding = true;
+    try {
+      // No replay runs during a rebuild: one that started earlier finishes first.
+      Lock namespace = namespaceLock.writeLock();
+      lockForReplay(namespace, "rebuilding the indexes");
+      try {
+        rebuildAndSeed();
+      } finally {
+        namespace.unlock();
+      }
+    } finally {
+      rebuilding = false;
+    }
+  }
 
+  private void rebuildAndSeed() throws IOException {
     Map<RepositoryId, IndexCursor> seeds = new LinkedHashMap<>();
     for (Map.Entry<RepositoryId, String> head :
         repositories.storage().listManifestVersions().entrySet()) {
@@ -580,6 +914,7 @@ final class IndexEventTailer implements LifecycleListener {
                 seed.getValue().getSequence(),
                 seed.getValue().getTransactionId(),
                 seed.getValue().getManifestVersion());
+        noteApplied(seed.getKey(), seed.getValue().getSequence());
       } finally {
         replaying.unlock();
       }
@@ -589,6 +924,11 @@ final class IndexEventTailer implements LifecycleListener {
         "WalGerrit rebuilt this node's indexes in {} s and seeded cursors for {} repositories",
         TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started),
         seeds.size());
+  }
+
+  /** Test hook: sets how long replay and rebuild wait for a lock. */
+  void replayLockWait(Duration wait) {
+    this.replayLockWait = wait;
   }
 
   /** Test hook: decide by writer identity which entries came from another node. */

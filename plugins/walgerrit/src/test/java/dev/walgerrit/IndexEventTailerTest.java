@@ -523,7 +523,7 @@ class IndexEventTailerTest {
       Thread repository = replayer(tailer, id, failures);
       repository.start();
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-      while (repository.getState() != Thread.State.WAITING) {
+      while (repository.getState() != Thread.State.TIMED_WAITING) {
         assertTrue(System.nanoTime() < deadline, "the repository replay waits");
         Thread.sleep(10);
       }

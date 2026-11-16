@@ -155,6 +155,10 @@ index writes. Replaying an entry after a crash is safe because index replacement
 are idempotent. This requires Lucene and `commitWithin = 0` for accounts, both change sub-indexes,
 groups and projects.
 
+A request that looks a change up by Change-Id first waits, within a bound, until the index holds
+what other nodes published to its repository before the request arrived. See
+[Index events](index-events.md#change-lookups-wait-for-other-nodes-writes).
+
 A malformed payload, log gap or index failure stops progress for that repository. A stale or
 divergent cursor can trigger a full index rebuild. Startup completes a clean sweep before
 listeners open; a failed background sweep revokes readiness. Readiness reports the last sweep,

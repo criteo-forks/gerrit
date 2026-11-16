@@ -127,6 +127,7 @@ signal.
   indexCursorPath = data/walgerrit-index-events
   indexReplayLimit = 10000
   indexRebuildOnStaleCursor = true
+  indexBarrierTimeout = 5 sec
 ```
 
 The shown values are defaults. Keep the cursor directory on durable node-local storage with the
@@ -153,6 +154,64 @@ A peer's UDP hint queues replay for one repository on the tailer thread. When it
 replay conditionally reads the current manifest and applies unseen log entries. Hints received
 while replay is queued share that pass; hints received during replay can queue another. Sweeps
 retry failed work and discover writes whose hints were lost. See [Peer wake-ups](gossip.md).
+
+## Change lookups wait for other nodes' writes
+
+Gerrit decides whether a pushed commit is a new change or a new patch set by looking its
+Change-Id up in the change index. A node's index trails the other nodes' writes, so a lookup made
+right after another node created the change would miss it and create the change again.
+
+Before such a lookup the node brings the repository's index up to date:
+
+1. It reads the repository's manifest conditionally to learn the log head.
+2. If its cursor is at the head, or this node published every entry between the cursor and the
+   head, the request continues. The request that publishes an entry indexes its own work, so a
+   node's own entries are not waited for; the tailer replays them later as usual.
+3. Otherwise the repository is replayed through the usual catch-up path, and the request
+   continues once the cursor has reached the head it read.
+
+This applies to every push over HTTP and SSH, and to the REST calls that move a change,
+cherry-pick, or create a change through `/projects/<name>/create.change`. `POST /changes/` does
+not name its project in the URL and is not covered, nor are queries that span projects, nor a
+REST call on a change this node's index does not hold yet.
+
+The index holds a repository under the name the catalog gave it when the node last replayed the
+catalog. While the catalog the node has read is ahead of the one it has replayed, for instance
+right after any node renamed or created a project, the request continues with the index as it
+is and the tailer is asked to replay the catalog.
+
+The store is read and the log replayed on up to 16 threads of their own, never on the request
+thread. Requests for one repository share a replay. One replay runs at a time on a node, whoever
+started it, because entries of different repositories can index the same change. A request waits at
+most `indexBarrierTimeout`. When that time runs out, the store read or the replay fails, no thread
+is free, the catalog is being replayed, or the cursor needs a rebuild, the request continues with
+the index as it is, and a replay it stopped waiting for still completes. The barrier never rejects a
+request. The time a push waits counts toward its deadline, when the client or the server set one; a
+REST call's deadline starts after the wait.
+
+No replay runs while the node rebuilds its indexes; a replay that started earlier finishes first.
+A sweep, wake-up or rebuild waits up to one minute for a replay running on another thread. If the
+wait times out, it fails and the next sweep retries.
+
+A lookup therefore sees every change another node acknowledged before the request reached this
+node. Two requests that overlap in time can still both miss, on one node or on two. Nodes that
+share a host name take one another's entries for their own and do not wait for them.
+
+```ini
+[walgerrit]
+  indexBarrierTimeout = 5 sec
+```
+
+`0` turns the barrier off. The timer `walgerrit/index_barrier/latency` records how long each
+request spent in the barrier, by `outcome`:
+
+| Outcome | Meaning |
+| --- | --- |
+| `not_behind` | The index already held every entry other nodes wrote. |
+| `replayed` | The index was behind and caught up while the request waited. |
+| `timed_out` | `indexBarrierTimeout` ran out first. |
+| `failed` | Reading the store or replaying failed. |
+| `skipped` | Nothing was awaited: the tailer is not running or is rebuilding, the project has no active repository, the catalog is not replayed yet or is being replayed, no barrier thread was free, replay made no progress, or the cursor needs a rebuild. |
 
 ## Replay
 

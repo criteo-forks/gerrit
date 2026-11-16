@@ -44,6 +44,7 @@ record WalGitConfiguration(
     boolean manifestRevalidateOnOpen,
     long indexReplayLimit,
     boolean indexRebuildOnStaleCursor,
+    Duration indexBarrierTimeout,
     boolean compactionEnabled,
     int compactMinPacks,
     int compactGeometricFactor,
@@ -81,6 +82,12 @@ record WalGitConfiguration(
    * Entries a node replays into its indexes at most before rebuilding them from scratch instead.
    */
   static final long DEFAULT_INDEX_REPLAY_LIMIT = 10_000;
+
+  /**
+   * Longest a request that looks changes up waits for the index to hold what other nodes wrote to
+   * its repository; zero turns the wait off. See {@link IndexBarrier}.
+   */
+  static final Duration DEFAULT_INDEX_BARRIER_TIMEOUT = Duration.ofSeconds(5);
 
   /**
    * Size of the chunks in which a pack larger than one chunk is fetched from the store as it is
@@ -170,6 +177,7 @@ record WalGitConfiguration(
         true,
         DEFAULT_INDEX_REPLAY_LIMIT,
         true,
+        DEFAULT_INDEX_BARRIER_TIMEOUT,
         true,
         DEFAULT_COMPACT_MIN_PACKS,
         DEFAULT_COMPACT_GEOMETRIC_FACTOR,
@@ -234,6 +242,7 @@ record WalGitConfiguration(
             config.getBoolean(SECTION, null, "manifestRevalidateOnOpen", true),
             config.getLong(SECTION, null, "indexReplayLimit", DEFAULT_INDEX_REPLAY_LIMIT),
             config.getBoolean(SECTION, null, "indexRebuildOnStaleCursor", true),
+            duration(config, "indexBarrierTimeout", DEFAULT_INDEX_BARRIER_TIMEOUT),
             config.getBoolean(SECTION, null, "compactionEnabled", true),
             config.getInt(SECTION, null, "compactMinPacks", DEFAULT_COMPACT_MIN_PACKS),
             config.getInt(
@@ -312,6 +321,7 @@ record WalGitConfiguration(
         !manifestRevalidateInterval.isNegative(),
         "manifestRevalidateInterval must be zero or positive");
     require(indexReplayLimit >= 1, "indexReplayLimit must be at least 1");
+    require(!indexBarrierTimeout.isNegative(), "indexBarrierTimeout must be zero or positive");
     require(compactMinPacks >= 2, "compactMinPacks must be at least 2");
     require(compactGeometricFactor >= 2, "compactGeometricFactor must be at least 2");
     require(compactMaxPackSize >= 1, "compactMaxPackSize must be positive");

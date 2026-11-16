@@ -49,6 +49,7 @@ class WalGitConfigurationTest {
     assertEquals(8L << 20, configuration.packFetchChunkSize());
     assertEquals(10_000, configuration.indexReplayLimit());
     assertTrue(configuration.indexRebuildOnStaleCursor());
+    assertEquals(Duration.ofSeconds(5), configuration.indexBarrierTimeout());
   }
 
   @Test
@@ -126,6 +127,14 @@ class WalGitConfigurationTest {
     WalGitConfiguration configuration = WalGitConfiguration.from(config, sitePath);
 
     assertEquals(Duration.ZERO, configuration.manifestRevalidateInterval());
+  }
+
+  @Test
+  void zeroIndexBarrierTimeoutTurnsTheBarrierOff() {
+    Config config = new Config();
+    config.setString("walgerrit", null, "indexBarrierTimeout", "0");
+
+    assertTrue(WalGitConfiguration.from(config, sitePath).indexBarrierTimeout().isZero());
   }
 
   @Test
