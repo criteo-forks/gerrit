@@ -28,6 +28,7 @@ import dev.walgerrit.proto.StorageProto.RefTransaction;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -401,6 +402,154 @@ class IndexEventTailerTest {
       releaseReplay.countDown();
       tailer.stop();
     }
+  }
+
+  @Test
+  void concurrentCatchUpsApplyEachTransactionOnceInOrder() throws Exception {
+    Path shared = storagePath.resolve("shared-wal");
+    WalGitRepositoryManager writer = configuredManager(shared, storagePath.resolve("writer"));
+    WalGitRepositoryManager reader = configuredManager(shared, storagePath.resolve("reader"));
+    Project.NameKey project = Project.nameKey("platform/concurrent-replay");
+    writer.createRepository(project).close();
+    AtomicInteger applying = new AtomicInteger();
+    AtomicInteger overlaps = new AtomicInteger();
+    List<String> applied = new CopyOnWriteArrayList<>();
+    IndexEventTailer tailer =
+        tailer(
+            reader,
+            (name, transaction) -> {
+              if (applying.incrementAndGet() > 1) {
+                overlaps.incrementAndGet();
+              }
+              try {
+                transaction.getUpdatesList().forEach(update -> applied.add(update.getName()));
+                Thread.sleep(1);
+              } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+              } finally {
+                applying.decrementAndGet();
+              }
+            });
+    RepositoryId id = reader.idOf(project);
+    tailer.catchUp(id);
+    applied.clear();
+
+    AtomicBoolean publishing = new AtomicBoolean(true);
+    List<Throwable> failures = new CopyOnWriteArrayList<>();
+    List<Thread> replayers = new ArrayList<>();
+    for (int i = 0; i < 4; i++) {
+      Thread replayer =
+          new Thread(
+              () -> {
+                try {
+                  while (publishing.get()) {
+                    tailer.catchUp(id);
+                  }
+                  tailer.catchUp(id);
+                } catch (Throwable failure) {
+                  failures.add(failure);
+                }
+              });
+      replayer.start();
+      replayers.add(replayer);
+    }
+    List<String> published = new ArrayList<>();
+    try {
+      for (int i = 0; i < 40; i++) {
+        String ref = Constants.R_HEADS + "branch-" + i;
+        publishRef(writer, project, ref);
+        published.add(ref);
+      }
+    } finally {
+      publishing.set(false);
+      for (Thread replayer : replayers) {
+        replayer.join(TimeUnit.SECONDS.toMillis(30));
+      }
+    }
+
+    assertEquals(List.of(), failures);
+    assertEquals(0, overlaps.get(), "two threads replayed the repository at once");
+    assertEquals(published, applied);
+  }
+
+  @Test
+  void repositoryReplayWaitsForCatalogReplay() throws Exception {
+    Path shared = storagePath.resolve("shared-wal");
+    WalGitRepositoryManager writer = configuredManager(shared, storagePath.resolve("writer"));
+    WalGitRepositoryManager reader = configuredManager(shared, storagePath.resolve("reader"));
+    Project.NameKey project = Project.nameKey("platform/existing");
+    writer.createRepository(project).close();
+    CountDownLatch catalogReplaying = new CountDownLatch(1);
+    CountDownLatch releaseCatalog = new CountDownLatch(1);
+    AtomicBoolean block = new AtomicBoolean();
+    RecordingApplier applied = new RecordingApplier();
+    IndexEventTailer tailer =
+        tailer(
+            reader,
+            new IndexEventApplier() {
+              @Override
+              public void apply(Project.NameKey name, RefTransaction transaction) {
+                applied.apply(name, transaction);
+              }
+
+              @Override
+              public void namespaceChanged(List<NamespaceChange> changes) {
+                if (!block.get()) {
+                  return;
+                }
+                catalogReplaying.countDown();
+                try {
+                  if (!releaseCatalog.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("test did not release the catalog replay");
+                  }
+                } catch (InterruptedException interrupted) {
+                  Thread.currentThread().interrupt();
+                  throw new IllegalStateException(interrupted);
+                }
+              }
+            });
+    RepositoryId id = reader.idOf(project);
+    tailer.catchUp(RepositoryId.CATALOG);
+    tailer.catchUp(id);
+
+    ObjectId commit = publishRef(writer, project, Constants.R_HEADS + "main");
+    writer.createRepository(Project.nameKey("platform/created")).close();
+    block.set(true);
+    List<Throwable> failures = new CopyOnWriteArrayList<>();
+    Thread catalog = replayer(tailer, RepositoryId.CATALOG, failures);
+    catalog.start();
+    try {
+      assertTrue(catalogReplaying.await(10, TimeUnit.SECONDS));
+      Thread repository = replayer(tailer, id, failures);
+      repository.start();
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+      while (repository.getState() != Thread.State.WAITING) {
+        assertTrue(System.nanoTime() < deadline, "the repository replay waits");
+        Thread.sleep(10);
+      }
+      assertFalse(applied.sawUpdate(Constants.R_HEADS + "main", commit));
+
+      releaseCatalog.countDown();
+      repository.join(TimeUnit.SECONDS.toMillis(10));
+    } finally {
+      releaseCatalog.countDown();
+      catalog.join(TimeUnit.SECONDS.toMillis(10));
+    }
+
+    assertEquals(List.of(), failures);
+    assertTrue(applied.sawUpdate(Constants.R_HEADS + "main", commit));
+  }
+
+  private static Thread replayer(
+      IndexEventTailer tailer, RepositoryId id, List<Throwable> failures) {
+    return new Thread(
+        () -> {
+          try {
+            tailer.catchUp(id);
+          } catch (Throwable failure) {
+            failures.add(failure);
+          }
+        });
   }
 
   private static org.eclipse.jgit.lib.Config durableLuceneConfig() {

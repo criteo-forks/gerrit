@@ -46,6 +46,10 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
 import org.eclipse.jgit.lib.Config;
 import org.slf4j.Logger;
@@ -58,7 +62,8 @@ import org.slf4j.LoggerFactory;
  * with the current version of its manifest. A repository is replayed only when that version differs
  * from the one this node last caught up to, so an unchanged repository costs nothing beyond its
  * share of the listing. A peer's wake-up (see {@link GossipEndpoint}) replays one repository ahead
- * of the sweep, on the same thread and through the same {@link #catchUp} path.
+ * of the sweep, on the same thread and through the same {@link #catchUp} path. One thread replays
+ * at a time. Catalog replay blocks repository replay.
  *
  * <p>A cursor that cannot be advanced by replay, because it is too far behind, ahead of a
  * rolled-back head, or names a transaction the manifest no longer does, makes the node rebuild all
@@ -92,6 +97,15 @@ final class IndexEventTailer implements LifecycleListener {
 
   /** Manifest version at which this node last confirmed each repository's cursor was at head. */
   private final Map<RepositoryId, String> caughtUpVersions = new ConcurrentHashMap<>();
+
+  /**
+   * Held by the thread that replays or seeds cursors. Entries of different repositories can index
+   * the same change, so replays of different repositories do not run side by side either.
+   */
+  private final ReentrantLock replayLock = new ReentrantLock();
+
+  /** Blocks repository replay during catalog replay so entries use reconciled repository names. */
+  private final ReadWriteLock namespaceLock = new ReentrantReadWriteLock();
 
   /** Repositories a peer's wake-up queued for replay that the tailer thread has not started. */
   private final Set<RepositoryId> pendingWakeUps = ConcurrentHashMap.newKeySet();
@@ -324,6 +338,40 @@ final class IndexEventTailer implements LifecycleListener {
    * @throws IndexRebuildRequiredException when the cursor cannot be advanced by replay
    */
   int catchUp(RepositoryId id, String listedVersion) throws IOException {
+    Lock namespace = id.isCatalog() ? namespaceLock.writeLock() : namespaceLock.readLock();
+    lockForReplay(namespace, id);
+    try {
+      return replayExclusively(id, listedVersion);
+    } finally {
+      namespace.unlock();
+    }
+  }
+
+  /** Replays {@code id} while no other thread does; the caller holds {@link #namespaceLock}. */
+  private int replayExclusively(RepositoryId id, String listedVersion) throws IOException {
+    ReentrantLock replaying = lockForReplay(id);
+    try {
+      return replay(id, listedVersion);
+    } finally {
+      replaying.unlock();
+    }
+  }
+
+  private ReentrantLock lockForReplay(RepositoryId id) throws IOException {
+    lockForReplay(replayLock, id);
+    return replayLock;
+  }
+
+  private static void lockForReplay(Lock lock, RepositoryId id) throws IOException {
+    try {
+      lock.lockInterruptibly();
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while waiting to replay " + id, interrupted);
+    }
+  }
+
+  private int replay(RepositoryId id, String listedVersion) throws IOException {
     ManifestStore manifestStore = repositories.storage().manifestStore(id);
     IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
     IndexCursor cursor = cursorStore.read();
@@ -525,11 +573,16 @@ final class IndexEventTailer implements LifecycleListener {
     rebuilder.rebuildAll();
 
     for (Map.Entry<RepositoryId, IndexCursor> seed : seeds.entrySet()) {
-      new IndexCursorStore(repositories.storage().manifestStore(seed.getKey()).indexCursorPath())
-          .write(
-              seed.getValue().getSequence(),
-              seed.getValue().getTransactionId(),
-              seed.getValue().getManifestVersion());
+      ReentrantLock replaying = lockForReplay(seed.getKey());
+      try {
+        new IndexCursorStore(repositories.storage().manifestStore(seed.getKey()).indexCursorPath())
+            .write(
+                seed.getValue().getSequence(),
+                seed.getValue().getTransactionId(),
+                seed.getValue().getManifestVersion());
+      } finally {
+        replaying.unlock();
+      }
     }
     caughtUpVersions.clear();
     logger.info(
