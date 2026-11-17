@@ -805,8 +805,9 @@ class IndexBarrierTest {
     second.gated = OTHER;
     second.replayGate = gate;
     List<Throwable> failures = new CopyOnWriteArrayList<>();
+    List<Optional<List<IndexedChange>>> runningFound = new CopyOnWriteArrayList<>();
     List<Optional<List<IndexedChange>>> found = new CopyOnWriteArrayList<>();
-    Thread running = thread(() -> found.add(second.topic("feature")), failures);
+    Thread running = thread(() -> runningFound.add(second.topic("feature")), failures);
     running.start();
     List<Thread> waiting = new ArrayList<>();
     Push late;
@@ -830,10 +831,11 @@ class IndexBarrierTest {
     }
 
     assertEquals(List.of(), failures);
-    assertEquals(6, found.size());
+    assertEquals(1, runningFound.size());
+    assertTrue(runningFound.get(0).isPresent());
+    assertEquals(5, found.size());
     assertTrue(found.stream().allMatch(Optional::isPresent));
-    // Every lookup that arrived after the publication sees it; the pass that was already running
-    // could not promise that, so none of them shared it.
+    // Later lookups must see the publication; the first may see it too.
     assertEquals(
         5,
         found.stream().filter(changes -> numbers(changes.get()).contains(late.number())).count());
