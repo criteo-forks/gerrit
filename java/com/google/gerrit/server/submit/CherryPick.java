@@ -98,10 +98,7 @@ public class CherryPick extends SubmitStrategy {
       // delta relative to that one parent and redoing that on the current merge
       // tip.
       args.rw.parseBody(toMerge);
-      psId =
-          ChangeUtil.nextPatchSetIdFromChangeRefs(
-              ctx.getRepoView().getRefs(getId().toRefPrefix()).keySet(),
-              toMerge.change().currentPatchSetId());
+      psId = ChangeUtil.nextPatchSetId(ctx.getRepoView(), toMerge.change().currentPatchSetId());
       RevCommit mergeTip = args.mergeTip.getCurrentTip();
       args.rw.parseBody(mergeTip);
       String cherryPickCmtMsg = args.mergeUtil.createCommitMessageOnSubmit(toMerge, mergeTip);

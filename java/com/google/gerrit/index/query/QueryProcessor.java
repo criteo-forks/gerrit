@@ -168,6 +168,17 @@ public abstract class QueryProcessor<T> {
     return this;
   }
 
+  /**
+   * Lift the limits that the request and the query give: the user-provided limit, the default limit
+   * and a limit predicate.
+   *
+   * <p>If visibility is enforced the results stay bounded by the user's {@code queryLimit} global
+   * capability and by the maximum limit of the index, like those of any query of that user. If it
+   * is not, nothing bounds them.
+   *
+   * @param isNoLimit whether to lift the limits.
+   * @return this.
+   */
   @CanIgnoreReturnValue
   public QueryProcessor<T> setNoLimit(boolean isNoLimit) {
     this.isNoLimit = isNoLimit;
@@ -253,7 +264,8 @@ public abstract class QueryProcessor<T> {
           initialPageSize--;
         }
 
-        int page = (start / limit) + 1;
+        // The page after that of the largest start does not fit an int.
+        long page = ((long) start / limit) + 1;
         if (page > indexConfig.maxPages()) {
           throw new QueryParseException(
               "Cannot go beyond page " + indexConfig.maxPages() + " of results");
@@ -317,23 +329,29 @@ public abstract class QueryProcessor<T> {
 
       // Run each query asynchronously, if supported.
       List<ResultSet<T>> matches = new ArrayList<>(cnt);
-      for (DataSource<T> s : sources) {
-        try (TraceTimer ignored = TraceContext.newTimer("readDataSource")) {
-          matches.add(s.read());
+      try {
+        for (DataSource<T> s : sources) {
+          try (TraceTimer ignored = TraceContext.newTimer("readDataSource")) {
+            matches.add(s.read());
+          }
         }
-      }
 
-      out = new ArrayList<>(cnt);
-      for (int i = 0; i < cnt; i++) {
-        try (TraceTimer ignored = TraceContext.newTimer("createQueryResult")) {
-          String queryString = queryStrings != null ? queryStrings.get(i) : null;
-          ImmutableList<T> matchesList = matches.get(i).toList();
-          int limit = limits.get(i);
-          logger.atFine().log(
-              "Matches[%d]:\n%s",
-              i, lazy(() -> matchesList.stream().map(this::formatForLogging).collect(toList())));
-          out.add(QueryResult.create(queryString, predicates.get(i), limit, matchesList));
+        out = new ArrayList<>(cnt);
+        for (int i = 0; i < cnt; i++) {
+          try (TraceTimer ignored = TraceContext.newTimer("createQueryResult")) {
+            String queryString = queryStrings != null ? queryStrings.get(i) : null;
+            ImmutableList<T> matchesList = matches.get(i).toList();
+            int limit = limits.get(i);
+            logger.atFine().log(
+                "Matches[%d]:\n%s",
+                i, lazy(() -> matchesList.stream().map(this::formatForLogging).collect(toList())));
+            out.add(QueryResult.create(queryString, predicates.get(i), limit, matchesList));
+          }
         }
+      } finally {
+        // All queries were started before the results of the first were fetched. When fetching
+        // fails, or the request is cancelled meanwhile, those that still run are of no use.
+        matches.forEach(ResultSet::close);
       }
 
       // Only measure successful queries that actually touched the index.
@@ -432,8 +450,14 @@ public abstract class QueryProcessor<T> {
   }
 
   public int getEffectiveLimit(Predicate<T> p) {
-    if (isNoLimit == true) {
-      return Integer.MAX_VALUE;
+    if (isNoLimit) {
+      // A query that does not enforce visibility is one that the server runs for itself, and
+      // nothing limits it. For a user, no limit means as many results as the user may ask for:
+      // the limits that the request and the query give are lifted, the user's query limit and
+      // the limit of the index are not.
+      return enforceVisibility
+          ? Math.min(getBackendSupportedLimit(), getPermittedLimit())
+          : Integer.MAX_VALUE;
     }
     List<Integer> possibleLimits = new ArrayList<>(4);
     possibleLimits.add(getBackendSupportedLimit());

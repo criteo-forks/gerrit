@@ -39,6 +39,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,6 +82,7 @@ final class WalJournal
   private final Project.NameKey allUsers;
   private final GerritRuntime runtime;
   private final JournalBuffer buffer = new JournalBuffer();
+  private final ThreadLocal<Receipt> expected = new ThreadLocal<>();
   private volatile ScheduledExecutorService executor;
 
   @Inject
@@ -107,8 +109,51 @@ final class WalJournal
       logger.warn("WalGerrit cannot journal a {} event", event.type, unserializable);
       return;
     }
-    if (buffer.add(projectOf(event), json) >= FLUSH_AT) {
+    int waiting = buffer.add(projectOf(event), json);
+    Receipt receipt = expected.get();
+    if (receipt != null && receipt.event.test(event)) {
+      receipt.journaled = true;
+    }
+    if (waiting >= FLUSH_AT) {
       flushSoon();
+    }
+  }
+
+  /**
+   * Tells the caller whether, until it closes the receipt, an event that {@code event} accepts was
+   * fired on the calling thread and taken into the journal's buffer. Gerrit calls the listeners of
+   * an event on the thread that fires it and logs what they throw, so this is how that thread
+   * learns that the event it meant to fire exists and is on its way to the log. Nothing else
+   * changes: every event, this one included, is journaled as always.
+   */
+  Receipt expect(Predicate<Event> event) {
+    Receipt receipt = new Receipt(event, expected.get());
+    expected.set(receipt);
+    return receipt;
+  }
+
+  /** See {@link #expect}. */
+  final class Receipt implements AutoCloseable {
+    private final Predicate<Event> event;
+    private final Receipt outer;
+    private boolean journaled;
+
+    private Receipt(Predicate<Event> event, Receipt outer) {
+      this.event = event;
+      this.outer = outer;
+    }
+
+    boolean journaled() {
+      return journaled;
+    }
+
+    @Override
+    public void close() {
+      if (outer == null) {
+        expected.remove();
+      } else {
+        expected.set(outer);
+      }
     }
   }
 

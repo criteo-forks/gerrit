@@ -27,6 +27,7 @@ import com.google.gerrit.extensions.restapi.BadRequestException;
 import com.google.gerrit.extensions.restapi.ResourceConflictException;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.config.UrlFormatter;
+import com.google.gerrit.server.update.RepoView;
 import com.google.gerrit.server.util.CommitMessageUtil;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
@@ -127,6 +128,22 @@ public class ChangeUtil {
         git.getRefDatabase().getRefsByPrefix(id.changeId().toRefPrefix()).stream()
             .map(Ref::getName),
         id);
+  }
+
+  /**
+   * Get the next patch set ID from the refs a batch update sees: those of the repository and those
+   * the update has added but not yet executed.
+   *
+   * @param repoView view of the repository the update is made in.
+   * @param id previous patch set ID.
+   * @return next unused patch set ID for the same change, skipping any IDs whose corresponding ref
+   *     names appear in the view.
+   */
+  public static PatchSet.Id nextPatchSetId(RepoView repoView, PatchSet.Id id) throws IOException {
+    // The view returns the names without the prefix.
+    String prefix = id.changeId().toRefPrefix();
+    return nextPatchSetIdFromChangeRefs(
+        repoView.getRefs(prefix).keySet().stream().map(suffix -> prefix + suffix), id);
   }
 
   /**

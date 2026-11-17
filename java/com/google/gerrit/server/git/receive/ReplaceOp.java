@@ -42,6 +42,7 @@ import com.google.gerrit.extensions.api.changes.ReviewerInput;
 import com.google.gerrit.extensions.client.ChangeKind;
 import com.google.gerrit.extensions.client.ReviewerState;
 import com.google.gerrit.extensions.restapi.BadRequestException;
+import com.google.gerrit.extensions.restapi.ResourceConflictException;
 import com.google.gerrit.extensions.restapi.RestApiException;
 import com.google.gerrit.extensions.restapi.UnprocessableEntityException;
 import com.google.gerrit.server.ChangeMessagesUtil;
@@ -65,7 +66,6 @@ import com.google.gerrit.server.extensions.events.CommentAdded;
 import com.google.gerrit.server.extensions.events.RevisionCreated;
 import com.google.gerrit.server.git.MergedByPushOp;
 import com.google.gerrit.server.git.receive.ReceiveCommits.MagicBranchInput;
-import com.google.gerrit.server.git.receive.RejectionReason.MetricBucket;
 import com.google.gerrit.server.git.validators.CommitValidationInfo;
 import com.google.gerrit.server.git.validators.CommitValidationInfoListener;
 import com.google.gerrit.server.git.validators.TopicValidator;
@@ -126,7 +126,26 @@ public class ReplaceOp implements BatchUpdateOp {
         RequestScopePropagator requestScopePropagator);
   }
 
-  private static final String CHANGE_IS_CLOSED = "change is closed";
+  /**
+   * The change was closed after the push was validated against it.
+   *
+   * <p>By then {@link #updateRepo} has added the patch set ref to the update. The update fails as a
+   * whole, so that the ref is not created without its patch set and nothing is notified.
+   */
+  public static class ChangeClosedException extends ResourceConflictException {
+    private static final long serialVersionUID = 1L;
+
+    private final Change.Id changeId;
+
+    ChangeClosedException(Change.Id changeId) {
+      super("change " + changeId + " closed");
+      this.changeId = changeId;
+    }
+
+    public Change.Id getChangeId() {
+      return changeId;
+    }
+  }
 
   private final AccountCache accountCache;
   private final String anonymousCowardName;
@@ -170,7 +189,6 @@ public class ReplaceOp implements BatchUpdateOp {
   private ChangeKind changeKind;
   private String mailMessage;
   private ApprovalCopier.Result approvalCopierResult;
-  private RejectionReason rejectionReason;
   private MergedByPushOp mergedByPushOp;
   private ReviewerModificationList reviewerAdditions;
   private MailRecipients oldRecipients;
@@ -303,8 +321,7 @@ public class ReplaceOp implements BatchUpdateOp {
     notes = ctx.getNotes();
     Change change = notes.getChange();
     if (change == null || change.isClosed()) {
-      rejectionReason = RejectionReason.create(MetricBucket.CHANGE_IS_CLOSED, CHANGE_IS_CLOSED);
-      return false;
+      throw new ChangeClosedException(patchSetId.changeId());
     }
     if (groups.isEmpty()) {
       PatchSet prevPs = psUtil.current(notes);
@@ -626,10 +643,6 @@ public class ReplaceOp implements BatchUpdateOp {
 
   public Change getChange() {
     return notes.getChange();
-  }
-
-  public Optional<RejectionReason> getRejectionReason() {
-    return Optional.ofNullable(rejectionReason);
   }
 
   public Optional<String> getOutdatedApprovalsMessage() {

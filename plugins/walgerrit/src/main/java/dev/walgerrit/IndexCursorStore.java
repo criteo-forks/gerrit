@@ -15,6 +15,7 @@
 package dev.walgerrit;
 
 import dev.walgerrit.proto.StorageProto.IndexCursor;
+import dev.walgerrit.proto.StorageProto.LogPosition;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -28,6 +29,9 @@ import java.util.UUID;
  * Crash-safe node-local acknowledgement of WAL entries applied to local secondary indexes. The
  * cursor names the last applied entry by sequence and transaction id, so a manifest that was
  * restored to an older version and diverged is detected rather than silently followed.
+ *
+ * <p>The same file holds the merges whose change-merged event this node still owes the log, so that
+ * passing a transaction and recording what it merged are one replacement of the file.
  */
 final class IndexCursorStore {
   private final Path path;
@@ -43,23 +47,51 @@ final class IndexCursorStore {
     return IndexCursor.parseFrom(Files.readAllBytes(path));
   }
 
-  void write(long sequence, String transactionId) throws IOException {
-    write(sequence, transactionId, "");
+  /** Whether this node has a cursor for the repository at all. */
+  boolean exists() {
+    return Files.exists(path);
   }
 
   /**
-   * Writes the cursor; {@code manifestVersion} names the manifest whose head {@code sequence} is,
-   * or is empty while replay is still short of the head.
+   * {@code cursor} at another entry: {@code manifestVersion} names the manifest whose head {@code
+   * sequence} is, or is empty while replay is still short of the head. What the cursor holds
+   * besides its place is kept.
    */
-  void write(long sequence, String transactionId, String manifestVersion) throws IOException {
+  static IndexCursor at(
+      IndexCursor cursor, long sequence, String transactionId, String manifestVersion) {
+    return cursor.toBuilder()
+        .setSequence(sequence)
+        .setTransactionId(transactionId == null ? "" : transactionId)
+        .setManifestVersion(manifestVersion == null ? "" : manifestVersion)
+        .build();
+  }
+
+  /**
+   * The cursor that replaces {@code this} one when it is moved to an entry without the entries in
+   * between being read, as an index rebuild and an offline reindex do. The merges it holds stay,
+   * and it remembers up to where merges were read, so that the next replay reads the rest. A node
+   * that had no cursor has read nothing and owes nothing.
+   */
+  IndexCursor movedTo(long sequence, String transactionId, String manifestVersion)
+      throws IOException {
+    if (!exists()) {
+      return at(IndexCursor.getDefaultInstance(), sequence, transactionId, manifestVersion);
+    }
+    IndexCursor old = read();
+    IndexCursor.Builder moved = at(old, sequence, transactionId, manifestVersion).toBuilder();
+    if (!old.hasMergesReadTo() && old.getSequence() != sequence) {
+      moved.setMergesReadTo(
+          LogPosition.newBuilder()
+              .setSequence(old.getSequence())
+              .setTransactionId(old.getTransactionId()));
+    }
+    return moved.build();
+  }
+
+  /** Replaces the cursor and everything it holds in one step. */
+  void write(IndexCursor cursor) throws IOException {
     Files.createDirectories(path.getParent());
-    byte[] bytes =
-        IndexCursor.newBuilder()
-            .setSequence(sequence)
-            .setTransactionId(transactionId == null ? "" : transactionId)
-            .setManifestVersion(manifestVersion == null ? "" : manifestVersion)
-            .build()
-            .toByteArray();
+    byte[] bytes = cursor.toByteArray();
     Path temporary =
         path.resolveSibling(path.getFileName() + "." + UUID.randomUUID() + ".tmp");
     try {

@@ -105,6 +105,11 @@ message LogEntry {
   IndexUpdate index_update = 12;
   // Present for FENCE: the namespace operation that fenced the repository.
   string fence_operation = 13;
+  // A random id the writing process drew when it started. Unlike `writer`
+  // (host:pid) it is never repeated by a restart, so a node can tell the
+  // entries of the process it is from those of a process that ended. Empty
+  // on entries written before this field existed: no running process's.
+  string writer_process = 14;
 }
 
 // Documents one node reindexed with no ref update behind them: an explicit
@@ -130,6 +135,11 @@ message RefUpdate {
 
 message RefTransaction {
   repeated RefUpdate updates = 1;
+  // A node publishes the ref transactions that wait together as one entry.
+  // How many of `updates`, in order, each of them made. Empty on entries
+  // written before this field existed: their updates cannot be told apart, so
+  // nothing can be concluded from two of them being in one entry.
+  repeated uint32 members = 2;
 }
 
 // Node-local acknowledgement of secondary-index replay. It is stored beside
@@ -143,6 +153,46 @@ message IndexCursor {
   // that reports the same version means nothing was published since, so a
   // restarted node need not read the manifest to know it is caught up.
   string manifest_version = 3;
+  // Changes that ref transactions of this node merged and whose change-merged
+  // event the log does not hold yet; replaced together with the cursor.
+  repeated OwedMerge owed = 4;
+  // Set when the cursor was moved over entries that were not read, by an
+  // index rebuild or an offline reindex: the entry up to which merges were
+  // recorded in `owed`. The next replay reads the entries between it and the
+  // cursor for merges and their events only, and clears it.
+  LogPosition merges_read_to = 5;
+}
+
+// The entry at `sequence`, named as a cursor names it.
+message LogPosition {
+  uint64 sequence = 1;
+  string transaction_id = 2;
+}
+
+// A change that a ref transaction of this node merged, with what its
+// change-merged event says. Recorded when the node's replay passes the
+// transaction and removed when it passes the log entry that carries the
+// event. See docs/events.md.
+message OwedMerge {
+  int32 change = 1;
+  int32 patch_set = 2;
+  // The change's meta ref after the transaction: the NoteDb state the event
+  // describes.
+  string meta_revision = 3;
+  // What the ref transaction that merged the change made the change's
+  // destination branch; empty when it did not update that branch, or when the
+  // entry does not say which of its updates that transaction made. Such a
+  // merge is not known to be a submit's and its event cannot be rebuilt.
+  string new_revision = 4;
+  int32 submitter = 5;
+  int64 merged_at_epoch_millis = 6;
+  // Sequence of the transaction's log entry.
+  uint64 sequence = 7;
+  // writer_process of the process that is to fire the event: the one that
+  // wrote the transaction, or the one that fired the event again since.
+  string process = 8;
+  // The commit of the patch set that was merged.
+  string patch_set_revision = 9;
 }
 
 // A reader's acknowledgement of one repository's log, shared by every node:

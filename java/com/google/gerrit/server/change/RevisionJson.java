@@ -332,6 +332,14 @@ public class RevisionJson {
     return r;
   }
 
+  /**
+   * Whether no patch set of the change has a higher number. Patch set numbers can have gaps, so the
+   * number of patch sets does not say which one is the last.
+   */
+  private static boolean isLastPatchSet(ChangeData cd, PatchSet ps) {
+    return cd.patchSets().stream().noneMatch(other -> other.number() > ps.number());
+  }
+
   private RevisionInfo toRevisionInfo(
       AccountLoader accountLoader,
       ChangeData cd,
@@ -351,7 +359,7 @@ public class RevisionJson {
     if (in.branch().isPresent()) {
       // set the per-patch-set branch if it exists
       out.branch = in.branch().get();
-    } else if (in.number() == cd.patchSets().size()) {
+    } else if (isLastPatchSet(cd, in)) {
       // only set the per-change branch on this patch-set if this is the last patch-set
       out.branch = cd.change().getDest().branch();
     }
@@ -415,7 +423,9 @@ public class RevisionJson {
         }
       }
       if (addFooters) {
-        Ref ref = repo.exactRef(branchName);
+        // Footers are computed for the current patch set, whose target is the change's branch
+        // unless the patch set recorded its own.
+        Ref ref = repo.exactRef(in.branch().orElse(cd.change().getDest().branch()));
         RevCommit mergeTip = null;
         if (ref != null) {
           mergeTip = rw.parseCommit(ref.getObjectId());

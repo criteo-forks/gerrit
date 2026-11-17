@@ -14,8 +14,6 @@
 
 package com.google.gerrit.server.query.change;
 
-import static com.google.common.collect.ImmutableList.toImmutableList;
-
 import com.google.common.collect.ImmutableList;
 import com.google.gerrit.entities.Change;
 import com.google.gerrit.index.query.FieldBundle;
@@ -23,8 +21,10 @@ import com.google.gerrit.index.query.LazyResultSet;
 import com.google.gerrit.index.query.OrPredicate;
 import com.google.gerrit.index.query.Predicate;
 import com.google.gerrit.index.query.ResultSet;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
@@ -44,8 +44,16 @@ public class OrSource extends OrPredicate<ChangeData> implements ChangeDataSourc
   public ResultSet<ChangeData> read() {
     // ResultSets are lazy. Calling #read here first and then dealing with ResultSets only when
     // requested allows the index to run asynchronous queries.
-    ImmutableList<ResultSet<ChangeData>> results =
-        getChildren().stream().map(p -> ((ChangeDataSource) p).read()).collect(toImmutableList());
+    List<ResultSet<ChangeData>> results = new ArrayList<>(getChildCount());
+    try {
+      for (Predicate<ChangeData> child : getChildren()) {
+        results.add(((ChangeDataSource) child).read());
+      }
+    } catch (RuntimeException | Error e) {
+      // The reads that were started have nobody left to close them.
+      results.forEach(ResultSet::close);
+      throw e;
+    }
     return new LazyResultSet<>(
         () -> {
           ImmutableList.Builder<ChangeData> r = ImmutableList.builder();
@@ -58,7 +66,8 @@ public class OrSource extends OrPredicate<ChangeData> implements ChangeDataSourc
             }
           }
           return r.build();
-        });
+        },
+        () -> results.forEach(ResultSet::close));
   }
 
   @Override

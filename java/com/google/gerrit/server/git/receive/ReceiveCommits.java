@@ -1221,6 +1221,18 @@ class ReceiveCommits {
                     .defaultTimeoutMultiplier(5)
                     .call();
           }
+        } catch (ReplaceOp.ChangeClosedException e) {
+          // Nothing was written. The push ends as it would have had the change been closed just
+          // before it was validated.
+          logger.atFine().log("Rejecting because change %s was closed meanwhile", e.getChangeId());
+          reject(
+              replaceByChange.get(e.getChangeId()).inputCommand,
+              RejectionReason.create(MetricBucket.CHANGE_IS_CLOSED, e.getMessage()));
+        } catch (PatchSetNumberTakenException e) {
+          logger.atFine().log("Rejecting because %s was created meanwhile", e.psId);
+          reject(
+              replaceByChange.get(e.psId.changeId()).inputCommand,
+              RejectionReason.create(MetricBucket.PATCH_SET_NUMBER_TAKEN, e.getMessage()));
         } catch (ResourceConflictException e) {
           addError(e.getMessage());
           reject(magicBranchCmd, RejectionReason.create(MetricBucket.CONFLICT, "conflict"));
@@ -1238,7 +1250,8 @@ class ReceiveCommits {
       }
     }
 
-    if (magicBranch != null && magicBranch.submit) {
+    // A push that was rejected has created nothing that could be submitted.
+    if (magicBranch != null && magicBranch.submit && magicBranch.cmd.getResult() == OK) {
       // Using the submit option submits the created change(s) immediately without checking labels
       // nor submit rules. Since code review is bypassed, same as on direct push, use a direct push
       // RefUpdateContext to do the direct submit.
@@ -1340,16 +1353,10 @@ class ReceiveCommits {
         magicBranchCmd.setResult(OK);
       }
       for (ReplaceRequest replace : replaceByChange.values()) {
-        Optional<RejectionReason> rejectionReason = replace.getRejectionReason();
-        if (!rejectionReason.isPresent()) {
-          if (replace.inputCommand.getResult() == NOT_ATTEMPTED) {
-            // Not necessarily the magic branch, so need to set OK on the original
-            // value.
-            replace.inputCommand.setResult(OK);
-          }
-        } else {
-          logger.atFine().log("Rejecting due to message from ReplaceOp");
-          reject(replace.inputCommand, rejectionReason.get());
+        if (replace.inputCommand.getResult() == NOT_ATTEMPTED) {
+          // Not necessarily the magic branch, so need to set OK on the original
+          // value.
+          replace.inputCommand.setResult(OK);
         }
       }
     }
@@ -3657,13 +3664,23 @@ class ReceiveCommits {
 
     private PatchSet.Id nextPatchSetId(PatchSet.Id psId) throws IOException {
       PatchSet.Id next = ChangeUtil.nextPatchSetId(psId);
-      while (receivePackRefCache.exactRef(next.toRefName()) != null) {
+      // The refs that were advertised when the push began may be minutes old by now, so the
+      // repository is asked as well.
+      while (receivePackRefCache.exactRef(next.toRefName()) != null
+          || repo.getRefDatabase().exactRef(next.toRefName()) != null) {
         next = ChangeUtil.nextPatchSetId(next);
       }
       return next;
     }
 
-    void addOps(RevWalk globalRevWalk, BatchUpdate bu, @Nullable Task progress) throws IOException {
+    /**
+     * Adds the ops of this request to an update that is about to be executed.
+     *
+     * @throws PatchSetNumberTakenException if another update has created this request's patch set
+     *     ref since its number was chosen
+     */
+    void addOps(RevWalk globalRevWalk, BatchUpdate bu, @Nullable Task progress)
+        throws IOException, PatchSetNumberTakenException {
       try (TraceTimer traceTimer = newTimer("addOps")) {
         if (magicBranch != null && magicBranch.edit) {
           bu.addOp(notes.getChangeId(), new ReindexOnlyOp());
@@ -3672,6 +3689,9 @@ class ReceiveCommits {
           }
           bu.addRepoOnlyOp(new UpdateOneRefOp(cmd));
           return;
+        }
+        if (repo.getRefDatabase().exactRef(psId.toRefName()) != null) {
+          throw new PatchSetNumberTakenException(psId);
         }
         // TODO(dborowitz): Move to ReplaceOp#updateRepo.
         RevCommit newCommit = globalRevWalk.parseCommit(newCommitId);
@@ -3722,12 +3742,31 @@ class ReceiveCommits {
       }
     }
 
-    Optional<RejectionReason> getRejectionReason() {
-      return replaceOp != null ? replaceOp.getRejectionReason() : Optional.empty();
-    }
-
     Optional<String> getOutdatedApprovalsMessage() {
       return replaceOp != null ? replaceOp.getOutdatedApprovalsMessage() : Optional.empty();
+    }
+  }
+
+  /**
+   * The patch set number a push was given was taken by another update before the push could create
+   * its patch set.
+   *
+   * <p>The update is built from the same request on every attempt, so creating that ref again fails
+   * however often it is retried. The push is rejected instead; pushed again, it is validated
+   * against the patch set that took the number and gets the next one.
+   */
+  private static class PatchSetNumberTakenException extends ResourceConflictException {
+    private static final long serialVersionUID = 1L;
+
+    final PatchSet.Id psId;
+
+    PatchSetNumberTakenException(PatchSet.Id psId) {
+      super(
+          String.format(
+              "patch set %d of change %s was created by another update while this push was"
+                  + " processed; push again",
+              psId.get(), psId.changeId()));
+      this.psId = psId;
     }
   }
 
@@ -4072,6 +4111,13 @@ class ReceiveCommits {
 
                       return null;
                     })
+                // Each attempt reads the changes again and chooses their patch set numbers
+                // again, so one that finds a change closed or a number taken meanwhile leaves
+                // that out and closes the others.
+                .retryOn(
+                    t ->
+                        t instanceof ReplaceOp.ChangeClosedException
+                            || t instanceof PatchSetNumberTakenException)
                 // Use a multiple of the default timeout to account for inner retries that may
                 // otherwise
                 // eat up the whole timeout so that no time is left to retry this outer action.

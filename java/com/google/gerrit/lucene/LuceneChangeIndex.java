@@ -23,6 +23,7 @@ import static com.google.gerrit.server.index.change.ChangeField.PROJECT_SPEC;
 import static com.google.gerrit.server.index.change.ChangeIndexRewriter.CLOSED_STATUSES;
 import static com.google.gerrit.server.index.change.ChangeIndexRewriter.OPEN_STATUSES;
 import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
@@ -50,6 +51,8 @@ import com.google.gerrit.index.query.Predicate;
 import com.google.gerrit.index.query.QueryParseException;
 import com.google.gerrit.index.query.ResultSet;
 import com.google.gerrit.proto.Protos;
+import com.google.gerrit.server.cancellation.RequestCancelledException;
+import com.google.gerrit.server.cancellation.RequestStateContext;
 import com.google.gerrit.server.change.MergeabilityComputationBehavior;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.config.SitePaths;
@@ -76,6 +79,7 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexWriter;
@@ -113,6 +117,9 @@ public class LuceneChangeIndex implements ChangeIndex {
   private static final String CHANGES_OPEN = "open";
   private static final String CHANGES_CLOSED = "closed";
   private static final String CHANGE_FIELD = ChangeField.CHANGE_SPEC.getName();
+
+  /** How often a thread that waits for a read looks whether its request was cancelled. */
+  private static final long CANCELLATION_CHECK_INTERVAL_MS = 100;
 
   static Term idTerm(ChangeData cd) {
     return idTerm(cd.virtualId());
@@ -373,12 +380,13 @@ public class LuceneChangeIndex implements ChangeIndex {
       }
 
       final Set<String> fields = IndexUtils.changeFields(opts);
+      ReadCancellation cancellation = new ReadCancellation();
       return new ChangeDataResults(
           executor.submit(
               new Callable<Results>() {
                 @Override
                 public Results call() throws IOException {
-                  return doRead(fields);
+                  return doRead(fields, cancellation);
                 }
 
                 @Override
@@ -386,7 +394,8 @@ public class LuceneChangeIndex implements ChangeIndex {
                   return predicate.toString();
                 }
               }),
-          fields);
+          fields,
+          cancellation);
     }
 
     @Override
@@ -395,7 +404,7 @@ public class LuceneChangeIndex implements ChangeIndex {
       Map<ChangeSubIndex, ScoreDoc> searchAfterBySubIndex;
 
       try {
-        Results r = doRead(IndexUtils.changeFields(opts));
+        Results r = doRead(IndexUtils.changeFields(opts), new ReadCancellation());
         documents = r.docs;
         searchAfterBySubIndex = r.searchAfterBySubIndex;
       } catch (IOException e) {
@@ -426,7 +435,10 @@ public class LuceneChangeIndex implements ChangeIndex {
       };
     }
 
-    private Results doRead(Set<String> fields) throws IOException {
+    private Results doRead(Set<String> fields, ReadCancellation cancellation) throws IOException {
+      // The searchers that all reads share, and for each one a searcher of this read that ends
+      // its search when the read is abandoned.
+      IndexSearcher[] acquired = new IndexSearcher[indexes.size()];
       IndexSearcher[] searchers = new IndexSearcher[indexes.size()];
       Map<ChangeSubIndex, ScoreDoc> searchAfterBySubIndex = new HashMap<>();
       try {
@@ -438,8 +450,10 @@ public class LuceneChangeIndex implements ChangeIndex {
         List<TopFieldDocs> hits = new ArrayList<>();
         int searchAfterHitsCount = 0;
         for (int i = 0; i < indexes.size(); i++) {
+          cancellation.check();
           ChangeSubIndex subIndex = indexes.get(i);
-          searchers[i] = subIndex.acquire();
+          acquired[i] = subIndex.acquire();
+          searchers[i] = cancellation.searcherFor(acquired[i]);
           if (isSearchAfterPagination) {
             ScoreDoc searchAfter = getSearchAfter(subIndex);
             int maxRemainingHits = queryLimit - searchAfterHitsCount;
@@ -463,6 +477,7 @@ public class LuceneChangeIndex implements ChangeIndex {
 
         List<Document> result = new ArrayList<>(docs.scoreDocs.length);
         for (int i = opts.start(); i < docs.scoreDocs.length; i++) {
+          cancellation.check();
           ScoreDoc sd = docs.scoreDocs[i];
           IndexSearcher searcher = searchers[sd.shardIndex];
           StoredFields storedFields = searcher.getIndexReader().storedFields();
@@ -471,9 +486,9 @@ public class LuceneChangeIndex implements ChangeIndex {
         return new Results(result, searchAfterBySubIndex);
       } finally {
         for (int i = 0; i < indexes.size(); i++) {
-          if (searchers[i] != null) {
+          if (acquired[i] != null) {
             try {
-              indexes.get(i).release(searchers[i]);
+              indexes.get(i).release(acquired[i]);
             } catch (IOException e) {
               logger.atWarning().withCause(e).log("cannot release Lucene searcher");
             }
@@ -534,11 +549,13 @@ public class LuceneChangeIndex implements ChangeIndex {
   private class ChangeDataResults implements ResultSet<ChangeData> {
     private final Future<Results> future;
     private final Set<String> fields;
+    private final ReadCancellation cancellation;
     private Map<ChangeSubIndex, ScoreDoc> searchAfterBySubIndex;
 
-    ChangeDataResults(Future<Results> future, Set<String> fields) {
+    ChangeDataResults(Future<Results> future, Set<String> fields, ReadCancellation cancellation) {
       this.future = future;
       this.fields = fields;
+      this.cancellation = cancellation;
     }
 
     @Override
@@ -549,12 +566,13 @@ public class LuceneChangeIndex implements ChangeIndex {
     @Override
     public ImmutableList<ChangeData> toList() {
       try {
-        Results r = future.get();
+        Results r = awaitRead();
         List<Document> docs = r.docs;
         searchAfterBySubIndex = r.searchAfterBySubIndex;
         ImmutableList.Builder<ChangeData> result =
             ImmutableList.builderWithExpectedSize(docs.size());
         for (Document doc : docs) {
+          RequestStateContext.abortIfCancelled();
           String fieldName =
               doc.getField(CHANGENUM_SPEC.getName()) != null
                   ? CHANGENUM_SPEC.getName()
@@ -571,8 +589,28 @@ public class LuceneChangeIndex implements ChangeIndex {
       }
     }
 
+    /**
+     * Waits for the read. While it waits it looks whether the request of this thread is cancelled,
+     * which the reading thread cannot know, and if so stops the read.
+     */
+    private Results awaitRead() throws InterruptedException, ExecutionException {
+      while (true) {
+        try {
+          return future.get(CANCELLATION_CHECK_INTERVAL_MS, MILLISECONDS);
+        } catch (TimeoutException e) {
+          try {
+            RequestStateContext.abortIfCancelled();
+          } catch (RequestCancelledException cancelled) {
+            close();
+            throw cancelled;
+          }
+        }
+      }
+    }
+
     @Override
     public void close() {
+      cancellation.abandon();
       future.cancel(false /* do not interrupt Lucene */);
     }
 

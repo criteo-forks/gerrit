@@ -4,4 +4,5 @@ acceptance_tests(
     srcs = glob(["**/*IT.java"]),
     group = "server_index",
     labels = ["server"],
+    deps = ["//java/com/google/gerrit/server/cancellation"],
 )

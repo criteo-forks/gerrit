@@ -103,7 +103,12 @@ command line parser in the server).
 	Number of changes to skip.
 
 --no-limit::
-	Return all results, overriding the default limit.
+	Return as many results as the caller's
+	link:access-control.html#capability_queryLimit[query limit] and
+	link:config-gerrit.html#index.maxLimit[index.maxLimit] allow,
+	overriding the default limit and any `limit:` operator. This is
+	not necessarily every result: when there are more, the stats line
+	has `moreChanges` set and the rest is fetched with `--start`.
 
 limit:<n>::
 	Maximum number of results to return.  This is actually a

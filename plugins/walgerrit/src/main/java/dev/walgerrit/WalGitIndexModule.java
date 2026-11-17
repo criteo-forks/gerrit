@@ -59,6 +59,9 @@ public final class WalGitIndexModule extends LifecycleModule {
     DynamicSet.bind(binder(), GroupIndexedListener.class).to(WalJournal.class);
     DynamicSet.bind(binder(), ProjectIndexedListener.class).to(WalJournal.class);
     listener().to(WalJournal.class);
+    // Last: a change-merged event that an earlier process of this node owes is fired once the
+    // journal and, before this module, the plugins run.
+    listener().to(OwedEventDelivery.class);
     // The journaled events as a log per repository, for plugins that forward them elsewhere.
     bind(EventLog.class).to(WalEventLog.class);
   }

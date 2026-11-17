@@ -20,6 +20,7 @@ import com.google.gerrit.exceptions.StorageException;
 import com.google.gerrit.index.IndexConfig;
 import com.google.gerrit.index.PaginationType;
 import com.google.gerrit.index.QueryOptions;
+import com.google.gerrit.server.cancellation.RequestStateContext;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -44,6 +45,7 @@ public class PaginatingSource<T> extends FilteredSource<T> {
           T last = null;
           int pageResultSize = 0;
           for (T data : buffer(resultSet)) {
+            RequestStateContext.abortIfCancelled();
             if (!isMatchable() || match(data)) {
               r.add(data);
             }
@@ -69,17 +71,22 @@ public class PaginatingSource<T> extends FilteredSource<T> {
                       ? p.restart(searchAfter, pageSize)
                       : p.restart(nextStart, pageSize);
               pageResultSize = 0;
-              for (T data : buffer(next)) {
-                if (match(data)) {
-                  r.add(data);
+              try {
+                for (T data : buffer(next)) {
+                  RequestStateContext.abortIfCancelled();
+                  if (match(data)) {
+                    r.add(data);
+                  }
+                  pageResultSize++;
+                  if (r.size() > limit) {
+                    break;
+                  }
                 }
-                pageResultSize++;
-                if (r.size() > limit) {
-                  break;
-                }
+                searchAfter = next.searchAfter();
+              } finally {
+                next.close();
               }
               nextStart += pageResultSize;
-              searchAfter = next.searchAfter();
             }
           }
 
@@ -89,7 +96,8 @@ public class PaginatingSource<T> extends FilteredSource<T> {
             return ImmutableList.copyOf(r.subList(start, r.size()));
           }
           return ImmutableList.copyOf(r);
-        });
+        },
+        resultSet::close);
   }
 
   @Override

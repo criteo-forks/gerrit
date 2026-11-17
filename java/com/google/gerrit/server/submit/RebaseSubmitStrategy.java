@@ -125,9 +125,7 @@ public class RebaseSubmitStrategy extends SubmitStrategy {
 
       args.rw.parseBody(toMerge);
       newPatchSetId =
-          ChangeUtil.nextPatchSetIdFromChangeRefs(
-              ctx.getRepoView().getRefs(getId().toRefPrefix()).keySet(),
-              toMerge.change().currentPatchSetId());
+          ChangeUtil.nextPatchSetId(ctx.getRepoView(), toMerge.change().currentPatchSetId());
       // Stale read of patch set is ok; see comments in RebaseChangeOp.
       PatchSet origPs = args.psUtil.get(toMerge.getNotes(), toMerge.getPatchsetId());
       rebaseOp =

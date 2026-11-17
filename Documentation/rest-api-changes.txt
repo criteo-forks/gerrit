@@ -78,7 +78,15 @@ Queries changes visible to the caller. The
 link:user-search.html#_search_operators[query string] must be provided
 by the `q` parameter. The `n` parameter can be used to limit the
 returned results. The `no-limit` parameter can be used remove the default
-limit on queries and return all results (does not apply to anonymous requests).
+limit on queries and return as many results as the caller may ask for (does
+not apply to anonymous requests): the limits given by `n`, by a `limit:`
+operator and by link:config-gerrit.html#index.defaultLimit[index.defaultLimit]
+are lifted, the caller's
+link:access-control.html#capability_queryLimit[query limit] and
+link:config-gerrit.html#index.maxLimit[index.maxLimit] are not. When there
+are more results, the last change has `_more_changes` set and the rest can be
+fetched with the `S` parameter, within
+link:config-gerrit.html#index.maxPages[index.maxPages].
 This might not be supported by all index backends.
 
 As result a list of link:#change-info[ChangeInfo] entries is returned.

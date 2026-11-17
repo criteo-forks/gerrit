@@ -11,6 +11,9 @@ indexing intent. Search catches up asynchronously; it is not part of the Git tra
 3. Manifest CAS publishes the entry and refs together.
 4. Each node reads unseen entries in repository sequence order and applies their index work.
 5. After an entry's synchronous work succeeds, the node persists its cursor.
+   The same file holds the merges of this node whose change-merged event is not in the log yet,
+   so passing a ref transaction and recording what it merged are one write; see
+   [Events](events.md#recovering-a-submits-change-merged-event-after-restart).
 
 A crash between index application and cursor persistence causes replay. Index replacements and
 deletions are idempotent, so delivery can be at least once. A failed index or cursor write leaves
@@ -73,11 +76,19 @@ batched durable checkpoints remain future work.
 ## Ordering and failure behavior
 
 Order is per repository. An All-Users draft or star update can arrive before its project's change
-is indexed. A live update whose change cannot yet be resolved fails and retries on a later sweep;
-a deletion can safely encounter an already deleted change.
+is indexed, whichever node wrote it: a node replays its own All-Users entries too, and has a change
+another node created only once it has replayed that creation. A live update whose change cannot
+yet be resolved fails; a deletion can safely encounter an already deleted change.
 
 A missing or malformed `REF_UPDATE` payload, missing log entry, sequence error, index failure or
 cursor-write failure stops replay for that repository. Other repositories are still attempted.
+
+A sweep replays a repository whose replay failed once more after the others. Before it does, it
+lists the store again and replays what is behind that listing, since the change an entry waits for
+may have been created after the sweep's first listing. The second replay stops at the head the
+node knew when the first one failed: later entries may wait for publications later still, and
+are left to the next wake-up or sweep. The extra listing is made only in a sweep where a replay
+failed. A replay that fails again fails the sweep. A wake-up that fails is left to the next sweep.
 
 ## The catalog is replayed first
 

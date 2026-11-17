@@ -18,7 +18,6 @@ import com.google.gerrit.entities.Project;
 import java.io.IOException;
 import java.time.Duration;
 import org.eclipse.jgit.internal.storage.dfs.DfsObjDatabase;
-import org.eclipse.jgit.internal.storage.dfs.DfsRefDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
 import org.eclipse.jgit.internal.storage.dfs.DfsRepositoryBuilder;
 import org.eclipse.jgit.internal.storage.dfs.DfsRepositoryDescription;
@@ -27,7 +26,7 @@ import org.eclipse.jgit.lib.RefDatabase;
 /** A normal JGit DFS repository whose durable files are published through a WalGit manifest. */
 final class LocalWalGitRepository extends DfsRepository {
   private final LocalWalGitObjectDatabase objectDatabase;
-  private final DfsRefDatabase refDatabase;
+  private final LocalWalGitRefDatabase refDatabase;
   private volatile String gitwebDescription;
 
   /**
@@ -58,6 +57,16 @@ final class LocalWalGitRepository extends DfsRepository {
   @Override
   public RefDatabase getRefDatabase() {
     return refDatabase;
+  }
+
+  /** The generation of refs this handle serves now; see {@link LocalWalGitRefDatabase}. */
+  long revalidatedRefGeneration() throws IOException {
+    return refDatabase.revalidatedGeneration();
+  }
+
+  /** The generation of refs as it is, without adopting a newer manifest. */
+  long refGeneration() {
+    return refDatabase.generation();
   }
 
   /** Callers asking for a rescan get one conditional manifest read, then JGit's cache reset. */

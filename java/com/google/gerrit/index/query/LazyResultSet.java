@@ -30,11 +30,21 @@ import java.util.function.Supplier;
  */
 public class LazyResultSet<T> implements ResultSet<T> {
   private final Supplier<ImmutableList<T>> resultsCallback;
+  private final Runnable onClose;
 
   private boolean resultsReturned = false;
 
   public LazyResultSet(Supplier<ImmutableList<T>> r) {
+    this(r, () -> {});
+  }
+
+  /**
+   * @param r fetches the results.
+   * @param onClose closes the underlying result set, including any outstanding read.
+   */
+  public LazyResultSet(Supplier<ImmutableList<T>> r, Runnable onClose) {
     resultsCallback = requireNonNull(r, "results can't be null");
+    this.onClose = requireNonNull(onClose, "onClose can't be null");
   }
 
   @Override
@@ -52,7 +62,9 @@ public class LazyResultSet<T> implements ResultSet<T> {
   }
 
   @Override
-  public void close() {}
+  public void close() {
+    onClose.run();
+  }
 
   @Override
   public Object searchAfter() {

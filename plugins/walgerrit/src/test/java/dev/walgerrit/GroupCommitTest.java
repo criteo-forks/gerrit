@@ -76,6 +76,10 @@ class GroupCommitTest {
     assertEquals(LogEntry.Kind.REF_UPDATE, group.getKind());
     assertEquals(WRITERS - 1, group.getRefTransaction().getUpdatesCount(), "one entry, five transactions");
     assertEquals(
+        java.util.Collections.nCopies(WRITERS - 1, 1),
+        group.getRefTransaction().getMembersList(),
+        "the entry says which update was whose transaction");
+    assertEquals(
         WRITERS - 1,
         group.getAdditionsList().stream().filter(CompactionPolicy::hasReftable).count(),
         "every member's reftable travels in the group's entry; packs ride in whichever "

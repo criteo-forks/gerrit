@@ -2878,7 +2878,20 @@ public class ChangeIT extends AbstractDaemonTest {
     List<ChangeInfo> resultsWithDefaultLimit = gApi.changes().query().get();
     List<ChangeInfo> resultsWithNoLimit = gApi.changes().query().withNoLimit().get();
     assertThat(resultsWithDefaultLimit).hasSize(2);
-    assertThat(resultsWithNoLimit.size()).isAtLeast(3);
+    // No limit does not lift the query limit of the user.
+    assertThat(resultsWithNoLimit).hasSize(2);
+    assertThat(Iterables.getLast(resultsWithNoLimit)._moreChanges).isTrue();
+  }
+
+  @Test
+  @GerritConfig(name = "index.defaultLimit", value = "1")
+  public void queryChangesNoLimitLiftsDefaultAndRequestedLimit() throws Exception {
+    for (int i = 0; i < 3; i++) {
+      createChange();
+    }
+    assertThat(gApi.changes().query().get()).hasSize(1);
+    assertThat(gApi.changes().query().withNoLimit().get().size()).isAtLeast(3);
+    assertThat(gApi.changes().query().withLimit(2).withNoLimit().get().size()).isAtLeast(3);
   }
 
   @Test

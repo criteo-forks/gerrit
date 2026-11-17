@@ -227,6 +227,15 @@ public class Submit
         return updatedChange;
       }
 
+      // MergeOp hands back the change it was given when it had nothing to update for it. That
+      // happens when the change was closed after this request read it, by another submission or
+      // by an abandon: MergeOp reloads the changes and leaves out those no longer open. It is the
+      // conflict the check above reports when the request reads the change a moment later.
+      Change current = changeDataFactory.create(change.getProject(), change.getId()).change();
+      if (!current.isNew()) {
+        throw new ResourceConflictException("change is " + ChangeUtil.status(current));
+      }
+
       throw new IllegalStateException(
           String.format(
               "change %s of project %s unexpectedly had status %s after submit attempt",

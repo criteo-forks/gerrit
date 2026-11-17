@@ -137,15 +137,37 @@ public class QueryProcessorTest {
   }
 
   @Test
-  public void getEffectiveLimit_NoLimit() {
+  public void getEffectiveLimit_NoLimit() throws QueryParseException {
     noLimit = true;
-    assertThat(createProcessor().getEffectiveLimit(Predicate.any())).isEqualTo(Integer.MAX_VALUE);
+    limitField = "limit";
+    Predicate<String> limitOfQuery = new LimitPredicate<>(limitField, 1);
 
-    // noLimit has precedence over all other limits
+    // noLimit lifts the limits that the request and the query give
+    userProvidedLimit = 1;
+    defaultLimit = 1;
+    assertThat(createProcessor().getEffectiveLimit(limitOfQuery)).isEqualTo(1000);
+
+    // but not what the user may ask for, nor what the index allows
+    userQueryLimit = 314;
+    assertThat(createProcessor().getEffectiveLimit(limitOfQuery)).isEqualTo(314);
+    maxLimit = 271;
+    assertThat(createProcessor().getEffectiveLimit(limitOfQuery)).isEqualTo(271);
+  }
+
+  @Test
+  public void getEffectiveLimit_NoLimitWithoutVisibilityEnforcement() throws QueryParseException {
+    noLimit = true;
+    limitField = "limit";
+
+    // a query of the server itself: noLimit has precedence over all limits
     userProvidedLimit = 1;
     userQueryLimit = 1;
     maxLimit = 1;
     defaultLimit = 1;
-    assertThat(createProcessor().getEffectiveLimit(Predicate.any())).isEqualTo(Integer.MAX_VALUE);
+    assertThat(
+            createProcessor()
+                .enforceVisibility(false)
+                .getEffectiveLimit(new LimitPredicate<>(limitField, 1)))
+        .isEqualTo(Integer.MAX_VALUE);
   }
 }

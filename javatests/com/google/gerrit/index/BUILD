@@ -12,6 +12,7 @@ junit_tests(
         "//java/com/google/gerrit/index/project",
         "//java/com/google/gerrit/index/query/testing",
         "//java/com/google/gerrit/server",
+        "//java/com/google/gerrit/server/cancellation",
         "//java/com/google/gerrit/testing:gerrit-test-util",
         "//lib:guava",
         "//lib:jgit",

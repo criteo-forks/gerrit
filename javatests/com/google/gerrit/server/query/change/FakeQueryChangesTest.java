@@ -25,6 +25,7 @@ import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
 import com.google.gerrit.acceptance.UseClockStep;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.entities.Change;
@@ -162,13 +163,31 @@ public abstract class FakeQueryChangesTest extends AbstractQueryChangesTest {
     AbstractFakeIndex<?, ?, ?> idx =
         (AbstractFakeIndex<?, ?, ?>) changeIndexCollection.getSearchIndex();
 
-    // 2 index searches are expected. The first index search will run with size 3 (i.e.
-    // the configured query-limit+1), and then we will paginate to get the remaining
-    // changes with the second index search.
-    @SuppressWarnings("unused")
-    var unused = newQuery("status:new").withNoLimit().get();
+    // A query of the server itself without limit: 2 index searches are expected. The first
+    // index search will run with size 3 (i.e. the configured query-limit+1), and then we will
+    // paginate to get the remaining changes with the second index search.
+    assertThat(queryProvider.get().setNoLimit(true).byProject(project)).hasSize(4);
 
     assertThatSearchQueryWasPaginated(idx.getQueryCount(), 2);
+  }
+
+  @Test
+  @UseClockStep
+  public void noLimitQueryOfUserEndsAtQueryLimit() throws Exception {
+    // The query limit is 2.
+    AbstractFakeIndex<?, ?, ?> idx = setupRepoWithFourChanges();
+    List<ChangeInfo> limited = newQuery("status:new").withLimit(2).get();
+    int searchesOfLimitedQuery = idx.getQueryCount();
+
+    // The same as when the user asks for as many changes as the query limit allows.
+    List<ChangeInfo> unlimited = newQuery("status:new").withNoLimit().get();
+
+    assertThat(unlimited.stream().map(change -> change._number))
+        .containsExactlyElementsIn(limited.stream().map(change -> change._number).toList())
+        .inOrder();
+    assertThat(unlimited).hasSize(2);
+    assertThat(Iterables.getLast(unlimited)._moreChanges).isTrue();
+    assertThat(idx.getQueryCount() - searchesOfLimitedQuery).isEqualTo(searchesOfLimitedQuery);
   }
 
   @Test

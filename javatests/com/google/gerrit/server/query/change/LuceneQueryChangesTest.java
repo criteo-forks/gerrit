@@ -14,6 +14,7 @@
 
 package com.google.gerrit.server.query.change;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.gerrit.acceptance.testsuite.project.TestProjectUpdate.allowCapability;
 import static com.google.gerrit.common.data.GlobalCapability.QUERY_LIMIT;
@@ -107,8 +108,23 @@ public abstract class LuceneQueryChangesTest extends AbstractQueryChangesTest {
         .add(allowCapability(QUERY_LIMIT).group(REGISTERED_USERS).range(0, 1))
         .update();
 
-    Change[] expected = new Change[] {change6, change5, change4, change3, change2, change1};
-    assertQuery(newQuery("project:repo").withNoLimit(), expected);
+    // A user's query without limit ends at the user's query limit.
+    assertQuery(newQuery("project:repo").withNoLimit(), change6);
+
+    // A query of the server itself does not; its first page is as large as that limit, and it
+    // goes on through both sub-indexes page by page.
+    assertThat(
+            queryProvider.get().setNoLimit(true).byProject(project).stream()
+                .map(ChangeData::getId)
+                .collect(toImmutableList()))
+        .containsExactly(
+            change6.getId(),
+            change5.getId(),
+            change4.getId(),
+            change3.getId(),
+            change2.getId(),
+            change1.getId())
+        .inOrder();
   }
 
   @Test

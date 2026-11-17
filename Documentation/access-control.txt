@@ -1616,7 +1616,10 @@ When applying a query limit to a user the largest value granted by
 any of their groups is used.
 
 This limit applies not only to the link:cmd-query.html[`gerrit query`]
-command, but also to the web UI results pagination size.
+command, but also to the web UI results pagination size. It also bounds
+queries that ask for no limit (`no-limit` of the REST API, `--no-limit` of
+`gerrit query`): an account that has to fetch more results in one query
+needs a group with a higher query limit.
 
 
 [[capability_readAs]]

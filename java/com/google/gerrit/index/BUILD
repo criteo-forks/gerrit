@@ -30,6 +30,7 @@ java_library(
         "//java/com/google/gerrit/json",
         "//java/com/google/gerrit/metrics",
         "//java/com/google/gerrit/proto",
+        "//java/com/google/gerrit/server/cancellation",
         "//java/com/google/gerrit/server/logging",
         "//lib:guava",
         "//lib:jgit",

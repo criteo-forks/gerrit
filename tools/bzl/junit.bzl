@@ -29,7 +29,8 @@ import org.junit.runner.RunWith;
 public class %s {}
 """
 
-_PREFIXES = ("org", "com", "edu")
+# In this order: a path is cut at the first of them that it holds.
+_PREFIXES = ("org", "com", "edu", "dev")
 
 def _SafeIndex(j, val):
     for i, v in enumerate(j):

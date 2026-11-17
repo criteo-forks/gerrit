@@ -41,7 +41,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 import org.slf4j.Logger;
@@ -296,7 +295,18 @@ final class ManifestStore {
    */
   List<LogEntry> readLogEntriesAfter(
       long sequence, String transactionId, Manifest manifest, long limit) throws IOException {
-    long head = manifest.getHeadSeq();
+    return readLogEntriesBetween(
+        sequence, transactionId, manifest.getHeadSeq(), manifest.getHeadTransactionId(), limit);
+  }
+
+  /**
+   * As {@link #readLogEntriesAfter}, up to the entry at {@code head} named {@code
+   * headTransactionId} instead of a manifest's head: an entry the caller knows to be in this
+   * repository's history, such as the one its cursor is at.
+   */
+  List<LogEntry> readLogEntriesBetween(
+      long sequence, String transactionId, long head, String headTransactionId, long limit)
+      throws IOException {
     if (sequence > head) {
       throw new IndexRebuildRequiredException(
           repositoryName,
@@ -315,7 +325,7 @@ final class ManifestStore {
               + limit);
     }
     Deque<LogEntry> entries = new ArrayDeque<>();
-    String expectedId = manifest.getHeadTransactionId();
+    String expectedId = headTransactionId;
     for (long seq = head; seq > sequence; seq--) {
       LogEntry entry = readEntry(seq, expectedId);
       entries.addFirst(entry);
@@ -339,6 +349,31 @@ final class ManifestStore {
     return entry;
   }
 
+  /**
+   * Follows the compare-and-swaps one publication tries, so that local read snapshots can tell
+   * whether the packs it carries are in the manifest's history.
+   */
+  interface Attempts {
+    /** For a publication no reader needs to follow. */
+    Attempts UNOBSERVED =
+        new Attempts() {
+          @Override
+          public void attempting(long sequence, String transactionId) {}
+
+          @Override
+          public void settled(boolean landed) {}
+        };
+
+    /** Called before each CAS with the log entry it would make the head. */
+    void attempting(long sequence, String transactionId);
+
+    /**
+     * The attempt announced last is proved to be in the history, or proved never to get there
+     * because another transaction has its sequence. Not called while its outcome is unknown.
+     */
+    void settled(boolean landed);
+  }
+
   /** A publication nothing fences: tests and tools on a repository no operation touches. */
   Manifest publish(
       long expectedRefRevision,
@@ -353,11 +388,12 @@ final class ManifestStore {
         requireExactRefRevision,
         null,
         UNFENCED,
-        (sequence, transactionId) -> {});
+        Attempts.UNOBSERVED);
   }
 
   /**
-   * Registers each attempt before its CAS so local read snapshots can resolve in-flight packs.
+   * Announces each attempt before its CAS, and its outcome once proved, so local read snapshots can
+   * resolve in-flight packs.
    *
    * @param expectedWriteEpoch the epoch the writer was admitted under, or {@link #UNFENCED}
    */
@@ -368,7 +404,7 @@ final class ManifestStore {
       boolean requireExactRefRevision,
       RefTransaction refTransaction,
       long expectedWriteEpoch,
-      BiConsumer<Long, String> beforeCas)
+      Attempts attempts)
       throws IOException {
     return publish(
         expectedRefRevision,
@@ -381,7 +417,7 @@ final class ManifestStore {
         false,
         null,
         expectedWriteEpoch,
-        beforeCas);
+        attempts);
   }
 
   /**
@@ -410,7 +446,7 @@ final class ManifestStore {
         false,
         new NamespaceFence(operation, delete),
         expectedWriteEpoch,
-        (sequence, transactionId) -> {});
+        Attempts.UNOBSERVED);
   }
 
   private record NamespaceFence(String operation, boolean delete) {}
@@ -442,7 +478,7 @@ final class ManifestStore {
         false,
         null,
         UNFENCED,
-        (s, id) -> {});
+        Attempts.UNOBSERVED);
   }
 
   private Manifest publish(
@@ -456,7 +492,7 @@ final class ManifestStore {
       boolean recoveryFence,
       @Nullable NamespaceFence namespaceFence,
       long expectedWriteEpoch,
-      BiConsumer<Long, String> beforeCas)
+      Attempts attempts)
       throws IOException {
     createCacheDirectories();
     for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
@@ -515,6 +551,7 @@ final class ManifestStore {
               .addAllEventJson(eventJson)
               .setCreatedAtEpochMillis(now)
               .setWriter(writer)
+              .setWriterProcess(WRITER_PROCESS)
               .setBaseRevision(current.getRevision())
               .setTransactionId(transactionId)
               .setPreviousTransactionId(current.getHeadTransactionId());
@@ -554,7 +591,7 @@ final class ManifestStore {
       }
       Manifest updated = next.build();
 
-      beforeCas.accept(sequence, transactionId);
+      attempts.attempting(sequence, transactionId);
       ObjectStore.StoredObject stored;
       try {
         stored =
@@ -577,6 +614,7 @@ final class ManifestStore {
           throw new AmbiguousPublicationException(sequence, transactionId, cause);
         }
         if (landed) {
+          attempts.settled(true);
           notifyPublished(fresh);
           return fresh.manifest();
         }
@@ -585,11 +623,13 @@ final class ManifestStore {
         }
         // A different transaction occupies the sequence, so this CAS cannot still land. A
         // conflict retries on that manifest; other definite failures retain their original cause.
+        attempts.settled(false);
         if (!(failure instanceof ObjectStoreConflictException)) {
           throw cause;
         }
         continue;
       }
+      attempts.settled(true);
       VersionedManifest published = new VersionedManifest(updated, stored.version());
       cache.offer(cacheKey, published);
       notifyPublished(published);
@@ -601,7 +641,23 @@ final class ManifestStore {
   /** A definitive outcome, proved against a manifest that has reached the attempt's sequence. */
   record Resolution(Manifest manifest, boolean landed) {}
 
+  /** Whether a manifest's history holds one publication attempt its head has reached. */
+  @FunctionalInterface
+  interface History {
+    boolean contains(Manifest manifest) throws IOException;
+  }
+
   Resolution resolvePublication(long sequence, String transactionId) throws IOException {
+    return resolvePublication(
+        sequence, transactionId, fresh -> transactionLanded(fresh, sequence, transactionId));
+  }
+
+  /**
+   * @param history answers for the attempt once the head has reached {@code sequence}; a caller
+   *     that shares the answer with others passes its own lookup
+   */
+  Resolution resolvePublication(long sequence, String transactionId, History history)
+      throws IOException {
     Manifest fresh = refresh();
     if (fresh.getHeadSeq() < sequence) {
       // Absence from an earlier snapshot is not failure: the timed-out request may still run.
@@ -619,12 +675,12 @@ final class ManifestStore {
               true,
               null,
               UNFENCED,
-              (seq, id) -> {});
+              Attempts.UNOBSERVED);
     }
     if (fresh.getHeadSeq() < sequence) {
       throw new IOException("Manifest history precedes unresolved publication " + transactionId);
     }
-    return new Resolution(fresh, transactionLanded(fresh, sequence, transactionId));
+    return new Resolution(fresh, history.contains(fresh));
   }
 
   private void notifyPublished(VersionedManifest manifest) {
@@ -908,7 +964,11 @@ final class ManifestStore {
   /**
    * Whether the manifest's history contains this publication attempt: the chain from the head
    * passes through the attempt's transaction id at its sequence. No read when the attempt is the
-   * head itself.
+   * head itself; otherwise one log entry is read for each sequence between the two.
+   *
+   * <p>False for a manifest that has not reached the sequence means "not there yet", not "never".
+   * Once the head has reached the sequence the answer is final, whichever it is: the log only
+   * grows, so the entry at a sequence never changes.
    */
   boolean transactionLanded(Manifest manifest, long sequence, String transactionId)
       throws IOException {
@@ -974,6 +1034,12 @@ final class ManifestStore {
       // Some filesystems do not expose directory fsync through FileChannel.
     }
   }
+
+  /**
+   * What tells this process from every other one that wrote or will write entries on this host.
+   * {@link #writerIdentity()} does not: a container's restart repeats host name and process id.
+   */
+  static final String WRITER_PROCESS = UUID.randomUUID().toString();
 
   static String writerIdentity() {
     return writerHost() + ":" + ProcessHandle.current().pid();

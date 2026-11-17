@@ -18,8 +18,10 @@ import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 import static com.google.common.truth.TruthJUnit.assume;
+import static com.google.gerrit.acceptance.testsuite.project.TestProjectUpdate.allowCapability;
 import static com.google.gerrit.acceptance.testsuite.project.TestProjectUpdate.allowLabel;
 import static com.google.gerrit.acceptance.testsuite.project.TestProjectUpdate.block;
+import static com.google.gerrit.common.data.GlobalCapability.QUERY_LIMIT;
 import static com.google.gerrit.extensions.client.ListChangesOption.DETAILED_LABELS;
 import static com.google.gerrit.extensions.client.ListChangesOption.REVIEWED;
 import static com.google.gerrit.server.group.SystemGroupBackend.REGISTERED_USERS;
@@ -2065,6 +2067,78 @@ public abstract class AbstractQueryChangesTest extends GerritServerTests {
         .hasMessageThat()
         .isEqualTo("Cannot go beyond page 10 of results");
     assertQuery(query.withLimit(100).withStart(100));
+  }
+
+  @Test
+  public void maxPagesWithLargestStart() throws Exception {
+    Project.NameKey project = Project.nameKey("repo");
+    repo = createAndOpenProject(project);
+    insert(project, newChange(repo));
+
+    // The number of the page after this one does not fit an int.
+    assertThatQueryException(newQuery("status:new").withLimit(1).withStart(Integer.MAX_VALUE))
+        .hasMessageThat()
+        .isEqualTo("Cannot go beyond page 10 of results");
+  }
+
+  @Test
+  public void maxPagesWithNoLimit() throws Exception {
+    Project.NameKey project = Project.nameKey("repo");
+    repo = createAndOpenProject(project);
+    Change change1 = insert(project, newChange(repo));
+    Change change2 = insert(project, newChange(repo));
+    Change change3 = insert(project, newChange(repo));
+    setQueryLimitOfRegisteredUsers(2);
+
+    // The pages of a query without limit are as large as the user's query limit.
+    QueryRequest query = newQuery("status:new").withNoLimit();
+    assertQuery(query, change3, change2);
+    assertQuery(query.withStart(2), change1);
+    assertQuery(query.withStart(19));
+    assertThatQueryException(query.withStart(20))
+        .hasMessageThat()
+        .isEqualTo("Cannot go beyond page 10 of results");
+  }
+
+  @Test
+  public void noLimitLiftsTheLimitsOfTheRequestWithinTheQueryLimit() throws Exception {
+    Project.NameKey project = Project.nameKey("repo");
+    repo = createAndOpenProject(project);
+    Change change1 = insert(project, newChange(repo));
+    Change change2 = insert(project, newChange(repo));
+    Change change3 = insert(project, newChange(repo));
+
+    QueryRequest query = newQuery("status:new limit:1").withLimit(1);
+    assertQuery(query, change3);
+    assertQuery(query.withNoLimit(), change3, change2, change1);
+
+    setQueryLimitOfRegisteredUsers(2);
+    List<ChangeInfo> results = assertQuery(query.withNoLimit(), change3, change2);
+    assertThat(Iterables.getLast(results)._moreChanges).isTrue();
+  }
+
+  @Test
+  public void noLimitOfInternalQueryIsNotBoundedByTheQueryLimit() throws Exception {
+    Project.NameKey project = Project.nameKey("repo");
+    repo = createAndOpenProject(project);
+    Change change1 = insert(project, newChange(repo));
+    Change change2 = insert(project, newChange(repo));
+    Change change3 = insert(project, newChange(repo));
+    setQueryLimitOfRegisteredUsers(1);
+
+    assertThat(
+            queryProvider.get().setNoLimit(true).byProject(project).stream()
+                .map(ChangeData::getId)
+                .collect(toImmutableList()))
+        .containsExactly(change1.getId(), change2.getId(), change3.getId());
+  }
+
+  private void setQueryLimitOfRegisteredUsers(int limit) {
+    projectOperations
+        .project(allProjectsName)
+        .forUpdate()
+        .add(allowCapability(QUERY_LIMIT).group(REGISTERED_USERS).range(0, limit))
+        .update();
   }
 
   @Test

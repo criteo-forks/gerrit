@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableBatchRefUpdate;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableDatabase;
@@ -39,6 +40,9 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   private final LocalWalGitObjectDatabase objectDatabase;
   /** The manifest revision the cached reftable stack was built from. */
   private volatile long stackRevision = -1;
+
+  /** Counts the times the reftable stack was dropped; see {@link #revalidatedGeneration}. */
+  private final AtomicLong generation = new AtomicLong();
 
   LocalWalGitRefDatabase(
       DfsRepository repository, LocalWalGitObjectDatabase objectDatabase) {
@@ -110,8 +114,33 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
 
   @Override
   public void refresh() {
+    // Read first: a stack that is rebuilt right after the reset mirrors this revision or a newer
+    // one, never an older one than the revision recorded for it.
+    long observed = objectDatabase.observedManifestRevision();
     super.refresh();
-    stackRevision = objectDatabase.observedManifestRevision();
+    stackRevision = observed;
+    generation.incrementAndGet();
+  }
+
+  /**
+   * Adopts a newer manifest as every lookup does, then says which generation of refs this database
+   * serves. The number changes whenever the reftable stack is dropped, which is the only way a
+   * lookup's answer changes, so a caller that finds the number it saw before knows that every ref
+   * has the value it had, without looking it up under the stack's lock.
+   */
+  long revalidatedGeneration() throws IOException {
+    revalidate();
+    return generation.get();
+  }
+
+  /** The generation as it is, without adopting anything; see {@link #revalidatedGeneration}. */
+  long generation() {
+    return generation.get();
+  }
+
+  /** A ref transaction of this handle ran: JGit dropped the stack on the way. */
+  private void refsChanged() {
+    generation.incrementAndGet();
   }
 
   /**
@@ -170,7 +199,11 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
           try {
             objectDatabase.beginRefTransaction();
             refDatabase.refresh();
-            super.execute(walk, monitor, options);
+            try {
+              super.execute(walk, monitor, options);
+            } finally {
+              refDatabase.refsChanged();
+            }
           } finally {
             // A publication released the lock as soon as the reftable was written; a transaction
             // that failed validation still holds it.

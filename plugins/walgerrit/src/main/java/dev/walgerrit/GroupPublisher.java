@@ -27,6 +27,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -143,7 +145,91 @@ final class GroupPublisher {
   /** Publications whose outcome is unknown, with the packs they carried; settled from the log. */
   private final List<Uncertain> uncertain = new ArrayList<>();
 
-  private record Attempt(long sequence, String transactionId) {}
+  /**
+   * One compare-and-swap a publication tried: the log entry it would have made the head.
+   *
+   * <p>Whether that entry is in the repository's history is unknown while the head has not reached
+   * its sequence. From then on it is a fact about the log, the same against every later manifest,
+   * so it is established once and kept here, where every reader of the packs the attempt carried
+   * finds it: by the publisher when the store proves it, otherwise by the first reader that needs
+   * it, whose walk of the log the readers arriving meanwhile wait for instead of repeating. The
+   * record goes when the last pending pack and reader let go of it.
+   */
+  private static final class Attempt {
+    final long sequence;
+    final String transactionId;
+
+    /** Null until proved, then never changed. Guarded by this. */
+    private Boolean landed;
+
+    /** A reader's walk in progress. Guarded by this. */
+    private CompletableFuture<Boolean> lookup;
+
+    Attempt(long sequence, String transactionId) {
+      this.sequence = sequence;
+      this.transactionId = transactionId;
+    }
+
+    /** Records an outcome the store proved. */
+    synchronized void settle(boolean outcome) {
+      if (landed == null) {
+        landed = outcome;
+      }
+    }
+
+    /**
+     * Whether the attempt is in the history of {@code manifest}, whose head has reached its
+     * sequence. A lookup that fails is not remembered: the next caller walks again.
+     */
+    boolean landed(ManifestStore store, Manifest manifest) throws IOException {
+      CompletableFuture<Boolean> running;
+      boolean walking = false;
+      synchronized (this) {
+        if (landed != null) {
+          return landed;
+        }
+        if (lookup == null) {
+          lookup = new CompletableFuture<>();
+          walking = true;
+        }
+        running = lookup;
+      }
+      if (!walking) {
+        return await(running);
+      }
+      boolean outcome;
+      try {
+        outcome = store.transactionLanded(manifest, sequence, transactionId);
+      } catch (Throwable failure) {
+        // Whatever ended the walk, the readers waiting for it must not wait for ever.
+        synchronized (this) {
+          lookup = null;
+        }
+        running.completeExceptionally(failure);
+        throw failure;
+      }
+      synchronized (this) {
+        if (landed == null) {
+          landed = outcome;
+        }
+        outcome = landed;
+        lookup = null;
+      }
+      running.complete(outcome);
+      return outcome;
+    }
+
+    private static boolean await(CompletableFuture<Boolean> running) throws IOException {
+      try {
+        return running.get();
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new IOException("Interrupted while a pending publication was looked up", interrupted);
+      } catch (ExecutionException failed) {
+        throw new IOException("Looking up a pending publication failed", failed.getCause());
+      }
+    }
+  }
 
   /**
    * Shared with read snapshots even after it leaves the inventory. Registering the attempt before
@@ -159,8 +245,9 @@ final class GroupPublisher {
     }
   }
 
-  /** A lost-response publication: which transaction, and which pending packs rode in it. */
-  private record Uncertain(long sequence, String transactionId, Set<String> packNames) {}
+  /** A lost-response publication: which attempt, and which pending packs rode in it. */
+  private record Uncertain(Attempt attempt, Set<String> packNames) {}
+
   private boolean publishing;
   private long epoch;
   private long knownRefRevision = -1;
@@ -263,21 +350,17 @@ final class GroupPublisher {
       state.unlock();
     }
     Manifest manifest = refresh ? store.refresh() : store.current();
-    Map<Attempt, Boolean> outcomes = new LinkedHashMap<>();
     List<PackRef> unpublished = new ArrayList<>();
     for (PendingPack pending : packs) {
       // Read the attempt after the manifest. A CAS registered after this inventory snapshot may
       // already have landed by the manifest read. The shared record survives inventory removal.
       Attempt attempt = pending.attempt;
-      boolean landed = false;
-      if (attempt != null && manifest.getHeadSeq() >= attempt.sequence()) {
-        Boolean known = outcomes.get(attempt);
-        if (known == null) {
-          known = store.transactionLanded(manifest, attempt.sequence(), attempt.transactionId());
-          outcomes.put(attempt, known);
-        }
-        landed = known;
-      }
+      // An attempt the head has not reached is not asked about: its pack is unpublished for now,
+      // and nothing is remembered about it.
+      boolean landed =
+          attempt != null
+              && manifest.getHeadSeq() >= attempt.sequence
+              && attempt.landed(store, manifest);
       if (!landed) {
         unpublished.add(pending.pack);
       }
@@ -469,6 +552,9 @@ final class GroupPublisher {
         if (member.isRefTransaction()) {
           refUpdate = true;
           transaction.addAllUpdates(member.refTransaction.getUpdatesList());
+          // Which updates were one transaction is what tells a submit's branch update from the
+          // branch update of another request that happened to be published with it.
+          transaction.addMembers(member.refTransaction.getUpdatesCount());
         }
       }
       if (accepted.isEmpty()) {
@@ -526,6 +612,7 @@ final class GroupPublisher {
       long expectedWriteEpoch,
       List<PackRef> carried)
       throws IOException {
+    CarriedAttempts attempts = new CarriedAttempts(carried);
     try {
       return store.publish(
           expectedRefRevision,
@@ -534,32 +621,53 @@ final class GroupPublisher {
           refUpdate,
           transaction,
           expectedWriteEpoch,
-          (sequence, transactionId) -> {
-            Attempt attempt = new Attempt(sequence, transactionId);
-            state.lock();
-            try {
-              for (PackRef pack : carried) {
-                inFlightAdditions.get(pack.getName()).attempt = attempt;
-              }
-            } finally {
-              state.unlock();
-            }
-          });
+          attempts);
     } catch (AmbiguousPublicationException unknown) {
       // Associate packs only with their own attempted publication, never with a recovery fence.
-      remember(unknown, carried);
+      remember(attempts.last, carried);
       throw unknown;
     }
   }
 
-  private void remember(AmbiguousPublicationException unknown, List<PackRef> carried) {
+  /**
+   * Puts each attempt of one publication on the packs it carries, and its outcome on the attempt.
+   */
+  private final class CarriedAttempts implements ManifestStore.Attempts {
+    private final List<PackRef> carried;
+    private Attempt last;
+
+    CarriedAttempts(List<PackRef> carried) {
+      this.carried = carried;
+    }
+
+    @Override
+    public void attempting(long sequence, String transactionId) {
+      Attempt attempt = new Attempt(sequence, transactionId);
+      state.lock();
+      try {
+        for (PackRef pack : carried) {
+          inFlightAdditions.get(pack.getName()).attempt = attempt;
+        }
+      } finally {
+        state.unlock();
+      }
+      last = attempt;
+    }
+
+    @Override
+    public void settled(boolean landed) {
+      last.settle(landed);
+    }
+  }
+
+  private void remember(Attempt unknown, List<PackRef> carried) {
     Set<String> names = new HashSet<>();
     for (PackRef pack : carried) {
       names.add(pack.getName());
     }
     state.lock();
     try {
-      uncertain.add(new Uncertain(unknown.sequence(), unknown.transactionId(), names));
+      uncertain.add(new Uncertain(unknown, names));
     } finally {
       state.unlock();
     }
@@ -582,8 +690,12 @@ final class GroupPublisher {
       state.unlock();
     }
     for (Uncertain publication : unsettled) {
+      Attempt attempt = publication.attempt();
+      // The same lookup a reader of the attempt's packs makes: whoever gets there first answers
+      // for both.
       ManifestStore.Resolution resolution =
-          store.resolvePublication(publication.sequence(), publication.transactionId());
+          store.resolvePublication(
+              attempt.sequence, attempt.transactionId, fresh -> attempt.landed(store, fresh));
       state.lock();
       try {
         if (resolution.landed()) {

@@ -81,6 +81,15 @@ view. They are either still live in the manifest or have been superseded. This c
 write whose response is in flight, including one already followed by compaction. Readers resolve
 identity without fencing or changing pending state; packs from one attempt share the history check.
 
+The check is made once per attempt, not once per reader. While the head has not reached the
+attempt's sequence there is nothing to check and nothing is remembered: the packs are unpublished
+for now. Once the head has reached it, which transaction occupies the sequence never changes, so
+the answer is kept on the attempt record that the pending packs and the readers share. The
+publisher records it when the store proves it during publication, which covers a lost CAS; for an
+unresolved attempt the first reader walks the log from the head to the sequence, one entry per
+read, readers arriving meanwhile wait for that walk, and recovery reuses its answer. A walk that
+fails is not remembered. The record needs no eviction: it goes with its pending packs.
+
 Pending records and unresolved outcomes exist only in node memory. A restart forgets them and
 cannot re-add them. Their files are either covered by committed history or left for reclamation.
 
@@ -167,6 +176,7 @@ listeners open; a failed background sweep revokes readiness. Readiness reports t
 not a cross-repository snapshot or a barrier against later writes.
 
 Repository streams have no global order. An All-Users draft or star update that depends on a
-change not yet discoverable in its project is retried. See [Index events](index-events.md).
+change not yet discoverable in its project is retried, within the sweep after the other
+repositories and otherwise by the next one. See [Index events](index-events.md).
 Separate public `EVENT` notifications are [best effort](events.md), with possible loss and
 duplication; they do not inherit the ref payload's durability guarantee.

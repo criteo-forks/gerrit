@@ -28,7 +28,9 @@ import dev.walgerrit.IndexEventApplier.NamespaceChange;
 import dev.walgerrit.ManifestCache.VersionedManifest;
 import dev.walgerrit.proto.StorageProto.IndexCursor;
 import dev.walgerrit.proto.StorageProto.LogEntry;
+import dev.walgerrit.proto.StorageProto.LogPosition;
 import dev.walgerrit.proto.StorageProto.Manifest;
+import dev.walgerrit.proto.StorageProto.OwedMerge;
 import dev.walgerrit.proto.StorageProto.RefUpdate;
 import java.io.IOException;
 import java.time.Duration;
@@ -89,14 +91,41 @@ import org.slf4j.LoggerFactory;
  * never the name an entry was written under. The catalog's own transactions are replayed too: the
  * names they touched are handed to the applier with what the catalog says about them now, so every
  * node converges on the current namespace, whatever the order of the transitions it observed.
+ *
+ * <p>A submit fires its change-merged events after it committed, so a process that ends in between
+ * leaves merges nobody was told about. The tailer keeps, in each repository's cursor file, the
+ * merges that this node's ref transactions made and whose event has not appeared in the log, and
+ * fires the events of those whose process has ended; see {@link #fireOwed}.
  */
 @Singleton
 final class IndexEventTailer implements LifecycleListener {
   private static final Logger logger = LoggerFactory.getLogger(IndexEventTailer.class);
 
+  /** Merges kept per repository while their event is not in the log. */
+  static final int OWED_MERGES_KEPT = 10_000;
+
   private final WalGitRepositoryManager repositories;
   private final IndexEventApplier applier;
   private final EventReplayer replayer;
+  private volatile MergeEvents mergeEvents = MergeEvents.NONE;
+
+  /**
+   * What tells the entries this process wrote from those of an earlier process of this node, whose
+   * events nobody fires any more.
+   */
+  private volatile String process = ManifestStore.WRITER_PROCESS;
+
+  /** Repositories whose cursor file holds a merge that is due; see {@link #fireOwed}. */
+  private final Set<RepositoryId> owedRepositories = ConcurrentHashMap.newKeySet();
+
+  /** Repositories among them that wait for the delivery thread. */
+  private final Set<RepositoryId> queuedDeliveries = ConcurrentHashMap.newKeySet();
+
+  /** The one thread that fires owed events; null until everything that hears events runs. */
+  private volatile ExecutorService owedEventDelivery;
+
+  /** Set when delivery ends: the journal is about to stop, nothing more is fired. */
+  private volatile boolean owedEventDeliveryStopped;
 
   /**
    * Whether a log entry's writer is another node; this node's own events were fired here already.
@@ -290,6 +319,7 @@ final class IndexEventTailer implements LifecycleListener {
       IndexEventReadiness readiness,
       GerritIndexRebuilder rebuilder,
       GerritEventReplayer replayer,
+      GerritMergeEvents mergeEvents,
       GossipEndpoint gossip) {
     this(
         asWalGit(repositories),
@@ -300,6 +330,7 @@ final class IndexEventTailer implements LifecycleListener {
         readiness,
         rebuilder,
         replayer);
+    this.mergeEvents = mergeEvents;
     gossip.onHint((id, hint) -> wake(id, hint.getManifestVersion()));
   }
 
@@ -418,6 +449,7 @@ final class IndexEventTailer implements LifecycleListener {
       runningBarrierPools = barrierPools;
       barrierPools = null;
     }
+    stopOwedEventDelivery();
     if (runningBarrierPools != null) {
       // Running reads and replays finish; they are interrupted only if they outlast the wait below.
       runningBarrierPools.shutdown();
@@ -909,18 +941,24 @@ final class IndexEventTailer implements LifecycleListener {
     }
   }
 
+  /**
+   * Lists every repository and replays those whose manifest changed, the catalog first.
+   *
+   * <p>The logs of different repositories have no common order: an All-Users entry can name a
+   * change whose own repository this sweep replays later, or whose creation was published after the
+   * sweep's listing. A repository whose replay failed is therefore {@linkplain #replayWaiting
+   * replayed once more} after the others. What fails then fails the sweep.
+   */
   private Map<RepositoryId, IndexRebuildRequiredException> sweep() throws IOException {
     NavigableMap<RepositoryId, String> heads = repositories.storage().listManifestVersions();
     caughtUpVersions.keySet().retainAll(heads.keySet());
     appliedSequences.keySet().retainAll(heads.keySet());
     ownSequences.keySet().retainAll(heads.keySet());
     Map<RepositoryId, IndexRebuildRequiredException> stale = new LinkedHashMap<>();
-    Exception firstFailure = null;
-    // The catalog first: a repository's entries are indexed under the name it has now, and that
-    // name may be what the catalog's own entries in this sweep established.
-    List<Map.Entry<RepositoryId, String>> ordered = new ArrayList<>(heads.entrySet());
-    ordered.sort((a, b) -> Boolean.compare(!a.getKey().isCatalog(), !b.getKey().isCatalog()));
-    for (Map.Entry<RepositoryId, String> head : ordered) {
+    List<Exception> failures = new ArrayList<>();
+    // Repositories to replay once more, each with the head this node knew when its replay failed.
+    Map<RepositoryId, Long> waiting = new LinkedHashMap<>();
+    for (Map.Entry<RepositoryId, String> head : catalogFirst(heads)) {
       RepositoryId id = head.getKey();
       if (head.getValue().equals(caughtUpVersions.get(id))) {
         // Nothing to replay, but the listing just confirmed the node's view of this manifest.
@@ -935,21 +973,104 @@ final class IndexEventTailer implements LifecycleListener {
         // Every other repository would wait as long.
         throw busy;
       } catch (IOException | RuntimeException exception) {
-        logger.error("WalGerrit index-event replay failed for {}", id, exception);
-        if (firstFailure == null) {
-          firstFailure = exception;
+        Long known = id.isCatalog() ? null : knownHead(id);
+        if (known == null) {
+          // Every repository is indexed under the name the catalog gives it; replaying the
+          // others first changes nothing for the catalog.
+          logger.error("WalGerrit index-event replay failed for {}", id, exception);
+          failures.add(exception);
         } else {
-          firstFailure.addSuppressed(exception);
+          logger.info(
+              "WalGerrit index-event sweep will replay {} once more after the other"
+                  + " repositories: {}",
+              id,
+              exception.toString());
+          waiting.put(id, known);
         }
       }
     }
-    if (firstFailure instanceof IOException ioException) {
-      throw ioException;
+    if (!waiting.isEmpty()) {
+      replayWaiting(waiting, stale, failures);
     }
-    if (firstFailure instanceof RuntimeException runtimeException) {
-      throw runtimeException;
+    if (!failures.isEmpty()) {
+      Exception first = failures.get(0);
+      failures.subList(1, failures.size()).forEach(first::addSuppressed);
+      if (first instanceof IOException ioException) {
+        throw ioException;
+      }
+      throw (RuntimeException) first;
     }
     return stale;
+  }
+
+  /**
+   * Replays the repositories whose replay failed in this sweep, after what their entries may depend
+   * on.
+   *
+   * <p>What an entry depends on was published before it, though perhaps after the sweep's listing,
+   * so the store is listed once more and every other repository behind that listing is replayed
+   * first. Each waiting repository is then replayed up to the head this node knew when its replay
+   * failed: an entry beyond it can depend on a publication this second listing does not hold
+   * either, and is left to the next wake-up or sweep rather than chased. Cursors move as in any
+   * replay, entry by entry and only over entries that were applied.
+   */
+  private void replayWaiting(
+      Map<RepositoryId, Long> waiting,
+      Map<RepositoryId, IndexRebuildRequiredException> stale,
+      List<Exception> failures)
+      throws IOException {
+    for (Map.Entry<RepositoryId, String> head :
+        catalogFirst(repositories.storage().listManifestVersions())) {
+      RepositoryId id = head.getKey();
+      if (waiting.containsKey(id) || head.getValue().equals(caughtUpVersions.get(id))) {
+        continue;
+      }
+      try {
+        catchUp(id, head.getValue());
+      } catch (IndexRebuildRequiredException rebuildRequired) {
+        stale.put(id, rebuildRequired);
+      } catch (ReplayBusyException busy) {
+        throw busy;
+      } catch (IOException | RuntimeException exception) {
+        logger.error("WalGerrit index-event replay failed for {}", id, exception);
+        failures.add(exception);
+      }
+    }
+    for (Map.Entry<RepositoryId, Long> again : waiting.entrySet()) {
+      RepositoryId id = again.getKey();
+      try {
+        replayLocked(id, null, again.getValue());
+      } catch (IndexRebuildRequiredException rebuildRequired) {
+        stale.put(id, rebuildRequired);
+      } catch (ReplayBusyException busy) {
+        throw busy;
+      } catch (IOException | RuntimeException exception) {
+        logger.error(
+            "WalGerrit index-event replay failed for {}, also after the other repositories",
+            id,
+            exception);
+        failures.add(exception);
+      }
+    }
+  }
+
+  /** The listed repositories with the catalog ahead of the others. */
+  private static List<Map.Entry<RepositoryId, String>> catalogFirst(
+      Map<RepositoryId, String> heads) {
+    // The catalog first: a repository's entries are indexed under the name it has now, and that
+    // name may be what the catalog's own entries in this sweep established.
+    List<Map.Entry<RepositoryId, String>> ordered = new ArrayList<>(heads.entrySet());
+    ordered.sort((a, b) -> Boolean.compare(!a.getKey().isCatalog(), !b.getKey().isCatalog()));
+    return ordered;
+  }
+
+  /** The head of {@code id} in the newest manifest this node has read; null when it has none. */
+  private Long knownHead(RepositoryId id) {
+    try {
+      return repositories.storage().manifestStore(id).current().getHeadSeq();
+    } catch (IOException | RuntimeException unreadable) {
+      return null;
+    }
   }
 
   /** Replays the repository {@code project} is bound to; for tests. */
@@ -982,14 +1103,19 @@ final class IndexEventTailer implements LifecycleListener {
     return replayLocked(id, listedVersion).applied();
   }
 
-  /** Replays {@code id} while no other thread replays and the namespace allows it. */
+  /** Replays {@code id} to its head while no other thread replays and the namespace allows it. */
   private Replay replayLocked(RepositoryId id, String listedVersion) throws IOException {
+    return replayLocked(id, listedVersion, Long.MAX_VALUE);
+  }
+
+  /** As {@link #replayLocked(RepositoryId, String)}, applying no entry beyond {@code upTo}. */
+  private Replay replayLocked(RepositoryId id, String listedVersion, long upTo) throws IOException {
     Lock namespace = id.isCatalog() ? namespaceLock.writeLock() : namespaceLock.readLock();
     lockForReplay(namespace, "replaying " + id);
     try {
       ReentrantLock replaying = lockForReplay(id);
       try {
-        return replay(id, listedVersion);
+        return replay(id, listedVersion, upTo);
       } finally {
         replaying.unlock();
       }
@@ -1017,19 +1143,30 @@ final class IndexEventTailer implements LifecycleListener {
     }
   }
 
-  private Replay replay(RepositoryId id, String listedVersion) throws IOException {
+  /**
+   * Replays the entries of {@code id} after its cursor, up to sequence {@code upTo}. A replay that
+   * stops short of the head leaves the repository behind: it is not recorded as caught up, and the
+   * next replay continues from the cursor.
+   */
+  private Replay replay(RepositoryId id, String listedVersion, long upTo) throws IOException {
     ManifestStore manifestStore = repositories.storage().manifestStore(id);
     IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
     IndexCursor cursor = cursorStore.read();
     noteApplied(id, cursor.getSequence());
+    boolean tracking = !id.isCatalog() && tracksMerges();
     if (listedVersion != null
         && !cursor.getManifestVersion().isEmpty()
-        && cursor.getManifestVersion().equals(listedVersion)) {
+        && cursor.getManifestVersion().equals(listedVersion)
+        && !(tracking && cursor.hasMergesReadTo())) {
       // The cursor reached the head of exactly the manifest the listing reports: nothing was
       // published since, so there is nothing to read or replay. This is what lets a restarted
       // node's first sweep cost one listing rather than one read per repository.
       manifestStore.noteListedVersion(listedVersion);
       caughtUpVersions.put(id, listedVersion);
+      if (tracking) {
+        // What an earlier process of this node left owed is in the file, not in the log.
+        noteOwed(id, cursor.getOwedList());
+      }
       return new Replay(0, false, false);
     }
     VersionedManifest versioned =
@@ -1044,10 +1181,18 @@ final class IndexEventTailer implements LifecycleListener {
             cursor.getTransactionId(),
             manifest,
             repositories.configuration().indexReplayLimit());
+    boolean toHead = upTo >= manifest.getHeadSeq();
+    if (!toHead) {
+      entries = entries.stream().filter(entry -> entry.getSeq() <= upTo).toList();
+    }
+    // Entries that a rebuild or a reindex moved the cursor over, to be read for merges only.
+    // The read above found the cursor's entry in this repository's history.
+    List<LogEntry> passedOver =
+        tracking && cursor.hasMergesReadTo() ? passedOver(id, manifestStore, cursor) : List.of();
     Project.NameKey project = null;
     if (id.isCatalog()) {
       applyCatalog(entries);
-    } else if (!entries.isEmpty()) {
+    } else if (!entries.isEmpty() || !passedOver.isEmpty()) {
       Optional<Binding> binding = repositories.catalog().bindingOf(id, false);
       if (binding.isPresent() && binding.get().pending()) {
         logger.info(
@@ -1058,6 +1203,17 @@ final class IndexEventTailer implements LifecycleListener {
         return new Replay(0, true, !changesTouched(entries).isEmpty());
       }
       project = binding.filter(Binding::active).map(Binding::name).orElse(null);
+    }
+    long replayedFrom = cursor.getSequence();
+    List<OwedMerge> owed = new ArrayList<>(cursor.getOwedList());
+    if (tracking && cursor.hasMergesReadTo()) {
+      if (project != null) {
+        for (LogEntry entry : passedOver) {
+          trackMerges(id, project, entry, owed);
+        }
+      }
+      cursor = cursor.toBuilder().clearMergesReadTo().clearOwed().addAllOwed(owed).build();
+      cursorStore.write(cursor);
     }
     Set<Integer> reindexedByRefs = changesTouched(entries);
     int applied = 0;
@@ -1085,7 +1241,16 @@ final class IndexEventTailer implements LifecycleListener {
         applier.reindex(project, entry.getIndexUpdate(), reindexedByRefs);
         reindexed++;
       }
-      cursorStore.write(entry.getSeq(), entry.getTransactionId());
+      if (tracking && project != null) {
+        trackMerges(id, project, entry, owed);
+      }
+      // One replacement of the file passes the entry and records what it merged or announced.
+      cursor =
+          IndexCursorStore.at(cursor, entry.getSeq(), entry.getTransactionId(), "").toBuilder()
+              .clearOwed()
+              .addAllOwed(owed)
+              .build();
+      cursorStore.write(cursor);
       noteApplied(id, entry.getSeq());
     }
     if (!entries.isEmpty()) {
@@ -1094,22 +1259,318 @@ final class IndexEventTailer implements LifecycleListener {
               + " event entries and {} index updates from other nodes)",
           id,
           id.isCatalog() ? "the catalog" : project == null ? "no active name" : project.get(),
-          cursor.getSequence(),
-          manifest.getHeadSeq(),
+          replayedFrom,
+          entries.get(entries.size() - 1).getSeq(),
           applied,
           replayed,
           reindexed);
     }
+    if (!toHead) {
+      return new Replay(applied, false, false);
+    }
     if (!entries.isEmpty() || !versioned.version().equals(cursor.getManifestVersion())) {
       // At the head now; remember which manifest version that is.
       cursorStore.write(
-          manifest.getHeadSeq(), manifest.getHeadTransactionId(), versioned.version());
+          IndexCursorStore.at(
+              cursor, manifest.getHeadSeq(), manifest.getHeadTransactionId(), versioned.version()));
     }
     // Record the version of the manifest that was actually replayed, never a newer one another
     // handle may have cached meanwhile: the next listing must not skip entries this node has not
     // applied.
     caughtUpVersions.put(id, versioned.version());
+    if (tracking) {
+      // Every entry an earlier process of this node wrote has been read: what it still owes will
+      // not appear by itself.
+      noteOwed(id, owed);
+    }
     return new Replay(applied, false, false);
+  }
+
+  /** Whether this node records the merges it makes: it has events, and a journal to carry them. */
+  private boolean tracksMerges() {
+    return mergeEvents != MergeEvents.NONE && repositories.configuration().eventJournalEnabled();
+  }
+
+  /**
+   * The entries between where merges were read to and the cursor. Empty, with an error, when they
+   * cannot be read any more: what they merged is then not known to this node.
+   */
+  private List<LogEntry> passedOver(
+      RepositoryId id, ManifestStore manifestStore, IndexCursor cursor) throws IOException {
+    LogPosition readTo = cursor.getMergesReadTo();
+    if (readTo.getSequence() >= cursor.getSequence()) {
+      return List.of();
+    }
+    try {
+      // Up to the cursor, not the head: what was published since is replayed, and counts against
+      // the replay limit, by itself.
+      return manifestStore.readLogEntriesBetween(
+          readTo.getSequence(),
+          readTo.getTransactionId(),
+          cursor.getSequence(),
+          cursor.getTransactionId(),
+          repositories.configuration().indexReplayLimit());
+    } catch (IndexRebuildRequiredException unreadable) {
+      logger.error(
+          "WalGerrit cannot read the entries {} to {} of {} that an index rebuild passed over: {}."
+              + " A change-merged event that was lost with a process of this node that merged a"
+              + " change in them is not sent again",
+          readTo.getSequence() + 1,
+          cursor.getSequence(),
+          id,
+          unreadable.getMessage());
+      return List.of();
+    }
+  }
+
+  /**
+   * Brings {@code owed} up to date with one entry: adds the changes a ref transaction of this node
+   * merged, and removes those whose change-merged event the entry carries, whoever journaled it.
+   */
+  private void trackMerges(
+      RepositoryId id, Project.NameKey project, LogEntry entry, List<OwedMerge> owed)
+      throws IOException {
+    if (entry.getKind() == LogEntry.Kind.REF_UPDATE
+        && entry.hasRefTransaction()
+        && !foreignWriter.test(entry.getWriter())) {
+      for (OwedMerge merge : mergeEvents.mergedBy(project, entry)) {
+        boolean known =
+            owed.stream()
+                .anyMatch(
+                    other ->
+                        other.getChange() == merge.getChange()
+                            && other.getMetaRevision().equals(merge.getMetaRevision()));
+        if (!known) {
+          owed.add(merge);
+        }
+      }
+      if (owed.size() > OWED_MERGES_KEPT) {
+        int dropped = owed.size() - OWED_MERGES_KEPT;
+        owed.subList(0, dropped).clear();
+        logger.error(
+            "WalGerrit dropped the {} oldest merge(s) of {} whose change-merged event is not in"
+                + " the log: more than {} wait for one",
+            dropped,
+            id,
+            OWED_MERGES_KEPT);
+      }
+    }
+    if (entry.getEventJsonCount() > 0 && !owed.isEmpty()) {
+      List<OwedMerge> left = mergeEvents.withoutAnnounced(owed, entry);
+      if (left.size() != owed.size()) {
+        owed.clear();
+        owed.addAll(left);
+      }
+    }
+  }
+
+  /** A merge is due when the process that is to fire its event is not this one: it ended. */
+  private boolean due(OwedMerge merge) {
+    return !merge.getProcess().equals(process);
+  }
+
+  /** Remembers whether {@code id} has merges that are due, and has them fired when it does. */
+  private void noteOwed(RepositoryId id, List<OwedMerge> owed) {
+    if (owed.stream().anyMatch(this::due)) {
+      owedRepositories.add(id);
+      queueDelivery(id);
+    } else {
+      owedRepositories.remove(id);
+    }
+  }
+
+  /**
+   * Begins firing owed events. Called once everything that hears events on this node runs, the
+   * journal included: an event fired before that reaches neither the plugins nor the log.
+   */
+  void startOwedEventDelivery() {
+    synchronized (this) {
+      if (!participating
+          || owedEventDelivery != null
+          || owedEventDeliveryStopped
+          || !tracksMerges()) {
+        return;
+      }
+      owedEventDelivery =
+          Executors.newSingleThreadExecutor(
+              runnable -> {
+                Thread thread = new Thread(runnable, "WalGerrit-Owed-Events");
+                thread.setDaemon(true);
+                return thread;
+              });
+    }
+    owedRepositories.forEach(this::queueDelivery);
+  }
+
+  /**
+   * Ends firing owed events, before the journal stops: an event that is being fired is fired to the
+   * end, with up to ten seconds for its listeners, and what was not begun stays owed for the next
+   * process. Idempotent.
+   */
+  void stopOwedEventDelivery() {
+    ExecutorService delivery;
+    synchronized (this) {
+      delivery = owedEventDelivery;
+      owedEventDelivery = null;
+      owedEventDeliveryStopped = true;
+    }
+    if (delivery == null) {
+      return;
+    }
+    delivery.shutdown();
+    try {
+      if (!delivery.awaitTermination(10, TimeUnit.SECONDS)) {
+        logger.warn(
+            "The listeners of a change-merged event that WalGerrit fired for an earlier process"
+                + " did not end within 10 seconds; what they fire from now on may miss the"
+                + " journal");
+      }
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  private void queueDelivery(RepositoryId id) {
+    ExecutorService delivery = owedEventDelivery;
+    if (delivery == null || !queuedDeliveries.add(id)) {
+      return;
+    }
+    try {
+      delivery.execute(
+          () -> {
+            queuedDeliveries.remove(id);
+            try {
+              fireOwed(id);
+            } catch (IOException | RuntimeException failure) {
+              logger.warn(
+                  "WalGerrit could not fire the change-merged events owed for {}; it tries again"
+                      + " after the next sweep",
+                  id,
+                  failure);
+            }
+          });
+    } catch (RejectedExecutionException stopping) {
+      queuedDeliveries.remove(id);
+    }
+  }
+
+  /**
+   * Fires the change-merged events of the merges of {@code id} that are due: made by a process of
+   * this node that ended, with no such event in the log up to the head this node has replayed.
+   *
+   * <p>The events are fired on the calling thread with no lock of the tailer held and not as a
+   * replay: their listeners run as for any event of this node, may write and may wait for this
+   * node's indexes, and the journal records the events and whatever the listeners fire. A merge
+   * whose event was fired is handed to this process and stays in the file until the journal's entry
+   * comes by; a process that ends before that leaves it due again. Delivery is therefore at least
+   * once: this node's listeners can hear an event twice, the log holds it once or, when the process
+   * ended between two journal writes, twice.
+   */
+  void fireOwed(RepositoryId id) throws IOException {
+    IndexCursorStore cursorStore =
+        new IndexCursorStore(repositories.storage().manifestStore(id).indexCursorPath());
+    List<OwedMerge> due;
+    // Not in the middle of a replay, which may be about to pass the entry that settles a merge.
+    replayLock.lock();
+    try {
+      IndexCursor cursor = cursorStore.read();
+      due = cursor.getOwedList().stream().filter(this::due).toList();
+      if (due.isEmpty()) {
+        owedRepositories.remove(id);
+        return;
+      }
+      if (cursor.hasMergesReadTo() || cursor.getManifestVersion().isEmpty()) {
+        // Entries this node has not read for events yet, passed over by a rebuild or beyond a
+        // cursor that is short of the head, may hold the event: wait for the replay that reads
+        // them rather than call it missing.
+        return;
+      }
+    } finally {
+      replayLock.unlock();
+    }
+    if (indexesInDoubt()) {
+      return; // Listeners look changes up; after the next sweep the indexes may hold them again.
+    }
+    Optional<Binding> binding = repositories.catalog().bindingOf(id, false);
+    if (binding.isPresent() && binding.get().pending()) {
+      return; // The listeners would look the changes up under a name that is about to change.
+    }
+    Project.NameKey project = binding.filter(Binding::active).map(Binding::name).orElse(null);
+    Map<OwedMerge, MergeEvents.Delivery> delivered = new LinkedHashMap<>();
+    for (OwedMerge merge : due) {
+      if (owedEventDeliveryStopped) {
+        break; // The journal is stopping; the next process fires what is left.
+      }
+      MergeEvents.Delivery delivery;
+      if (project == null) {
+        delivery = MergeEvents.Delivery.GONE;
+      } else {
+        try {
+          delivery = mergeEvents.fire(project, merge);
+        } catch (RuntimeException failure) {
+          logger.warn(
+              "WalGerrit could not fire the change-merged event owed for change {} of {}; it"
+                  + " tries again after the next sweep",
+              merge.getChange(),
+              project.get(),
+              failure);
+          continue;
+        }
+      }
+      delivered.put(merge, delivery);
+      String name = project == null ? id.toString() : project.get();
+      switch (delivery) {
+        case FIRED ->
+            logger.info(
+                "WalGerrit fired the change-merged event of change {} of {} (patch set {}, {}):"
+                    + " the process that merged it at sequence {} ended before the event reached"
+                    + " the log",
+                merge.getChange(),
+                name,
+                merge.getPatchSet(),
+                merge.getNewRevision(),
+                merge.getSequence());
+        case GONE ->
+            logger.info(
+                "WalGerrit owes no change-merged event for change {} of {} any more: the change"
+                    + " or its project is gone, or the change's history no longer holds the merge"
+                    + " at sequence {}",
+                merge.getChange(),
+                name,
+                merge.getSequence());
+        case LOST ->
+            logger.error(
+                "The change-merged event of change {} of {} is lost: the process that merged it"
+                    + " at sequence {} ended before the event reached the log, and the event of a"
+                    + " change that was not merged by a submit cannot be rebuilt",
+                merge.getChange(),
+                name,
+                merge.getSequence());
+      }
+    }
+    if (delivered.isEmpty()) {
+      return;
+    }
+    // Replays replace the file too.
+    replayLock.lock();
+    try {
+      IndexCursor cursor = cursorStore.read();
+      List<OwedMerge> owed = new ArrayList<>();
+      for (OwedMerge merge : cursor.getOwedList()) {
+        MergeEvents.Delivery delivery = delivered.get(merge);
+        if (delivery == null) {
+          owed.add(merge);
+        } else if (delivery == MergeEvents.Delivery.FIRED) {
+          owed.add(merge.toBuilder().setProcess(process).build());
+        }
+      }
+      cursorStore.write(cursor.toBuilder().clearOwed().addAllOwed(owed).build());
+      if (owed.stream().noneMatch(this::due)) {
+        owedRepositories.remove(id);
+      }
+    } finally {
+      replayLock.unlock();
+    }
   }
 
   /**
@@ -1246,11 +1707,16 @@ final class IndexEventTailer implements LifecycleListener {
     for (Map.Entry<RepositoryId, IndexCursor> seed : seeds.entrySet()) {
       ReentrantLock replaying = lockForReplay(seed.getKey());
       try {
-        new IndexCursorStore(repositories.storage().manifestStore(seed.getKey()).indexCursorPath())
-            .write(
+        IndexCursorStore cursorStore =
+            new IndexCursorStore(
+                repositories.storage().manifestStore(seed.getKey()).indexCursorPath());
+        // The entries this passes over are not indexed again, but the next replay reads them
+        // for the merges this node made in them.
+        cursorStore.write(
+            cursorStore.movedTo(
                 seed.getValue().getSequence(),
                 seed.getValue().getTransactionId(),
-                seed.getValue().getManifestVersion());
+                seed.getValue().getManifestVersion()));
         noteApplied(seed.getKey(), seed.getValue().getSequence());
       } finally {
         replaying.unlock();
@@ -1266,6 +1732,16 @@ final class IndexEventTailer implements LifecycleListener {
   /** Test hook: sets how long replay and rebuild wait for a lock. */
   void replayLockWait(Duration wait) {
     this.replayLockWait = wait;
+  }
+
+  /** Test hook: what finds merges and fires their events. */
+  void mergeEvents(MergeEvents mergeEvents) {
+    this.mergeEvents = mergeEvents;
+  }
+
+  /** Test hook: the process this tailer runs in, as log entries name it. */
+  void process(String process) {
+    this.process = process;
   }
 
   /** Test hook: decide by writer identity which entries came from another node. */
@@ -1332,6 +1808,8 @@ final class IndexEventTailer implements LifecycleListener {
           readiness.markReady();
         }
       }
+      // Events that could not be fired when they became due.
+      owedRepositories.forEach(this::queueDelivery);
     } catch (Throwable failure) {
       synchronized (this) {
         if (participating) {

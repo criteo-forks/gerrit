@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.config.GerritRuntime;
+import dev.walgerrit.ManifestReadCountTest.CountingObjectStore;
 import dev.walgerrit.proto.StorageProto.IndexCursor;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
@@ -42,6 +43,8 @@ import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.Repository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class IndexEventTailerTest {
   @TempDir Path storagePath;
@@ -698,7 +701,12 @@ class IndexEventTailerTest {
 
     ManifestStore store = manager.manifestStore(project);
     IndexCursorStore cursorStore = new IndexCursorStore(store.indexCursorPath());
-    cursorStore.write(cursorStore.read().getSequence(), "not-the-transaction-that-happened");
+    cursorStore.write(
+        IndexCursorStore.at(
+            cursorStore.read(),
+            cursorStore.read().getSequence(),
+            "not-the-transaction-that-happened",
+            ""));
 
     // A sweep skips repositories whose manifest did not change, so a cursor is re-examined when
     // the node restarts, which a fresh tailer models.
@@ -758,6 +766,215 @@ class IndexEventTailerTest {
             new FakeRebuilder());
     failure = assertThrows(IllegalStateException.class, disabled::start);
     assertTrue(failure.getCause().getMessage().contains("disabled"));
+  }
+
+  @ParameterizedTest(name = "entries of another node: {0}")
+  @ValueSource(booleans = {false, true})
+  void sweepReplaysARepositoryAgainAfterTheOneItsEntryDependsOn(boolean foreign) throws Exception {
+    CountingObjectStore store = new CountingObjectStore(new FileObjectStore(storagePath));
+    WalGitRepositoryManager manager = sweptManager(store);
+    InSweepOrder repos = inSweepOrder(manager);
+    StarApplier applier = new StarApplier(repos.first());
+    IndexEventReadiness readiness = readiness("dependent-node");
+    IndexEventTailer tailer = startingTailer(manager, applier, readiness);
+    // The tailer applies this node's own ref transactions like any other node's.
+    tailer.foreignWriter(writer -> foreign);
+    tailer.start();
+    try {
+      // The change is created before it is starred, but the sweep reaches the star first.
+      publishRef(manager, repos.second(), CHANGE_1);
+      publishRef(manager, repos.first(), STAR_1);
+      store.reset();
+
+      tailer.runBackgroundSweep();
+
+      assertTrue(readiness.isReady(), "the star was only waiting for its change");
+      assertEquals(List.of("no change 1", "change 1", "star 1"), applier.applied);
+      assertAtHead(manager, repos.first());
+      assertAtHead(manager, repos.second());
+      assertEquals(2, store.count(LISTINGS), "one more listing, because a replay failed");
+
+      // A sweep in which nothing fails costs one listing, as before.
+      publishRef(manager, repos.second(), "refs/changes/02/2/meta");
+      store.reset();
+      tailer.runBackgroundSweep();
+      assertTrue(readiness.isReady());
+      assertEquals(1, store.count(LISTINGS));
+    } finally {
+      tailer.stop();
+    }
+  }
+
+  @Test
+  void sweepFindsADependencyPublishedAfterItsListing() throws Exception {
+    WalGitRepositoryManager manager = sweptManager(new FileObjectStore(storagePath));
+    InSweepOrder repos = inSweepOrder(manager);
+    StarApplier applier = new StarApplier(repos.first());
+    IndexEventReadiness readiness = readiness("late-dependency-node");
+    IndexEventTailer tailer = startingTailer(manager, applier, readiness);
+    tailer.start();
+    try {
+      publishRef(manager, repos.first(), STAR_1);
+      // The sweep has listed the change's repository as unchanged when the change is created.
+      applier.onMissing = once(() -> publishRef(manager, repos.second(), CHANGE_1));
+
+      tailer.runBackgroundSweep();
+
+      assertTrue(readiness.isReady());
+      assertEquals(List.of("no change 1", "change 1", "star 1"), applier.applied);
+      assertAtHead(manager, repos.first());
+      assertAtHead(manager, repos.second());
+    } finally {
+      tailer.stop();
+    }
+  }
+
+  @Test
+  void sweepDoesNotChaseEntriesPublishedDuringItAndFailsOnOnesThatStayUnresolved()
+      throws Exception {
+    WalGitRepositoryManager manager = sweptManager(new FileObjectStore(storagePath));
+    InSweepOrder repos = inSweepOrder(manager);
+    StarApplier applier = new StarApplier(repos.first());
+    IndexEventReadiness readiness = readiness("chasing-node");
+    IndexEventTailer tailer = startingTailer(manager, applier, readiness);
+    tailer.start();
+    try {
+      publishRef(manager, repos.second(), CHANGE_1);
+      publishRef(manager, repos.first(), STAR_1);
+      long starred = manager.manifestStore(repos.first()).read().getHeadSeq();
+      // While the sweep replays the change's repository, a star arrives for a change that no
+      // repository holds.
+      applier.onChange = once(() -> publishRef(manager, repos.first(), STAR_2));
+
+      tailer.runBackgroundSweep();
+
+      assertTrue(readiness.isReady(), "the entry this sweep failed on was resolved");
+      assertEquals(List.of("no change 1", "change 1", "star 1"), applier.applied);
+      assertEquals(starred, cursor(manager, repos.first()), "the later entry was left alone");
+      assertTrue(manager.manifestStore(repos.first()).read().getHeadSeq() > starred);
+
+      // The next sweep meets it, and what stays unresolved after the retry fails the sweep.
+      applier.applied.clear();
+      tailer.runBackgroundSweep();
+      assertFalse(readiness.isReady());
+      assertTrue(Files.notExists(readiness.markerPath()));
+      assertEquals(List.of("no change 2", "no change 2"), applier.applied);
+      assertEquals(starred, cursor(manager, repos.first()), "the cursor waits at the failed entry");
+
+      // Until its change exists.
+      applier.applied.clear();
+      publishRef(manager, repos.second(), CHANGE_2);
+      tailer.runBackgroundSweep();
+      assertTrue(readiness.isReady());
+      assertEquals(List.of("no change 2", "change 2", "star 2"), applier.applied);
+      assertAtHead(manager, repos.first());
+    } finally {
+      tailer.stop();
+    }
+  }
+
+  private static final String CHANGE_1 = "refs/changes/01/1/meta";
+  private static final String CHANGE_2 = "refs/changes/02/2/meta";
+  private static final String STAR_1 = "refs/starred-changes/01/1/1000001";
+  private static final String STAR_2 = "refs/starred-changes/02/2/1000001";
+  private static final String LISTINGS = "LIST-versions manifests/";
+
+  /** Two repositories, named in the order a sweep replays them. */
+  private record InSweepOrder(Project.NameKey first, Project.NameKey second) {}
+
+  private static InSweepOrder inSweepOrder(WalGitRepositoryManager manager) throws Exception {
+    Project.NameKey one = Project.nameKey("sweep/one");
+    Project.NameKey two = Project.nameKey("sweep/two");
+    manager.createRepository(one).close();
+    manager.createRepository(two).close();
+    RepositoryId oneId = manager.catalog().resolve(one, true).orElseThrow().id();
+    RepositoryId twoId = manager.catalog().resolve(two, true).orElseThrow().id();
+    return oneId.compareTo(twoId) < 0 ? new InSweepOrder(one, two) : new InSweepOrder(two, one);
+  }
+
+  /** A node that sweeps only when the test says so. */
+  private WalGitRepositoryManager sweptManager(ObjectStore store) {
+    Config config = new Config();
+    config.setString("walgerrit", null, "indexPollInterval", "1 hour");
+    config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
+    Path site = storagePath.resolveSibling(storagePath.getFileName() + "-site");
+    return new WalGitRepositoryManager(
+        WalGitConfiguration.from(config, site),
+        new StorageLayout(store, site.resolve("cache"), site.resolve("cursors"), ""));
+  }
+
+  private static long cursor(WalGitRepositoryManager manager, Project.NameKey project)
+      throws IOException {
+    return new IndexCursorStore(manager.manifestStore(project).indexCursorPath())
+        .read()
+        .getSequence();
+  }
+
+  private static void assertAtHead(WalGitRepositoryManager manager, Project.NameKey project)
+      throws IOException {
+    assertEquals(manager.manifestStore(project).read().getHeadSeq(), cursor(manager, project));
+  }
+
+  @FunctionalInterface
+  private interface Publication {
+    void run() throws Exception;
+  }
+
+  private static Runnable once(Publication publication) {
+    AtomicBoolean done = new AtomicBoolean();
+    return () -> {
+      if (done.compareAndSet(false, true)) {
+        try {
+          publication.run();
+        } catch (Exception failure) {
+          throw new AssertionError(failure);
+        }
+      }
+    };
+  }
+
+  /**
+   * Stands in for the change index: a star in the users repository is applied only once the
+   * change's own repository has been replayed, as in {@code GerritIndexEventApplier}.
+   */
+  private static final class StarApplier implements IndexEventApplier {
+    private final Project.NameKey users;
+    private final java.util.Set<Integer> indexed =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+    final List<String> applied = new CopyOnWriteArrayList<>();
+    volatile Runnable onMissing = () -> {};
+    volatile Runnable onChange = () -> {};
+
+    StarApplier(Project.NameKey users) {
+      this.users = users;
+    }
+
+    @Override
+    public void apply(Project.NameKey project, RefTransaction transaction) {
+      for (var update : transaction.getUpdatesList()) {
+        if (project.equals(users)) {
+          com.google.gerrit.entities.Change.Id starred =
+              com.google.gerrit.entities.Change.Id.fromAllUsersRef(update.getName());
+          if (starred == null) {
+            continue;
+          }
+          if (!indexed.contains(starred.get())) {
+            applied.add("no change " + starred.get());
+            onMissing.run();
+            throw new IllegalStateException("No such change: " + starred.get());
+          }
+          applied.add("star " + starred.get());
+        } else {
+          com.google.gerrit.entities.Change.Id change =
+              com.google.gerrit.entities.Change.Id.fromRef(update.getName());
+          if (change != null) {
+            indexed.add(change.get());
+            applied.add("change " + change.get());
+            onChange.run();
+          }
+        }
+      }
+    }
   }
 
   private static ObjectId publishRef(

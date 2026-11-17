@@ -18,7 +18,75 @@ that cannot be serialized is logged and dropped. A batch whose publication fails
 the next flush, its events ahead of those fired since; a publication whose response was lost is
 first settled from the log, so a batch that landed is not written twice. While a repository's log
 refuses writes it keeps at most 10,000 events, discarding the oldest beyond that with an error. A
-process crash still loses the events buffered since the last flush, at most 200 ms of them.
+process crash still loses the events buffered since the last flush, at most 200 ms of them, and
+the events that a request had not fired yet: Gerrit fires events after it committed. For the
+change-merged event of a submit the node makes up for that after its restart, as the next section
+says. For every other event it does not.
+
+## Recovering a submit's change-merged event after restart
+
+A submit commits each repository's part of a topic one after the other and fires the events when
+all are committed. A process that ends in between has merged changes nobody was told about: no
+listener on that node, no other node, no reader of the event log.
+
+The ref transaction in the log is what remains, and it says what the event says about the merge.
+The tailer therefore keeps, in each repository's cursor file, the merges that ref transactions of
+this node made and whose change-merged event it has not seen in the log:
+
+- When replay passes a ref transaction written on this host, it reads the NoteDb commits the
+  transaction added to each change. A change that the transaction turned to merged is recorded
+  with its patch set and that patch set's commit, the change's meta revision, the submitter and
+  time of the submit approval, and the revision the same transaction gave the destination branch,
+  which is the `newRev` of the event. The record is written in the same replacement of the cursor
+  file that moves the cursor past the transaction.
+- When replay passes a journal entry with a change-merged event of that change, patch set, commit
+  and revision, the record is removed.
+- A record whose transaction was written by a process that has ended is due once replay has
+  reached the head. A process is known by a random id it draws at start and puts on every entry it
+  writes (`writer_process`); host name and process id repeat across a container's restarts.
+- Due events are fired by one thread of their own, with no lock of the tailer held and not as a
+  replay: `ChangeMerged.fire` with the change as NoteDb had it after the merge, in a request
+  context of the submitter. Extension listeners and stream-event listeners, plugins included, hear
+  the event as they hear any event of this node, and what they write and fire in turn is journaled.
+  The journal writes the event to the log, the other nodes replay it from there, and the entry
+  removes the record.
+
+What this gives, and what it does not:
+
+- **At least once, not exactly once.** A process that ends after firing and before its journal
+  wrote the entry leaves the record due again: the node's own listeners hear the event twice. An
+  entry that was written removes the record whichever process replays it, so the log gets the
+  event once, apart from the journal's own retry of a publication whose outcome it could not
+  read. Consumers already have to tolerate duplicates.
+- **The same node has to run again, with its volume.** The records are in the cursor directory. A
+  node that does not come back, or comes back with an empty volume, owes nothing it knows of.
+- **Only merges in entries the node reads.** Entries that an index rebuild or an offline reindex
+  moves the cursor over are read afterwards for merges and their events only, up to the replay
+  limit; a range that cannot be read any more (the history diverged, or it is longer than
+  `indexReplayLimit`) is given up with an error. At most 10,000 records are kept per repository;
+  beyond that the oldest are dropped with an error.
+- **Only submits, and only since entries say whose update was whose.** The revision an event names
+  has to be the branch update of the same ref transaction. A change closed by a push, or found
+  already merged, is merged in a transaction that does not move its branch; its record is kept and
+  settled like any other, but when it falls due the event is reported as lost, at error level, and
+  not sent with a revision this node would have to guess. A node publishes transactions that wait
+  together as one entry and since this version records which update was whose; in an older entry
+  a branch update next to a merge proves nothing, and its merges are treated the same way.
+- **The merge is described as it was, the rest of the change as it is.** Change, patch set,
+  commit, submitter and revision are those of the merge, and extension listeners get the time of
+  the submit. Gerrit's stream-event listener reads the change's other attributes, such as topic
+  and hashtags, when the event is fired, as it does for every event, and the stream event's
+  `eventCreatedOn` is the time it is fired again, not the time of the merge. No event is fired for a change that has been deleted, is not merged any
+  more, was merged again as something else, or whose NoteDb history no longer holds the merge.
+- **Only this event.** The ref-updated events of the submit, its e-mail and the other work Gerrit
+  does after a submit committed are not made up for.
+- **A process that keeps running is left alone.** Its merges are recorded too, but it fires its own
+  events; a merge whose event it never fires, because the submit failed in a later repository,
+  falls due when that process has ended. A node whose journal is disabled records nothing.
+- **Firing waits for the server.** The delivery starts after the journal and the plugins. When the
+  server stops, the delivery is stopped before the journal: an event in flight gets ten seconds
+  for its listeners, and what was not begun is fired by the next process. Listeners that take
+  longer can outlast the journal; the tailer logs that.
 
 ## Each node replays foreign events
 

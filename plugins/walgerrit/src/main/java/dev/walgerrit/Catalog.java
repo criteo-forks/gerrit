@@ -202,6 +202,21 @@ final class Catalog {
   private final Object handleLock = new Object();
   private LocalWalGitRepository repository;
   private volatile Snapshot snapshot = Snapshot.EMPTY;
+
+  /**
+   * A snapshot that was the catalog while the handle served the refs of {@code generation}. While
+   * the handle still serves that generation the catalog's ref has not moved, and the snapshot is
+   * the catalog without looking the ref up.
+   */
+  private record Seen(long generation, Snapshot snapshot) {
+    static final Seen NOTHING = new Seen(-1, Snapshot.EMPTY);
+  }
+
+  private volatile Seen seen = Seen.NOTHING;
+
+  /** Lookups of the catalog's ref, for tests: what an unchanged catalog no longer costs. */
+  private final AtomicLong refLookups = new AtomicLong();
+
   // This process's writers take turns: each commit is built on the tip the previous one left.
   private final ReentrantLock commitLock = new ReentrantLock(true);
   private final AtomicLong lostRaces = new AtomicLong();
@@ -289,15 +304,33 @@ final class Catalog {
     if (authoritative) {
       handle.scanForRepoChanges();
     }
+    // Every project a request opens is resolved here. The handle adopts a newer manifest as for
+    // any lookup; when that leaves its refs as they were, so is the catalog, and the ref is not
+    // looked up again under the lock all lookups of the catalog repository share.
+    long generation = handle.revalidatedRefGeneration();
+    Seen before = seen;
+    if (before.generation() == generation) {
+      return before.snapshot();
+    }
+    refLookups.incrementAndGet();
     Ref ref = handle.exactRef(REF);
     ObjectId tip = ref == null ? ObjectId.zeroId() : ref.getObjectId();
-    Snapshot known = snapshot;
-    if (known.tip().equals(tip)) {
-      return known;
+    Snapshot current = snapshot;
+    if (!current.tip().equals(tip)) {
+      current = load(handle, tip);
+      snapshot = current;
     }
-    Snapshot loaded = load(handle, tip);
-    snapshot = loaded;
-    return loaded;
+    // Only when the refs did not change while the ref was read: what was read is then the catalog
+    // of this generation. Otherwise the next call looks again.
+    if (handle.refGeneration() == generation) {
+      seen = new Seen(generation, current);
+    }
+    return current;
+  }
+
+  /** How often the catalog's ref was looked up; for tests. */
+  long refLookups() {
+    return refLookups.get();
   }
 
   /**

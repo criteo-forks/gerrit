@@ -91,8 +91,13 @@ Reindex captures replay cursors before indexing and saves them after successful 
     }
     for (Map.Entry<RepositoryId, IndexCursor> seed : seeds.entrySet()) {
       IndexCursor cursor = seed.getValue();
-      new IndexCursorStore(repositories.storage().manifestStore(seed.getKey()).indexCursorPath())
-          .write(cursor.getSequence(), cursor.getTransactionId(), cursor.getManifestVersion());
+      IndexCursorStore store =
+          new IndexCursorStore(
+              repositories.storage().manifestStore(seed.getKey()).indexCursorPath());
+      // The daemon reads the entries the reindex passed over for the merges it owes events for.
+      store.write(
+          store.movedTo(
+              cursor.getSequence(), cursor.getTransactionId(), cursor.getManifestVersion()));
     }
     out.printf(
         Locale.ROOT,
