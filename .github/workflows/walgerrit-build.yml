@@ -70,7 +70,10 @@ jobs:
         run: ./mvnw --batch-mode --no-transfer-progress verify
 
       - name: Build the Gerrit 3.14.2 release WAR and the readonly plugin
-        run: npx --yes @bazel/bazelisk build --config=java21 //:release //plugins/readonly
+        run: >-
+          npx --yes @bazel/bazelisk build --config=java21
+          --downloader_config=.github/bazel-downloader.cfg
+          //:release //plugins/readonly
 
       - name: Assemble the deployment bundle
         env:
