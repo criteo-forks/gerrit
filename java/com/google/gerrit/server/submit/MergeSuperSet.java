@@ -23,6 +23,7 @@ import com.google.gerrit.entities.Change;
 import com.google.gerrit.extensions.registration.DynamicItem;
 import com.google.gerrit.server.CurrentUser;
 import com.google.gerrit.server.config.GerritServerConfig;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.logging.Metadata;
 import com.google.gerrit.server.logging.TraceContext;
 import com.google.gerrit.server.logging.TraceContext.TraceTimer;
@@ -61,9 +62,12 @@ public class MergeSuperSet {
   private final PermissionBackend permissionBackend;
   private final Config cfg;
   private final ProjectCache projectCache;
+  private final ChangeIndexFreshness changeIndexFreshness;
 
   private MergeOpRepoManager orm;
   private boolean closeOrm;
+  private boolean requireCompleteTopics;
+  private boolean topicsComplete;
 
   @Inject
   MergeSuperSet(
@@ -73,7 +77,8 @@ public class MergeSuperSet {
       Provider<MergeOpRepoManager> repoManagerProvider,
       DynamicItem<MergeSuperSetComputation> mergeSuperSetComputation,
       PermissionBackend permissionBackend,
-      ProjectCache projectCache) {
+      ProjectCache projectCache,
+      ChangeIndexFreshness changeIndexFreshness) {
     this.cfg = cfg;
     this.changeDataFactory = changeDataFactory;
     this.queryProvider = queryProvider;
@@ -81,6 +86,7 @@ public class MergeSuperSet {
     this.mergeSuperSetComputation = mergeSuperSetComputation;
     this.permissionBackend = permissionBackend;
     this.projectCache = projectCache;
+    this.changeIndexFreshness = changeIndexFreshness;
   }
 
   public static boolean wholeTopicEnabled(Config config) {
@@ -92,6 +98,25 @@ public class MergeSuperSet {
     checkState(this.orm == null);
     this.orm = requireNonNull(orm);
     closeOrm = false;
+    return this;
+  }
+
+  /**
+   * Makes this instance look topics up only in a change index that holds every change acknowledged
+   * before the lookup, in any project; see {@link ChangeIndexFreshness}. A topic's members live in
+   * their own projects, so a member the index does not hold yet cannot be found from the members it
+   * does hold.
+   *
+   * <p>The index is brought up to date once, before the first topic lookup, and a change set that
+   * reaches no topic costs nothing. For the submission itself: the callers that only show what
+   * would be submitted keep reading the index as it is.
+   *
+   * @throws com.google.gerrit.server.index.change.ChangeIndexNotFreshException from {@link
+   *     #completeChangeSet} when the index cannot be brought up to date
+   */
+  @CanIgnoreReturnValue
+  public MergeSuperSet requireCompleteTopics() {
+    requireCompleteTopics = true;
     return this;
   }
 
@@ -241,6 +266,10 @@ public class MergeSuperSet {
   }
 
   private List<ChangeData> byTopicOpen(String topic) {
+    if (requireCompleteTopics && !topicsComplete) {
+      changeIndexFreshness.requireAllFresh();
+      topicsComplete = true;
+    }
     return queryProvider.get().byTopicOpen(topic);
   }
 

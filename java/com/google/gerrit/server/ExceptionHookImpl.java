@@ -21,6 +21,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.gerrit.exceptions.GerritNoMergeBaseException;
 import com.google.gerrit.exceptions.MergeUpdateException;
 import com.google.gerrit.git.LockFailureException;
+import com.google.gerrit.server.index.change.ChangeIndexNotFreshException;
 import com.google.gerrit.server.project.ProjectConfig;
 import java.util.Optional;
 import org.eclipse.jgit.errors.MissingObjectException;
@@ -49,13 +50,18 @@ public class ExceptionHookImpl implements ExceptionHook {
 
   @Override
   public boolean skipRetryWithTrace(String actionType, String actionName, Throwable throwable) {
-    return isInvalidProjectConfig(throwable) || isNoMergeBaseException(throwable);
+    return isInvalidProjectConfig(throwable)
+        || isNoMergeBaseException(throwable)
+        || changeIndexNotFresh(throwable).isPresent();
   }
 
   @Override
   public Optional<String> formatCause(Throwable throwable) {
     if (isLockFailure(throwable)) {
       return Optional.of(RefUpdate.Result.LOCK_FAILURE.name());
+    }
+    if (changeIndexNotFresh(throwable).isPresent()) {
+      return Optional.of("change_index_not_fresh");
     }
     if (isMissingObjectException(throwable)) {
       return Optional.of("missing_object");
@@ -73,6 +79,10 @@ public class ExceptionHookImpl implements ExceptionHook {
   public ImmutableList<String> getUserMessages(Throwable throwable, ImmutableSet<String> traceIds) {
     if (isLockFailure(throwable)) {
       return ImmutableList.of(LOCK_FAILURE_USER_MESSAGE);
+    }
+    Optional<String> changeIndexNotFresh = changeIndexNotFresh(throwable);
+    if (changeIndexNotFresh.isPresent()) {
+      return ImmutableList.of(changeIndexNotFresh.get());
     }
     if (isInvalidProjectConfig(throwable)) {
       return ImmutableList.of(
@@ -95,6 +105,9 @@ public class ExceptionHookImpl implements ExceptionHook {
     if (isLockFailure(throwable)) {
       return Optional.of(Status.create(503, "Lock failure"));
     }
+    if (changeIndexNotFresh(throwable).isPresent()) {
+      return Optional.of(Status.create(503, "Change index not up to date"));
+    }
     if (isNoMergeBaseException(throwable)) {
       return Optional.of(Status.create(409, "Conflict"));
     }
@@ -106,6 +119,14 @@ public class ExceptionHookImpl implements ExceptionHook {
 
   private static boolean isLockFailure(Throwable throwable) {
     return isMatching(throwable, t -> t instanceof LockFailureException);
+  }
+
+  /** The message of the {@link ChangeIndexNotFreshException} in the causal chain, if any. */
+  private static Optional<String> changeIndexNotFresh(Throwable throwable) {
+    return Throwables.getCausalChain(throwable).stream()
+        .filter(ChangeIndexNotFreshException.class::isInstance)
+        .map(Throwable::getMessage)
+        .findFirst();
   }
 
   private static boolean isMissingObjectException(Throwable throwable) {

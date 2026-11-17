@@ -167,6 +167,7 @@ import com.google.gerrit.server.git.validators.RefOperationValidators;
 import com.google.gerrit.server.git.validators.UploadValidationListener;
 import com.google.gerrit.server.git.validators.UploadValidators;
 import com.google.gerrit.server.group.db.GroupDbModule;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness.ChangeIndexFreshnessModule;
 import com.google.gerrit.server.index.change.ReindexChangesAfterRefUpdate;
 import com.google.gerrit.server.logging.PerformanceLogger;
 import com.google.gerrit.server.mail.AutoReplyMailFilter;
@@ -287,6 +288,7 @@ public class GerritGlobalModule extends FactoryModule {
 
     install(new AccessControlModule());
     install(new AccountModule());
+    install(new ChangeIndexFreshnessModule());
     install(new CmdLineParserModule());
     install(new ExternalIdModule());
     install(new GitModule());

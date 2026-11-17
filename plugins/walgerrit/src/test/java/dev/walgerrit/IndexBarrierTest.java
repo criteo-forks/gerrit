@@ -14,6 +14,7 @@
 
 package dev.walgerrit;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -23,18 +24,14 @@ import com.google.gerrit.entities.Change;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.metrics.DisabledMetricMaker;
-import com.google.gerrit.server.AnonymousUser;
-import com.google.gerrit.server.RequestInfo;
-import com.google.gerrit.server.RequestInfo.RequestType;
 import com.google.gerrit.server.config.GerritRuntime;
-import com.google.gerrit.server.logging.TraceContext;
 import dev.walgerrit.IndexEventTailer.Indexed;
 import dev.walgerrit.ManifestReadCountTest.CountingObjectStore;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.time.Duration;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -46,6 +43,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
 import org.eclipse.jgit.lib.CommitBuilder;
 import org.eclipse.jgit.lib.Config;
@@ -63,14 +61,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Pushes for review against nodes that share one store and each keep their own change index.
+ * Pushes for review and topic lookups against nodes that share one store and each keep their own
+ * change index.
  *
- * <p>A node's index holds the branch and Change-Id of each change, taken from its meta ref.
- * {@link Node#push} passes the barrier, looks the Change-Id up in the node's index, creates a
- * change or adds a patch set through a ref transaction, and indexes its own write.
+ * <p>A node's index holds the project, branch, Change-Id and topic of each change, taken from its
+ * meta ref. {@link Node#push} passes the barrier the way Gerrit's push does, is rejected when the
+ * barrier says the index may be stale, and otherwise looks the Change-Id up in the node's index,
+ * creates a change or adds a patch set through a ref transaction, and indexes its own write. {@link
+ * Node#topic} passes the barrier the way a submission does before it looks a topic up.
  */
 class IndexBarrierTest {
   private static final Project.NameKey PROJECT = Project.nameKey("platform/app");
+  private static final Project.NameKey OTHER = Project.nameKey("platform/other");
   private static final String BRANCH = "refs/heads/main";
 
   @TempDir Path root;
@@ -113,7 +115,7 @@ class IndexBarrierTest {
       assertTrue(node.barrier.count(Indexed.REPLAYED) >= 20);
       assertEquals(0, node.barrier.count(Indexed.TIMED_OUT));
       assertEquals(0, node.barrier.count(Indexed.FAILED));
-      assertEquals(0, node.barrier.count(Indexed.SKIPPED));
+      assertEquals(0, node.barrier.count(Indexed.UNAVAILABLE));
     }
   }
 
@@ -137,46 +139,49 @@ class IndexBarrierTest {
   }
 
   @Test
-  void aReplayThatOutlastsTheBoundLetsThePushProceed() throws Exception {
+  void aReplayThatOutlastsTheBoundRejectsThePush() throws Exception {
     Node first = node("first", "5 s");
     Node second = node("second", "300 ms");
     startWithProject(first, second);
-    first.push(changeId(0));
-    long created = first.headSequence();
+    Push created = first.push(changeId(0));
+    long head = first.headSequence();
 
     CountDownLatch gate = new CountDownLatch(1);
     second.replayGate = gate;
     try {
       long started = System.nanoTime();
-      Push proceeded = second.push(changeId(0));
+      Push rejected = second.push(changeId(0));
       long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
 
-      assertEquals(Result.NEW_CHANGE, proceeded.result(), "the lookup ran on the index as it was");
+      assertEquals(Result.REJECTED, rejected.result(), "no lookup ran on the index as it was");
       assertEquals(1, second.barrier.count(Indexed.TIMED_OUT));
       assertTrue(elapsed >= 300 && elapsed < 3000, "the push waited " + elapsed + " ms");
+      assertEquals(1, first.changesInRepository(), "the rejected push wrote nothing");
     } finally {
       gate.countDown();
     }
 
-    // Replay continues after the push times out.
-    eventually(() -> second.cursorSequence() >= created, "the abandoned replay completes");
-    assertEquals(2, second.index.byBranchKey(BRANCH, changeId(0)).size());
+    // Replay continues after the push times out, and the repeated push finds the change.
+    eventually(() -> second.cursorSequence() >= head, "the abandoned replay completes");
+    assertEquals(new Push(Result.NEW_PATCH_SET, created.number()), second.push(changeId(0)));
+    assertEquals(1, second.index.byBranchKey(BRANCH, changeId(0)).size());
   }
 
   @Test
-  void aStoreThatDoesNotAnswerOrFailsLetsTheRequestProceed() throws Exception {
+  void aStoreThatDoesNotAnswerOrFailsRejectsTheRequest() throws Exception {
     GatedStore store = new GatedStore(bucket());
     Node first = node("first", "5 s");
     Node second = node("second", "300 ms", "1 hour", store, null);
     startWithProject(first, second);
-    first.push(changeId(0));
+    Push created = first.push(changeId(0));
 
     CountDownLatch gate = new CountDownLatch(1);
     store.manifestGate = gate;
     try {
       long started = System.nanoTime();
-      second.await();
+      Optional<String> notFresh = second.await();
       long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+      assertTrue(notFresh.isPresent(), "the request is told the index may be stale");
       assertEquals(1, second.barrier.count(Indexed.TIMED_OUT));
       assertTrue(elapsed >= 300 && elapsed < 3000, "the request waited " + elapsed + " ms");
     } finally {
@@ -185,11 +190,49 @@ class IndexBarrierTest {
     }
 
     store.failManifestReads = true;
-    second.await();
+    assertEquals(Result.REJECTED, second.push(changeId(0)).result());
     assertEquals(1, second.barrier.count(Indexed.FAILED));
 
     store.failManifestReads = false;
-    assertEquals(Result.NEW_PATCH_SET, second.push(changeId(0)).result());
+    assertEquals(new Push(Result.NEW_PATCH_SET, created.number()), second.push(changeId(0)));
+    assertEquals(1, first.changesInRepository());
+  }
+
+  @Test
+  void noRequestProceedsWhileEveryBarrierThreadIsBusy() throws Exception {
+    GatedStore store = new GatedStore(bucket());
+    Node first = node("first", "5 s");
+    Node second = node("second", "500 ms", "1 hour", store, null);
+    startWithProject(first, second);
+    Push created = first.push(changeId(0));
+
+    // More requests than the barrier has threads to read the store with, and none of the reads
+    // returns: the requests beyond the threads wait their turn instead of going ahead.
+    int requests = 40;
+    CountDownLatch gate = new CountDownLatch(1);
+    store.manifestGate = gate;
+    List<Optional<String>> answers = new CopyOnWriteArrayList<>();
+    List<Throwable> failures = new CopyOnWriteArrayList<>();
+    List<Thread> threads = new ArrayList<>();
+    try {
+      for (int i = 0; i < requests; i++) {
+        threads.add(thread(() -> answers.add(second.await()), failures));
+      }
+      threads.forEach(Thread::start);
+      for (Thread thread : threads) {
+        thread.join(TimeUnit.SECONDS.toMillis(10));
+      }
+    } finally {
+      store.manifestGate = null;
+      gate.countDown();
+    }
+
+    assertEquals(List.of(), failures);
+    assertEquals(requests, answers.size());
+    assertTrue(answers.stream().allMatch(Optional::isPresent), "every request was turned away");
+    assertEquals(requests, second.barrier.count(Indexed.TIMED_OUT));
+
+    assertEquals(new Push(Result.NEW_PATCH_SET, created.number()), second.push(changeId(0)));
   }
 
   @Test
@@ -283,7 +326,7 @@ class IndexBarrierTest {
   }
 
   @Test
-  void aCursorTooFarBehindIsLeftToTheSweep() throws Exception {
+  void aCursorTooFarBehindRejectsThePushAndIsLeftToTheSweep() throws Exception {
     AtomicInteger rebuilds = new AtomicInteger();
     Node first = node("first", "5 s");
     Node second = node("second", "5 s", "1 hour", bucket(), rebuilds::incrementAndGet);
@@ -293,16 +336,22 @@ class IndexBarrierTest {
       first.push(changeId(i));
     }
 
-    second.await();
+    assertEquals(Result.REJECTED, second.push(changeId(0)).result());
 
-    assertEquals(1, second.barrier.count(Indexed.SKIPPED));
+    assertEquals(1, second.barrier.count(Indexed.UNAVAILABLE));
     assertEquals(1, answered(second));
     assertEquals(0, rebuilds.get(), "only the sweep rebuilds");
+
+    // The sweep rebuilds, and the repeated push finds the change.
+    second.tailer.runOnce();
+    assertEquals(1, rebuilds.get());
+    second.reindexFromRepository();
+    assertEquals(Result.NEW_PATCH_SET, second.push(changeId(0)).result());
   }
 
   @Test
   void replaysOfDifferentRepositoriesDoNotRunSideBySide() throws Exception {
-    Project.NameKey other = Project.nameKey("platform/other");
+    Project.NameKey other = OTHER;
     Node first = node("first", "5 s");
     Node second = node("second", "300 ms");
     first.repositories.createRepository(other).close();
@@ -406,9 +455,10 @@ class IndexBarrierTest {
       assertTrue(rebuilding.await(10, TimeUnit.SECONDS));
       replay.start();
       eventually(() -> replay.getState() == Thread.State.TIMED_WAITING, "the replay waits");
-      second.await();
-      assertEquals(1, second.barrier.count(Indexed.SKIPPED));
-      assertEquals(1, answered(second));
+      assertTrue(second.await().isPresent(), "an index being rebuilt is not one to decide on");
+      assertTrue(second.awaitAll().isPresent());
+      assertEquals(2, second.barrier.count(Indexed.UNAVAILABLE));
+      assertEquals(2, answered(second));
     } finally {
       finish.countDown();
       sweep.join(TimeUnit.SECONDS.toMillis(10));
@@ -421,124 +471,507 @@ class IndexBarrierTest {
   }
 
   @Test
-  void aPushSkipsTheBarrierWhileTheCatalogItReadIsNotReplayed() throws Exception {
+  void aFailedRebuildRejectsRequestsUntilARebuildCompletes() throws Exception {
     Node first = node("first", "5 s");
-    Node second = node("second", "5 s");
+    Node[] rebuilt = new Node[1];
+    AtomicBoolean fail = new AtomicBoolean();
+    Node second =
+        node(
+            "second",
+            "5 s",
+            "1 hour",
+            bucket(),
+            () -> {
+              // A rebuild deletes every document before it indexes the first one again.
+              rebuilt[0].index.changes.clear();
+              if (fail.get()) {
+                throw new IOException("the rebuild failed after deleting the documents");
+              }
+              rebuilt[0].reindexFromRepository();
+            });
+    rebuilt[0] = second;
+    first.repositories.createRepository(PROJECT).close();
+    first.repositories.createRepository(OTHER).close();
+    first.tailer.start();
+    second.tailer.start();
+    Push original = first.push(changeId(0));
+    second.tailer.catchUp(second.id());
+    assertEquals(1, second.index.byProject(PROJECT).size());
+
+    // More entries in another repository than a node replays: only a rebuild gets past them.
+    for (int i = 1; i <= 8; i++) {
+      first.push(OTHER, changeId(i), null);
+    }
+    fail.set(true);
+    assertThrows(IOException.class, second.tailer::runOnce);
+    assertEquals(0, second.index.size());
+
+    // The cursor of the project still says the index holds the change. It does not.
+    assertEquals(new Push(Result.REJECTED, 0), second.push(changeId(0)));
+    assertEquals(Optional.empty(), second.topic("any"));
+    assertThrows(IOException.class, second.tailer::runOnce);
+    assertEquals(new Push(Result.REJECTED, 0), second.push(changeId(0)));
+    assertEquals(1, first.changesInRepository(), "no second change for the Change-Id");
+
+    fail.set(false);
+    second.tailer.runOnce();
+
+    assertEquals(new Push(Result.NEW_PATCH_SET, original.number()), second.push(changeId(0)));
+    assertTrue(second.topic("any").isPresent());
+    assertEquals(1, first.changesInRepository());
+  }
+
+  @Test
+  void aRebuildDuringAWaitRejectsTheRequestThatWaited() throws Exception {
+    GatedStore store = new GatedStore(bucket());
+    Node first = node("first", "5 s");
+    Node[] rebuilt = new Node[1];
+    Node second = node("second", "20 s", "1 hour", store, () -> rebuilt[0].reindexFromRepository());
+    rebuilt[0] = second;
+    first.repositories.createRepository(PROJECT).close();
+    first.repositories.createRepository(OTHER).close();
+    first.tailer.start();
+    second.tailer.start();
+    Push original = first.push(changeId(0));
+    second.tailer.catchUp(second.id());
+    for (int i = 1; i <= 8; i++) {
+      first.push(OTHER, changeId(i), null);
+    }
+
+    // The push is admitted while no rebuild runs, and is still reading the store when one begins
+    // and completes. What it then finds out about the cursor describes another index.
+    CountDownLatch gate = new CountDownLatch(1);
+    store.gatedThreads = "WalGerrit-Index-Barrier-Read-";
+    store.manifestGate = gate;
+    List<Push> pushed = new CopyOnWriteArrayList<>();
+    List<Throwable> failures = new CopyOnWriteArrayList<>();
+    Thread push = thread(() -> pushed.add(second.push(changeId(0))), failures);
+    push.start();
+    try {
+      eventually(() -> store.waitingReads.get() == 1, "the push reads the store");
+      second.tailer.runOnce();
+    } finally {
+      store.manifestGate = null;
+      gate.countDown();
+      push.join(TimeUnit.SECONDS.toMillis(10));
+    }
+
+    assertEquals(List.of(), failures);
+    assertEquals(List.of(new Push(Result.REJECTED, 0)), pushed);
+    assertEquals(1, second.barrier.count(Indexed.UNAVAILABLE));
+    assertEquals(new Push(Result.NEW_PATCH_SET, original.number()), second.push(changeId(0)));
+  }
+
+  @Test
+  void aPushWaitsForTheCatalogItReadToBeReplayed() throws Exception {
+    Node first = node("first", "5 s");
+    Node second = node("second", "300 ms");
     startWithProject(first, second);
     Push created = first.push(changeId(0));
-    first.repositories.createRepository(Project.nameKey("platform/other")).close();
+    first.repositories.createRepository(OTHER).close();
     // Opening a repository shows the node the catalog as it is now.
     second.repositories.openRepository(PROJECT).close();
 
     CountDownLatch gate = new CountDownLatch(1);
     second.catalogGate = gate;
     try {
-      second.await();
-      assertEquals(1, second.barrier.count(Indexed.SKIPPED));
+      assertEquals(Result.REJECTED, second.push(changeId(0)).result());
+      assertEquals(1, second.barrier.count(Indexed.TIMED_OUT));
       assertEquals(1, answered(second));
-      assertTrue(
-          second.catalogReplaying.await(10, TimeUnit.SECONDS), "the tailer is asked to replay it");
+      assertTrue(second.catalogReplaying.await(10, TimeUnit.SECONDS), "the catalog is replayed");
     } finally {
       gate.countDown();
     }
 
-    eventually(() -> second.tailer.wakeUpsReplayed() == 1, "the catalog is replayed");
+    // The catalog replay the first push started completes; the repeated push replays the rest.
+    second.catalogGate = null;
+    eventually(
+        () -> second.barrier.apply(Optional.of(PROJECT.get())).isEmpty(),
+        "the catalog is replayed");
     assertEquals(new Push(Result.NEW_PATCH_SET, created.number()), second.push(changeId(0)));
-    assertEquals(1, second.barrier.count(Indexed.REPLAYED));
+    assertEquals(1, first.changesInRepository());
   }
 
   @Test
-  void aNodesOwnCatalogChangeIsReplayedBeforeItsPushesWaitAgain() throws Exception {
+  void aNodesOwnCatalogChangeIsReplayedBeforeItsPushLooksUp() throws Exception {
     Node node = node("only", "5 s");
     startWithProject(node);
-    node.repositories.createRepository(Project.nameKey("platform/other")).close();
+    node.repositories.createRepository(OTHER).close();
 
-    node.await();
-    assertEquals(1, node.barrier.count(Indexed.SKIPPED));
+    assertTrue(node.await().isEmpty());
+    assertEquals(1, node.barrier.count(Indexed.REPLAYED));
     assertEquals(1, answered(node));
 
-    eventually(() -> node.tailer.wakeUpsReplayed() == 1, "the catalog is replayed");
-    node.await();
+    assertTrue(node.await().isEmpty());
     assertEquals(1, node.barrier.count(Indexed.NOT_BEHIND));
   }
 
   @Test
-  void aPushDoesNotWaitForACatalogReplay() throws Exception {
+  void aPushThatACatalogReplayOutlastsIsRejected() throws Exception {
     Node first = node("first", "5 s");
-    Node second = node("second", "5 s");
+    Node second = node("second", "300 ms");
     startWithProject(first, second);
-    first.push(changeId(0));
-    first.repositories.createRepository(Project.nameKey("platform/other")).close();
+    Push created = first.push(changeId(0));
+    first.repositories.createRepository(OTHER).close();
 
     CountDownLatch gate = new CountDownLatch(1);
     second.catalogGate = gate;
     List<Throwable> failures = new CopyOnWriteArrayList<>();
-    Thread catalog =
-        new Thread(
-            () -> {
-              try {
-                second.tailer.catchUp(RepositoryId.CATALOG);
-              } catch (Throwable failure) {
-                failures.add(failure);
-              }
-            });
+    Thread catalog = thread(() -> second.tailer.catchUp(RepositoryId.CATALOG), failures);
     catalog.start();
     try {
       assertTrue(second.catalogReplaying.await(10, TimeUnit.SECONDS));
       long started = System.nanoTime();
-      Push proceeded = second.push(changeId(0));
+      Push rejected = second.push(changeId(0));
       long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
 
-      assertEquals(Result.NEW_CHANGE, proceeded.result(), "the lookup ran on the index as it was");
-      assertEquals(1, second.barrier.count(Indexed.SKIPPED));
+      assertEquals(Result.REJECTED, rejected.result(), "no lookup ran on the index as it was");
+      assertEquals(1, second.barrier.count(Indexed.TIMED_OUT));
       assertTrue(elapsed < 3000, "the push waited " + elapsed + " ms");
     } finally {
       gate.countDown();
       catalog.join(TimeUnit.SECONDS.toMillis(10));
     }
     assertEquals(List.of(), failures);
+
+    second.catalogGate = null;
+    eventually(() -> second.await().isEmpty(), "the repository is replayed after the catalog");
+    assertEquals(new Push(Result.NEW_PATCH_SET, created.number()), second.push(changeId(0)));
   }
 
   @Test
-  void onlyRequestsThatLookUpChangeKeysWait() throws Exception {
+  void aNameWithoutARepositoryHasNothingToWaitFor() throws Exception {
     Node node = node("only", "5 s");
     startWithProject(node);
 
-    node.rest("/changes/platform%2Fapp~1001/detail");
-    node.rest("/projects/platform%2Fapp/branches/");
-    node.request(RequestType.GIT_UPLOAD, Optional.of(PROJECT), null);
-    node.request(RequestType.GIT_RECEIVE, Optional.empty(), null);
-    assertEquals(0, answered(node));
+    assertTrue(node.barrier.apply(Optional.of("no/such")).isEmpty());
+    assertEquals(1, node.barrier.count(Indexed.NOT_BEHIND));
+    assertEquals(1, answered(node));
+  }
 
-    node.rest("/changes/platform%2Fapp~1001/move");
-    node.rest("/changes/platform%2Fapp~1001/revisions/current/cherrypick");
-    node.rest("/projects/platform%2Fapp/commits/abc/cherrypick/");
-    node.rest("/projects/platform%2Fapp/create.change");
-    node.await();
-    assertEquals(5, node.barrier.count(Indexed.NOT_BEHIND));
+  @Test
+  void aRepositoryWhoseNameIsInFlightRejectsThePush() throws Exception {
+    Node first = node("first", "5 s");
+    Node second = node("second", "5 s");
+    startWithProject(first, second);
+    first.push(changeId(0));
+    NamespaceTest.prepareRename(first.repositories, "op-rename", PROJECT, OTHER);
 
-    node.request(RequestType.GIT_RECEIVE, Optional.of(Project.nameKey("no/such")), null);
-    assertEquals(1, node.barrier.count(Indexed.SKIPPED));
-    assertEquals(6, answered(node));
+    // Whether or not the node has seen the catalog change, the entries cannot be indexed under a
+    // name yet, and the push is not let through.
+    assertTrue(second.await().isPresent(), outcomes(second));
+    second.repositories.catalog().snapshot(true);
+    assertTrue(second.await().isPresent(), outcomes(second));
+    assertEquals(
+        0, second.barrier.count(Indexed.NOT_BEHIND) + second.barrier.count(Indexed.REPLAYED));
+    assertTrue(second.barrier.count(Indexed.UNAVAILABLE) >= 1, outcomes(second));
+
+    first.repositories.namespace().resume("op-rename");
+    assertTrue(second.barrier.apply(Optional.of(OTHER.get())).isEmpty(), outcomes(second));
+    assertEquals(OTHER, second.index.byBranchKey(OTHER, BRANCH, changeId(0)).get(0).project());
+  }
+
+  @Test
+  void aNodeThatDoesNotTailHasNothingToWaitForAndAStoppedOneRejects() throws Exception {
+    Node batch = node("batch", "5 s", "1 hour", bucket(), null, GerritRuntime.BATCH);
+    Node daemon = node("daemon", "5 s");
+    startWithProject(daemon, batch);
+
+    assertTrue(batch.await().isEmpty());
+    assertTrue(batch.awaitAll().isEmpty());
+    assertEquals(2, batch.barrier.count(Indexed.DISABLED));
+
+    daemon.tailer.stop();
+    assertTrue(daemon.await().isPresent(), "a stopped tailer no longer follows the log");
+    assertTrue(daemon.awaitAll().isPresent());
+    assertEquals(2, daemon.barrier.count(Indexed.UNAVAILABLE));
+  }
+
+  @Test
+  void aNodeRefusesToStartWithoutTheGerritHookUnlessTheBarrierIsOff() throws Exception {
+    // These tests run against the upstream plugin API, which has no ChangeIndexFreshness.
+    Node tailing = node("tailing", "5 s");
+    Node off = node("off", "0");
+    Node batch = node("batch", "5 s", "1 hour", bucket(), null, GerritRuntime.BATCH);
+
+    IllegalStateException refused =
+        assertThrows(IllegalStateException.class, tailing.barrier::start);
+    assertTrue(refused.getMessage().contains("indexBarrierTimeout = 0"), refused.getMessage());
+    assertDoesNotThrow(off.barrier::start);
+    assertDoesNotThrow(batch.barrier::start);
+  }
+
+  @Test
+  void aTopicLookupFindsAMemberAnotherNodeJustPushedToAnotherRepository() throws Exception {
+    Node first = node("first", "5 s");
+    Node second = node("second", "5 s");
+    first.repositories.createRepository(OTHER).close();
+    startWithProject(first, second);
+    Push approved = second.push(PROJECT, changeId(0), "feature");
+
+    // The member lands on the first node, in a repository the second node has no reason to look
+    // at: its wake-up is lost, its sweep is an hour away, and nothing it holds names it.
+    Push unapproved = first.push(OTHER, changeId(1), "feature");
+
+    // What a barrier for the project of the change being submitted can establish.
+    assertTrue(second.await().isEmpty());
+    assertEquals(List.of(approved.number()), numbers(second.index.byTopic("feature")));
+
+    assertEquals(
+        List.of(approved.number(), unapproved.number()), numbers(second.topic("feature").get()));
+    assertEquals(1, second.barrier.count(Indexed.REPLAYED));
+    assertEquals(0, second.barrier.count(Indexed.UNAVAILABLE));
+
+    // Nothing is behind now.
+    second.replayed.clear();
+    assertEquals(2, second.topic("feature").get().size());
+    assertEquals(List.of(), second.replayed);
+  }
+
+  @Test
+  void aTopicLookupIsRefusedWhileAnotherRepositoryCannotBeReplayed() throws Exception {
+    Node first = node("first", "5 s");
+    Node second = node("second", "300 ms");
+    first.repositories.createRepository(OTHER).close();
+    startWithProject(first, second);
+    second.push(PROJECT, changeId(0), "feature");
+    first.push(OTHER, changeId(1), "feature");
+
+    CountDownLatch gate = new CountDownLatch(1);
+    second.gated = OTHER;
+    second.replayGate = gate;
+    try {
+      assertTrue(second.topic("feature").isEmpty(), "no lookup ran on the index as it was");
+      assertEquals(1, second.barrier.count(Indexed.TIMED_OUT));
+    } finally {
+      gate.countDown();
+    }
+
+    second.replayGate = null;
+    eventually(() -> second.topic("feature").isPresent(), "the pass completes");
+    assertEquals(2, second.topic("feature").get().size());
+  }
+
+  @Test
+  void aTopicLookupFailsWhenTheStoreCannotBeListed() throws Exception {
+    GatedStore store = new GatedStore(bucket());
+    Node node = node("only", "5 s", "1 hour", store, null);
+    startWithProject(node);
+
+    store.failListings = true;
+    assertTrue(node.topic("feature").isEmpty());
+    assertEquals(1, node.barrier.count(Indexed.FAILED));
+
+    store.failListings = false;
+    assertTrue(node.topic("feature").isPresent());
+  }
+
+  @Test
+  void aTopicLookupDoesNotReplayTheNodesOwnWrites() throws Exception {
+    CountingObjectStore store = new CountingObjectStore(bucket());
+    Node node = node("only", "5 s", "1 hour", store, null);
+    node.repositories.createRepository(OTHER).close();
+    startWithProject(node);
+    // The node's own catalog entry is replayed before anything is looked up.
+    assertTrue(node.awaitAll().isEmpty());
+    node.push(PROJECT, changeId(0), "feature");
+    node.push(OTHER, changeId(1), "feature");
+    node.replayed.clear();
+    store.reset();
+    long notBehind = node.barrier.count(Indexed.NOT_BEHIND);
+
+    assertEquals(2, node.topic("feature").get().size());
+
+    assertEquals(notBehind + 1, node.barrier.count(Indexed.NOT_BEHIND));
+    assertEquals(List.of(), node.replayed, "the node's own writes were not replayed for a lookup");
+    assertEquals(1, store.count("LIST-versions manifests/"), "one listing is the boundary");
+    assertEquals(0, store.count("GET log/*"));
+    assertEquals(0, store.repositoryManifestReads(), "the node holds the manifests it published");
+  }
+
+  @Test
+  void topicLookupsThatArriveDuringAPassShareTheNextOne() throws Exception {
+    CountingObjectStore store = new CountingObjectStore(bucket());
+    Node first = node("first", "5 s");
+    Node second = node("second", "5 s", "1 hour", store, null);
+    first.repositories.createRepository(OTHER).close();
+    startWithProject(first, second);
+    assertTrue(second.awaitAll().isEmpty());
+    first.push(OTHER, changeId(0), "feature");
+    store.reset();
+
+    // The first lookup's pass has listed the store and is held replaying the other repository.
+    CountDownLatch gate = new CountDownLatch(1);
+    second.gated = OTHER;
+    second.replayGate = gate;
+    List<Throwable> failures = new CopyOnWriteArrayList<>();
+    List<Optional<List<IndexedChange>>> found = new CopyOnWriteArrayList<>();
+    Thread running = thread(() -> found.add(second.topic("feature")), failures);
+    running.start();
+    List<Thread> waiting = new ArrayList<>();
+    Push late;
+    try {
+      eventually(() -> second.applying.get() == 1, "the first pass is replaying");
+      // Published after that pass listed the store, before the next lookups arrive.
+      late = first.push(PROJECT, changeId(1), "feature");
+      for (int i = 0; i < 5; i++) {
+        waiting.add(thread(() -> found.add(second.topic("feature")), failures));
+      }
+      waiting.forEach(Thread::start);
+      eventually(
+          () -> waiting.stream().allMatch(t -> t.getState() == Thread.State.TIMED_WAITING),
+          "the later lookups wait");
+    } finally {
+      gate.countDown();
+    }
+    running.join(TimeUnit.SECONDS.toMillis(10));
+    for (Thread thread : waiting) {
+      thread.join(TimeUnit.SECONDS.toMillis(10));
+    }
+
+    assertEquals(List.of(), failures);
+    assertEquals(6, found.size());
+    assertTrue(found.stream().allMatch(Optional::isPresent));
+    // Every lookup that arrived after the publication sees it; the pass that was already running
+    // could not promise that, so none of them shared it.
+    assertEquals(
+        5,
+        found.stream().filter(changes -> numbers(changes.get()).contains(late.number())).count());
+    assertEquals(2, store.count("LIST-versions manifests/"), "six lookups, two passes");
+    assertEquals(0, second.overlaps.get(), "two threads replayed at once");
+  }
+
+  @Test
+  void aRepositoryWhoseReplayNeedsAnothersIsTriedOnceMore() throws Exception {
+    Node first = node("first", "5 s");
+    Node second = node("second", "5 s");
+    first.repositories.createRepository(OTHER).close();
+    startWithProject(first, second);
+    assertTrue(second.awaitAll().isEmpty());
+    first.push(PROJECT, changeId(0), "feature");
+    first.push(OTHER, changeId(1), "feature");
+
+    // As with a draft comment in All-Users on a change whose project is replayed later in the
+    // pass: the repository listed first cannot be replayed until the other one has been.
+    RepositoryId projectId = second.repositories.idOf(PROJECT);
+    RepositoryId otherId = second.repositories.idOf(OTHER);
+    Project.NameKey listedFirst = projectId.compareTo(otherId) < 0 ? PROJECT : OTHER;
+    Project.NameKey listedLast = listedFirst.equals(PROJECT) ? OTHER : PROJECT;
+    AtomicInteger refusals = new AtomicInteger();
+    second.beforeApply =
+        (project, node) -> {
+          if (project.equals(listedFirst) && node.index.byProject(listedLast).isEmpty()) {
+            refusals.incrementAndGet();
+            throw new IllegalStateException(listedFirst + " needs " + listedLast + " indexed");
+          }
+        };
+
+    assertEquals(2, second.topic("feature").get().size());
+    assertEquals(1, refusals.get());
+    assertEquals(1, second.barrier.count(Indexed.REPLAYED));
+  }
+
+  @Test
+  void aNameInFlightBlocksTopicLookupsOnlyWhileItsRepositoryHoldsUnindexedChanges()
+      throws Exception {
+    Node first = node("first", "5 s");
+    Node second = node("second", "5 s");
+    startWithProject(first, second);
+    assertTrue(second.awaitAll().isEmpty());
+
+    // A member another node pushed just before a rename began cannot be indexed under a name.
+    first.push(PROJECT, changeId(0), "feature");
+    NamespaceTest.prepareRename(first.repositories, "op-rename", PROJECT, OTHER);
+    assertTrue(second.topic("feature").isEmpty());
+    assertEquals(1, second.barrier.count(Indexed.UNAVAILABLE));
+
+    first.repositories.namespace().resume("op-rename");
+    assertEquals(1, second.topic("feature").get().size());
+    assertEquals(OTHER, second.topic("feature").get().get(0).project());
+
+    // A name in flight whose repository has nothing left to index holds no one up.
+    Project.NameKey third = Project.nameKey("platform/third");
+    NamespaceTest.prepareRename(first.repositories, "op-again", OTHER, third);
+    assertEquals(1, second.topic("feature").get().size());
+    assertEquals(1, second.barrier.count(Indexed.UNAVAILABLE));
+  }
+
+  @Test
+  void aReplayCannotWaitForTheBarrier() throws Exception {
+    Node first = node("first", "5 s");
+    Node second = node("second", "5 s");
+    startWithProject(first, second);
+    first.push(changeId(0));
+
+    // Something a replay triggers asks for an up-to-date index, on the thread that is replaying.
+    List<Optional<String>> answers = new CopyOnWriteArrayList<>();
+    second.beforeApply =
+        (project, node) -> {
+          answers.add(node.barrier.apply(Optional.empty()));
+          answers.add(node.barrier.apply(Optional.of(PROJECT.get())));
+        };
+    long started = System.nanoTime();
+    second.tailer.catchUp(second.id());
+    long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+    assertEquals(2, answers.size());
+    assertTrue(answers.stream().allMatch(Optional::isPresent), "it is refused, not left waiting");
+    assertTrue(elapsed < 3000, "the replay took " + elapsed + " ms");
+    assertEquals(2, second.barrier.count(Indexed.UNAVAILABLE));
   }
 
   private enum Result {
     NEW_CHANGE,
     NEW_PATCH_SET,
-    HAS_DUPLICATES
+    HAS_DUPLICATES,
+    /** The barrier could not bring the index up to date; nothing was looked up or written. */
+    REJECTED
   }
 
   private record Push(Result result, int number) {}
 
-  /** What the index holds of a change: enough to answer a lookup by branch and Change-Id. */
-  private record IndexedChange(int number, String branch, String changeId, int patchSets) {}
+  /**
+   * What the index holds of a change: enough to answer a lookup by branch and Change-Id, and by
+   * topic.
+   */
+  private record IndexedChange(
+      int number,
+      Project.NameKey project,
+      String branch,
+      String changeId,
+      String topic,
+      int patchSets) {}
+
+  private static List<Integer> numbers(List<IndexedChange> changes) {
+    return changes.stream().map(IndexedChange::number).toList();
+  }
 
   private static final class ChangeIndex {
     private final Map<Integer, IndexedChange> changes = new ConcurrentHashMap<>();
 
     List<IndexedChange> byBranchKey(String branch, String changeId) {
+      return byBranchKey(PROJECT, branch, changeId);
+    }
+
+    List<IndexedChange> byBranchKey(Project.NameKey project, String branch, String changeId) {
+      return sorted(
+          change ->
+              change.project().equals(project)
+                  && change.branch().equals(branch)
+                  && change.changeId().equals(changeId));
+    }
+
+    List<IndexedChange> byTopic(String topic) {
+      return sorted(change -> topic.equals(change.topic()));
+    }
+
+    List<IndexedChange> byProject(Project.NameKey project) {
+      return sorted(change -> change.project().equals(project));
+    }
+
+    private List<IndexedChange> sorted(java.util.function.Predicate<IndexedChange> filter) {
       return changes.values().stream()
-          .filter(change -> change.branch().equals(branch) && change.changeId().equals(changeId))
+          .filter(filter)
           .sorted(Comparator.comparingInt(IndexedChange::number))
           .toList();
     }
@@ -572,6 +1005,9 @@ class IndexBarrierTest {
     /** While set, reconciling the index with the catalog waits for it. */
     volatile CountDownLatch catalogGate;
 
+    /** Runs before a log entry of a project is applied; it may refuse by throwing. */
+    volatile BiConsumer<Project.NameKey, Node> beforeApply;
+
     final CountDownLatch catalogReplaying = new CountDownLatch(1);
 
     private boolean closed;
@@ -581,7 +1017,8 @@ class IndexBarrierTest {
         String barrierTimeout,
         String pollInterval,
         ObjectStore store,
-        IndexRebuilder rebuilder) {
+        IndexRebuilder rebuilder,
+        GerritRuntime runtime) {
       Config config = new Config();
       config.setString("walgerrit", null, "storagePath", root.resolve(name + "-cache").toString());
       config.setString(
@@ -601,7 +1038,7 @@ class IndexBarrierTest {
           new IndexEventTailer(
               repositories,
               this,
-              GerritRuntime.DAEMON,
+              runtime,
               "lucene",
               durableLuceneConfig(),
               new IndexEventReadiness(root.resolve(name + "-ready").resolve("READY")),
@@ -609,23 +1046,35 @@ class IndexBarrierTest {
       barrier = new IndexBarrier(tailer, tailer.indexBarrierTimeout(), new DisabledMetricMaker());
     }
 
-    /** A push of one commit for review on {@link #BRANCH}. */
+    /** A push of one commit for review on {@link #BRANCH} of {@link #PROJECT}. */
     Push push(String changeId) throws Exception {
-      await();
-      List<IndexedChange> found = index.byBranchKey(BRANCH, changeId);
+      return push(PROJECT, changeId, null);
+    }
+
+    /** A push of one commit for review on {@link #BRANCH} of {@code project}. */
+    Push push(Project.NameKey project, String changeId, String topic) throws Exception {
+      if (barrier.apply(Optional.of(project.get())).isPresent()) {
+        return new Push(Result.REJECTED, 0);
+      }
+      List<IndexedChange> found = index.byBranchKey(project, BRANCH, changeId);
       if (found.size() > 1) {
         return new Push(Result.HAS_DUPLICATES, 0);
       }
       int number;
       Result result;
-      try (Repository repository = repositories.openRepository(PROJECT)) {
+      try (Repository repository = repositories.openRepository(project)) {
         if (found.isEmpty()) {
           number = changeNumbers.incrementAndGet();
           ObjectId created =
               commit(
                   repository,
                   null,
-                  "Create change\n\nChange-id: " + changeId + "\nBranch: " + BRANCH + "\n");
+                  "Create change\n\nChange-id: "
+                      + changeId
+                      + "\nBranch: "
+                      + BRANCH
+                      + (topic == null ? "" : "\nTopic: " + topic)
+                      + "\n");
           RefUpdate update = repository.updateRef(RefNames.changeMetaRef(Change.id(number)));
           update.setExpectedOldObjectId(ObjectId.zeroId());
           update.setNewObjectId(created);
@@ -643,27 +1092,40 @@ class IndexBarrierTest {
         }
       }
       // Gerrit indexes a request's own write before it answers.
-      index(number);
+      index(project, number);
       return new Push(result, number);
     }
 
-    /** Runs the barrier for a push. */
-    void await() {
-      request(RequestType.GIT_RECEIVE, Optional.of(PROJECT), null);
+    /**
+     * The open changes of {@code topic} as a submission looks them up: in an index brought up to
+     * date with every repository, or not at all.
+     */
+    Optional<List<IndexedChange>> topic(String topic) {
+      if (awaitAll().isPresent()) {
+        return Optional.empty();
+      }
+      return Optional.of(index.byTopic(topic));
     }
 
-    void rest(String uri) {
-      request(RequestType.REST, Optional.of(PROJECT), uri);
+    /** Runs the barrier for a push to {@link #PROJECT}; the reason when the index may be stale. */
+    Optional<String> await() {
+      return barrier.apply(Optional.of(PROJECT.get()));
     }
 
-    void request(RequestType type, Optional<Project.NameKey> project, String uri) {
-      try (TraceContext trace = TraceContext.open()) {
-        RequestInfo.Builder request = RequestInfo.builder(type, new AnonymousUser(), trace);
-        project.ifPresent(request::project);
-        if (uri != null) {
-          request.requestUri(uri);
+    /** Runs the barrier for every repository; the reason when the index may be stale. */
+    Optional<String> awaitAll() {
+      return barrier.apply(Optional.empty());
+    }
+
+    /** Refills the index from the repositories, as a rebuild does. */
+    void reindexFromRepository() throws IOException {
+      index.changes.clear();
+      try (Repository repository = repositories.openRepository(PROJECT)) {
+        for (Ref ref : repository.getRefDatabase().getRefsByPrefix(RefNames.REFS_CHANGES)) {
+          if (ref.getName().endsWith(RefNames.META_SUFFIX)) {
+            index(PROJECT, Change.Id.fromRef(ref.getName()).get());
+          }
         }
-        barrier.onRequest(request.build());
       }
     }
 
@@ -673,6 +1135,10 @@ class IndexBarrierTest {
         overlaps.incrementAndGet();
       }
       try {
+        BiConsumer<Project.NameKey, Node> before = beforeApply;
+        if (before != null) {
+          before.accept(project, this);
+        }
         CountDownLatch gate = project.equals(gated) ? replayGate : null;
         if (gate != null && !gate.await(30, TimeUnit.SECONDS)) {
           throw new IllegalStateException("the test did not release the replay");
@@ -680,7 +1146,7 @@ class IndexBarrierTest {
         for (var update : transaction.getUpdatesList()) {
           Change.Id change = Change.Id.fromRef(update.getName());
           if (change != null && update.getName().endsWith(RefNames.META_SUFFIX)) {
-            index(change.get());
+            index(project, change.get());
             if (ObjectId.zeroId().name().equals(update.getOldObjectId())) {
               replayed.add(update.getName());
             }
@@ -713,9 +1179,9 @@ class IndexBarrierTest {
       }
     }
 
-    /** Indexes a change as the repository holds it now. */
-    private void index(int number) throws IOException {
-      try (Repository repository = repositories.openRepository(PROJECT);
+    /** Indexes a change of {@code project} as its repository holds it now. */
+    private void index(Project.NameKey project, int number) throws IOException {
+      try (Repository repository = repositories.openRepository(project);
           RevWalk walk = new RevWalk(repository)) {
         Ref meta = repository.exactRef(RefNames.changeMetaRef(Change.id(number)));
         if (meta == null) {
@@ -729,12 +1195,15 @@ class IndexBarrierTest {
           patchSets++;
           first = commit;
         }
+        List<String> topic = first.getFooterLines("Topic");
         index.changes.put(
             number,
             new IndexedChange(
                 number,
+                project,
                 first.getFooterLines("Branch").get(0),
                 first.getFooterLines("Change-id").get(0),
+                topic.isEmpty() ? null : topic.get(0),
                 patchSets));
       }
     }
@@ -780,6 +1249,12 @@ class IndexBarrierTest {
     private final ObjectStore delegate;
     volatile CountDownLatch manifestGate;
     volatile boolean failManifestReads;
+    volatile boolean failListings;
+
+    /** While set, only threads whose name starts with it wait for {@link #manifestGate}. */
+    volatile String gatedThreads;
+
+    final AtomicInteger waitingReads = new AtomicInteger();
 
     GatedStore(ObjectStore delegate) {
       this.delegate = delegate;
@@ -794,8 +1269,13 @@ class IndexBarrierTest {
         throw new IOException("the store refused to read " + key);
       }
       CountDownLatch gate = manifestGate;
+      String gated = gatedThreads;
+      if (gate == null || (gated != null && !Thread.currentThread().getName().startsWith(gated))) {
+        return;
+      }
+      waitingReads.incrementAndGet();
       try {
-        if (gate != null && !gate.await(30, TimeUnit.SECONDS)) {
+        if (!gate.await(30, TimeUnit.SECONDS)) {
           throw new IOException("the test did not release the read of " + key);
         }
       } catch (InterruptedException interrupted) {
@@ -844,6 +1324,9 @@ class IndexBarrierTest {
 
     @Override
     public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
+      if (failListings) {
+        throw new IOException("the store refused to list " + prefix);
+      }
       return delegate.listWithVersions(prefix);
     }
   }
@@ -866,7 +1349,17 @@ class IndexBarrierTest {
       String pollInterval,
       ObjectStore store,
       IndexRebuilder rebuilder) {
-    Node node = new Node(name, barrierTimeout, pollInterval, store, rebuilder);
+    return node(name, barrierTimeout, pollInterval, store, rebuilder, GerritRuntime.DAEMON);
+  }
+
+  private Node node(
+      String name,
+      String barrierTimeout,
+      String pollInterval,
+      ObjectStore store,
+      IndexRebuilder rebuilder,
+      GerritRuntime runtime) {
+    Node node = new Node(name, barrierTimeout, pollInterval, store, rebuilder, runtime);
     nodes.add(node);
     return node;
   }
@@ -876,6 +1369,14 @@ class IndexBarrierTest {
     for (Node node : started) {
       node.tailer.start();
     }
+  }
+
+  private static String outcomes(Node node) {
+    StringBuilder counts = new StringBuilder();
+    for (Indexed outcome : Indexed.values()) {
+      counts.append(outcome).append('=').append(node.barrier.count(outcome)).append(' ');
+    }
+    return counts.toString().trim();
   }
 
   private static long answered(Node node) {

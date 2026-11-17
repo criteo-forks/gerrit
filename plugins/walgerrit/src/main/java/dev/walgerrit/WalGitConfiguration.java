@@ -84,8 +84,9 @@ record WalGitConfiguration(
   static final long DEFAULT_INDEX_REPLAY_LIMIT = 10_000;
 
   /**
-   * Longest a request that looks changes up waits for the index to hold what other nodes wrote to
-   * its repository; zero turns the wait off. See {@link IndexBarrier}.
+   * Longest a request that decides on the change index waits for it to hold what other nodes wrote,
+   * to its repository or to every repository, before the request is rejected; zero turns the wait
+   * and the rejection off. See {@link IndexBarrier}.
    */
   static final Duration DEFAULT_INDEX_BARRIER_TIMEOUT = Duration.ofSeconds(5);
 

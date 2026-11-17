@@ -156,6 +156,8 @@ import com.google.gerrit.server.git.validators.CommitValidationMessage;
 import com.google.gerrit.server.git.validators.RefOperationValidationException;
 import com.google.gerrit.server.git.validators.RefOperationValidators;
 import com.google.gerrit.server.git.validators.ValidationMessage;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
+import com.google.gerrit.server.index.change.ChangeIndexNotFreshException;
 import com.google.gerrit.server.index.change.ChangeIndexer;
 import com.google.gerrit.server.logging.Metadata;
 import com.google.gerrit.server.logging.PerformanceLogContext;
@@ -397,6 +399,7 @@ class ReceiveCommits {
   private final CancellationMetrics cancellationMetrics;
   private final ChangeEditUtil editUtil;
   private final PluginSetContext<ExceptionHook> exceptionHooks;
+  private final ChangeIndexFreshness changeIndexFreshness;
   private final ChangeIndexer indexer;
   private final ChangeInserter.Factory changeInserterFactory;
   private final ChangeNotes.Factory notesFactory;
@@ -500,6 +503,7 @@ class ReceiveCommits {
       @GerritServerConfig Config config,
       ChangeEditUtil editUtil,
       PluginSetContext<ExceptionHook> exceptionHooks,
+      ChangeIndexFreshness changeIndexFreshness,
       ChangeIndexer indexer,
       ChangeInserter.Factory changeInserterFactory,
       ChangeNotes.Factory notesFactory,
@@ -574,6 +578,7 @@ class ReceiveCommits {
     this.hashtagsFactory = hashtagsFactory;
     this.setTopicFactory = setTopicFactory;
     this.serviceUserClassifier = serviceUserClassifier;
+    this.changeIndexFreshness = changeIndexFreshness;
     this.indexer = indexer;
     this.initializers = initializers;
     this.mergeOpProvider = mergeOpProvider;
@@ -863,6 +868,18 @@ class ReceiveCommits {
                 MetricBucket.PROJECT_NOT_WRITABLE,
                 "prohibited by Gerrit: project state does not permit write"));
       }
+      return;
+    }
+
+    // Whether a commit is a new change or a new patch set, and which changes a direct push closes,
+    // is decided on the change index. Nothing has been written yet, so a push that cannot have an
+    // up-to-date index is rejected whole and can be repeated.
+    try {
+      changeIndexFreshness.requireFresh(project.getNameKey());
+    } catch (ChangeIndexNotFreshException e) {
+      logger.atWarning().log("Rejecting push to %s: %s", project.getName(), e.getMessage());
+      rejectRemaining(
+          commands, RejectionReason.create(MetricBucket.CHANGE_INDEX_NOT_FRESH, e.getMessage()));
       return;
     }
 

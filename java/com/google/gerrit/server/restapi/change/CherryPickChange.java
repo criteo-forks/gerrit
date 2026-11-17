@@ -54,6 +54,7 @@ import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.git.GroupCollector;
 import com.google.gerrit.server.git.MergeUtil;
 import com.google.gerrit.server.git.MergeUtilFactory;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.notedb.ChangeNotes;
 import com.google.gerrit.server.notedb.ReviewerStateInternal;
 import com.google.gerrit.server.project.InvalidChangeOperationException;
@@ -107,6 +108,7 @@ public class CherryPickChange {
 
   private final Sequences seq;
   private final Provider<InternalChangeQuery> queryProvider;
+  private final ChangeIndexFreshness changeIndexFreshness;
   private final GitRepositoryManager gitManager;
   private final ZoneId serverZoneId;
   private final Provider<IdentifiedUser> user;
@@ -125,6 +127,7 @@ public class CherryPickChange {
   CherryPickChange(
       Sequences seq,
       Provider<InternalChangeQuery> queryProvider,
+      ChangeIndexFreshness changeIndexFreshness,
       @GerritServerConfig Config cfg,
       @GerritPersonIdent PersonIdent myIdent,
       GitRepositoryManager gitManager,
@@ -140,6 +143,7 @@ public class CherryPickChange {
       BatchUpdate.Factory batchUpdateFactory) {
     this.seq = seq;
     this.queryProvider = queryProvider;
+    this.changeIndexFreshness = changeIndexFreshness;
     this.gitManager = gitManager;
     this.serverZoneId = myIdent.getZoneId();
     this.user = user;
@@ -667,6 +671,7 @@ public class CherryPickChange {
   private ChangeData getDestChangeWithVerification(
       String destChangeId, BranchNameKey destBranch, boolean verifyIsMissing)
       throws InvalidChangeOperationException {
+    changeIndexFreshness.requireFresh(destBranch.project());
     List<ChangeData> destChanges =
         queryProvider.get().setLimit(2).byBranchKey(destBranch, Change.key(destChangeId));
     if (destChanges.size() > 1) {

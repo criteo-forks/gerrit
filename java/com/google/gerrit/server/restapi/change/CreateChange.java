@@ -73,6 +73,7 @@ import com.google.gerrit.server.git.CommitUtil;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.git.MergeUtil;
 import com.google.gerrit.server.git.MergeUtilFactory;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.notedb.ChangeNotes;
 import com.google.gerrit.server.patch.ApplyPatchUtil;
 import com.google.gerrit.server.permissions.ChangePermission;
@@ -140,6 +141,7 @@ public class CreateChange
   private final ChangeJson.Factory jsonFactory;
   private final ChangeFinder changeFinder;
   private final Provider<InternalChangeQuery> queryProvider;
+  private final ChangeIndexFreshness changeIndexFreshness;
   private final PatchSetUtil psUtil;
   private final MergeUtilFactory mergeUtilFactory;
   private final SubmitType submitType;
@@ -163,6 +165,7 @@ public class CreateChange
       ChangeJson.Factory json,
       ChangeFinder changeFinder,
       Provider<InternalChangeQuery> queryProvider,
+      ChangeIndexFreshness changeIndexFreshness,
       PatchSetUtil psUtil,
       @GerritServerConfig Config config,
       MergeUtilFactory mergeUtilFactory,
@@ -181,6 +184,7 @@ public class CreateChange
     this.jsonFactory = json;
     this.changeFinder = changeFinder;
     this.queryProvider = queryProvider;
+    this.changeIndexFreshness = changeIndexFreshness;
     this.psUtil = psUtil;
     this.submitType = config.getEnum("project", null, "submitType", SubmitType.MERGE_IF_NECESSARY);
     this.disablePrivateChanges = config.getBoolean("change", null, "disablePrivateChanges", false);
@@ -315,6 +319,7 @@ public class CreateChange
 
     Optional<String> changeId = CommitMessageUtil.getChangeIdFromCommitMessageFooter(input.subject);
     if (changeId.isPresent()) {
+      changeIndexFreshness.requireFresh(Project.nameKey(input.project));
       if (!queryProvider
           .get()
           .setLimit(1)

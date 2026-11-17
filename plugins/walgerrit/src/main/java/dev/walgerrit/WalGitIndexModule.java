@@ -20,17 +20,37 @@ import com.google.gerrit.extensions.events.GroupIndexedListener;
 import com.google.gerrit.extensions.events.ProjectIndexedListener;
 import com.google.gerrit.extensions.registration.DynamicSet;
 import com.google.gerrit.lifecycle.LifecycleModule;
-import com.google.gerrit.server.RequestListener;
 import com.google.gerrit.server.events.EventListener;
+import com.google.inject.Key;
+import com.google.inject.TypeLiteral;
+import com.google.inject.multibindings.OptionalBinder;
+import com.google.inject.name.Names;
+import java.util.Optional;
+import java.util.function.Function;
 
 /** Installs WAL-driven secondary-index convergence in Gerrit's system injector. */
 public final class WalGitIndexModule extends LifecycleModule {
+  /**
+   * The binding Gerrit calls before it decides on the change index. The name and type mirror {@code
+   * com.google.gerrit.server.index.change.ChangeIndexFreshness} in the WalGerrit fork of Gerrit,
+   * which this library is built without.
+   */
+  static final Key<Function<Optional<String>, Optional<String>>> INDEX_FRESHNESS_BARRIER =
+      Key.get(
+          new TypeLiteral<Function<Optional<String>, Optional<String>>>() {},
+          Names.named("changeIndexFreshnessBarrier"));
+
   @Override
   protected void configure() {
+    // First: a Gerrit build that never calls the barrier is not worth a startup sweep.
+    listener().to(IndexBarrier.class);
     // Peers' wake-ups let the tailer replay a repository before its next sweep finds it.
     listener().to(GossipEndpoint.class);
     listener().to(IndexEventTailer.class);
-    DynamicSet.bind(binder(), RequestListener.class).to(IndexBarrier.class);
+    // Gerrit declares the binding with a default that waits for nothing; this replaces it.
+    OptionalBinder.newOptionalBinder(binder(), INDEX_FRESHNESS_BARRIER)
+        .setBinding()
+        .to(IndexBarrier.class);
     // What this node does travels in the WAL to the other nodes' tailers: the events it fires and
     // the documents it reindexes with no ref update behind them.
     DynamicSet.bind(binder(), EventListener.class).to(WalJournal.class);

@@ -15,46 +15,51 @@
 package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
+import com.google.gerrit.extensions.events.LifecycleListener;
 import com.google.gerrit.metrics.Description;
 import com.google.gerrit.metrics.Field;
 import com.google.gerrit.metrics.MetricMaker;
-import com.google.gerrit.metrics.Timer1;
-import com.google.gerrit.server.RequestInfo;
-import com.google.gerrit.server.RequestInfo.RequestType;
-import com.google.gerrit.server.RequestListener;
+import com.google.gerrit.metrics.Timer2;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import dev.walgerrit.IndexEventTailer.Indexed;
 import java.time.Duration;
 import java.util.EnumMap;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Waits for other nodes' writes to a project to be indexed before a request looks a Change-Id up,
- * so the lookup finds a change another node just created.
+ * Brings this node's change index up to date with other nodes' writes before Gerrit decides
+ * something on it, and says so when it cannot.
  *
- * <p>It applies to pushes and to the REST calls that move, cherry-pick or create a change under a
- * project. The wait is bounded by {@code walgerrit.indexBarrierTimeout}; when it cannot be
- * satisfied in time the request continues with the index as it is. A timeout of zero turns the
- * barrier off.
+ * <p>Gerrit calls it through its {@code ChangeIndexFreshness} hook, which {@link WalGitIndexModule}
+ * binds it to: with a project before a push, a move, a cherry-pick or a change creation looks a
+ * Change-Id up there, and with no project before a submission looks up the members of a topic. The
+ * argument is the project name, or empty for every project; the result is empty when the index
+ * holds what other nodes wrote before the call, and otherwise the reason it may not. Gerrit rejects
+ * the request in that case, so the caller can repeat it.
+ *
+ * <p>The wait is bounded by {@code walgerrit.indexBarrierTimeout}. A timeout of zero turns the
+ * barrier off, and a node that does not tail the log has nothing to wait for; both let every
+ * request through.
  */
 @Singleton
-final class IndexBarrier implements RequestListener {
+final class IndexBarrier
+    implements Function<Optional<String>, Optional<String>>, LifecycleListener {
   private static final Logger logger = LoggerFactory.getLogger(IndexBarrier.class);
 
-  /** Last path segment of the REST calls that look a change up by Change-Id. */
-  private static final List<String> CHANGE_KEY_LOOKUPS =
-      List.of("/move", "/cherrypick", "/create.change");
+  /** The Gerrit class that calls the barrier; absent from a build without the hook. */
+  private static final String HOOK = "com.google.gerrit.server.index.change.ChangeIndexFreshness";
 
   private final IndexEventTailer tailer;
   private final Duration timeout;
-  private final Timer1<String> latency;
+  private final Timer2<String, String> latency;
   private final Map<Indexed, AtomicLong> outcomes = new EnumMap<>(Indexed.class);
 
   @Inject
@@ -71,32 +76,68 @@ final class IndexBarrier implements RequestListener {
     latency =
         metrics.newTimer(
             "walgerrit/index_barrier/latency",
-            new Description("Time a request spent in the index barrier, by outcome")
+            new Description("Time a request spent in the index barrier, by outcome and scope")
                 .setCumulative()
                 .setUnit(Description.Units.MILLISECONDS),
             Field.ofString("outcome", (metadata, value) -> {})
-                .description("not_behind, replayed, timed_out, failed or skipped")
+                .description("not_behind, replayed, disabled, timed_out, failed or unavailable")
+                .build(),
+            Field.ofString("scope", (metadata, value) -> {})
+                .description("project for one repository, all for every repository")
                 .build());
   }
 
+  /**
+   * Without the hook nothing calls the barrier, and a node would decide on a stale index with no
+   * sign of it. Refuse to start instead; {@code indexBarrierTimeout = 0} is the way to run without.
+   */
   @Override
-  public void onRequest(RequestInfo request) {
-    if (timeout.isZero() || request.project().isEmpty() || !looksUpChangeKeys(request)) {
+  public void start() {
+    if (timeout.isZero() || !tailer.tailing()) {
       return;
     }
-    Project.NameKey project = request.project().get();
+    try {
+      Class.forName(HOOK, false, IndexBarrier.class.getClassLoader());
+    } catch (ClassNotFoundException | LinkageError missing) {
+      throw new IllegalStateException(
+          "This Gerrit build has no "
+              + HOOK
+              + ", so nothing would call WalGerrit's index barrier. Deploy the WalGerrit library"
+              + " with the fork WAR it was built for, or set walgerrit.indexBarrierTimeout = 0 to"
+              + " run without the barrier.",
+          missing);
+    }
+  }
+
+  @Override
+  public void stop() {}
+
+  @Override
+  public Optional<String> apply(Optional<String> project) {
+    if (timeout.isZero()) {
+      return Optional.empty();
+    }
     long started = System.nanoTime();
-    Indexed outcome = tailer.awaitIndexed(project, timeout);
+    Indexed outcome =
+        project.isPresent()
+            ? tailer.awaitIndexed(Project.nameKey(project.get()), timeout)
+            : tailer.awaitAllIndexed(timeout);
     long elapsed = System.nanoTime() - started;
     outcomes.get(outcome).incrementAndGet();
-    latency.record(outcome.name().toLowerCase(Locale.ROOT), elapsed, TimeUnit.NANOSECONDS);
-    if (outcome == Indexed.TIMED_OUT) {
-      logger.warn(
-          "WalGerrit index barrier waited {} ms for {} without its index catching up; the"
-              + " request continues",
-          TimeUnit.NANOSECONDS.toMillis(elapsed),
-          project.get());
+    latency.record(
+        outcome.name().toLowerCase(Locale.ROOT),
+        project.isPresent() ? "project" : "all",
+        elapsed,
+        TimeUnit.NANOSECONDS);
+    if (outcome.fresh()) {
+      return Optional.empty();
     }
+    String reason = reason(outcome, TimeUnit.NANOSECONDS.toMillis(elapsed));
+    logger.warn(
+        "WalGerrit index barrier could not bring the index up to date for {}: {}",
+        project.orElse("all projects"),
+        reason);
+    return Optional.of(reason);
   }
 
   /** Requests the barrier answered with {@code outcome}. */
@@ -104,18 +145,13 @@ final class IndexBarrier implements RequestListener {
     return outcomes.get(outcome).get();
   }
 
-  private static boolean looksUpChangeKeys(RequestInfo request) {
-    String type = request.requestType();
-    if (RequestType.GIT_RECEIVE.name().equals(type)) {
-      return true;
-    }
-    if (!RequestType.REST.name().equals(type)) {
-      return false;
-    }
-    String uri = request.requestUri().orElse("");
-    while (uri.endsWith("/")) {
-      uri = uri.substring(0, uri.length() - 1);
-    }
-    return CHANGE_KEY_LOOKUPS.stream().anyMatch(uri::endsWith);
+  private static String reason(Indexed outcome, long waitedMillis) {
+    return switch (outcome) {
+      case TIMED_OUT -> "other servers' writes were not indexed within " + waitedMillis + " ms";
+      case FAILED -> "reading or indexing other servers' writes failed";
+      case UNAVAILABLE -> "other servers' writes cannot be indexed right now";
+      case NOT_BEHIND, REPLAYED, DISABLED ->
+          throw new IllegalArgumentException(outcome + " is not a failure");
+    };
   }
 }

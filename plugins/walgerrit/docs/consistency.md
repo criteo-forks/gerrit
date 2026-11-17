@@ -156,8 +156,10 @@ are idempotent. This requires Lucene and `commitWithin = 0` for accounts, both c
 groups and projects.
 
 A request that looks a change up by Change-Id first waits, within a bound, until the index holds
-what other nodes published to its repository before the request arrived. See
-[Index events](index-events.md#change-lookups-wait-for-other-nodes-writes).
+what other nodes published to its repository before the request arrived, and a submission that
+reaches a topic waits likewise for every repository. A request whose node cannot get there is
+rejected rather than served from the index as it is. Requests that overlap in time are not
+ordered. See [Index events](index-events.md#change-lookups-wait-for-other-nodes-writes).
 
 A malformed payload, log gap or index failure stops progress for that repository. A stale or
 divergent cursor can trigger a full index rebuild. Startup completes a clean sweep before

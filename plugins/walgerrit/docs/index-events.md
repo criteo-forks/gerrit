@@ -157,11 +157,23 @@ retry failed work and discover writes whose hints were lost. See [Peer wake-ups]
 
 ## Change lookups wait for other nodes' writes
 
-Gerrit decides whether a pushed commit is a new change or a new patch set by looking its
-Change-Id up in the change index. A node's index trails the other nodes' writes, so a lookup made
-right after another node created the change would miss it and create the change again.
+Gerrit decides two things on the change index that are wrong on a stale one:
 
-Before such a lookup the node brings the repository's index up to date:
+- whether a pushed commit is a new change or a new patch set, by looking its Change-Id up in the
+  destination branch. A lookup made right after another node created the change would miss it and
+  create the change again;
+- which changes a topic holds, when it submits a whole topic. A member another node just uploaded
+  to another repository would be left out, and the rest of the topic merged without it.
+
+A node's index trails the other nodes' writes, so before either decision the node brings its
+index up to date, and rejects the request when it cannot. Gerrit calls the barrier through the
+fork's `ChangeIndexFreshness` hook; a node whose Gerrit build lacks the hook refuses to start
+unless the barrier is turned off.
+
+### One repository
+
+Before a push, and before the REST calls that create a change, cherry-pick or move one look a
+Change-Id up, the node brings the index up to date for the destination project:
 
 1. It reads the repository's manifest conditionally to learn the log head.
 2. If its cursor is at the head, or this node published every entry between the cursor and the
@@ -170,48 +182,109 @@ Before such a lookup the node brings the repository's index up to date:
 3. Otherwise the repository is replayed through the usual catch-up path, and the request
    continues once the cursor has reached the head it read.
 
-This applies to every push over HTTP and SSH, and to the REST calls that move a change,
-cherry-pick, or create a change through `/projects/<name>/create.change`. `POST /changes/` does
-not name its project in the URL and is not covered, nor are queries that span projects, nor a
-REST call on a change this node's index does not hold yet.
-
 The index holds a repository under the name the catalog gave it when the node last replayed the
 catalog. While the catalog the node has read is ahead of the one it has replayed, for instance
-right after any node renamed or created a project, the request continues with the index as it
-is and the tailer is asked to replay the catalog.
+right after any node renamed or created a project, the catalog is replayed first. A name with no
+repository has nothing to wait for; Gerrit answers that request as it would anyway.
 
-The store is read and the log replayed on up to 16 threads of their own, never on the request
-thread. Requests for one repository share a replay. One replay runs at a time on a node, whoever
-started it, because entries of different repositories can index the same change. A request waits at
-most `indexBarrierTimeout`. When that time runs out, the store read or the replay fails, no thread
-is free, the catalog is being replayed, or the cursor needs a rebuild, the request continues with
-the index as it is, and a replay it stopped waiting for still completes. The barrier never rejects a
-request. The time a push waits counts toward its deadline, when the client or the server set one; a
-REST call's deadline starts after the wait.
+### Every repository
+
+A topic's members can be in any repository, and the members the index holds do not lead to the
+one it lacks. So a submission that reaches a topic, with `change.submitWholeTopic` on, first
+brings the index up to date for every repository:
+
+1. One paginated listing of `manifests/` names every repository with its manifest version. Every
+   publication acknowledged before the listing began is in it.
+2. The catalog is replayed first when it is behind the listing, then every repository whose
+   listed version the node has not caught up to, unless this node published every entry it is
+   missing.
+3. A repository whose replay fails is tried once more after the others: an All-Users entry can
+   name a change whose own repository comes later in the pass.
+
+The submission asks once, at its first topic lookup; a submission that reaches no topic does not
+ask, and neither do the read paths that compute the same set, such as `submitted_together` and
+the submit button. Submissions share passes: one that arrives while a pass runs waits for the
+next, since the running pass may have listed the store before it arrived, and however many wait,
+one pass follows another. On a quiet site a pass costs the listing; otherwise it costs the listing
+plus the replay the next sweep would have done.
+
+### When the index cannot be brought up to date
+
+The request is rejected: a push fails with a message for the client, and a REST call answers
+`503`. Both say to retry. A push is rejected before it updates any ref, and a rejected submission
+merges nothing. A push with `%submit` is two steps, though: the push has created its change or
+patch set by the time the submission asks, and that stays when the submission is rejected. This
+happens when:
+
+- `indexBarrierTimeout` runs out;
+- reading the store or replaying fails;
+- the node cannot replay now: it is stopping, a cursor needs a rebuild, a project's creation,
+  rename or deletion is in flight and its unreplayed entries touch changes, the catalog kept
+  moving, or more requests wait than the barrier takes;
+- the node's indexes are in doubt: it is rebuilding them, a rebuild began while the request
+  waited, or its last rebuild failed. A rebuild empties the indexes before it refills them, and a
+  failed one leaves the cursors saying what the indexes held before. The node therefore rejects
+  until a rebuild has completed, which the next sweep attempts.
+
+A node that stays unable to replay therefore rejects pushes and whole-topic submissions until it
+recovers, instead of creating duplicate changes or merging part of a topic. It also revokes
+readiness when its sweep fails; see [Startup and readiness](#startup-and-readiness).
+
+The store is read on up to 16 threads and the log replayed on up to 4 threads of their own,
+never on the request thread, and at most 256 reads and 256 replays wait for one. Requests for
+one repository share a replay, and a replay or pass a request stopped waiting for still
+completes. One replay runs at a time on a node, whoever started it, because entries of different
+repositories can index the same change. The time a push waits counts toward its deadline, when
+the client or the server set one.
 
 No replay runs while the node rebuilds its indexes; a replay that started earlier finishes first.
 A sweep, wake-up or rebuild waits up to one minute for a replay running on another thread. If the
-wait times out, it fails and the next sweep retries.
+wait times out, it fails and the next sweep retries. A replay never waits for the barrier: a
+request made on a thread that is replaying is rejected rather than deadlocked.
 
-A lookup therefore sees every change another node acknowledged before the request reached this
-node. Two requests that overlap in time can still both miss, on one node or on two. Nodes that
-share a host name take one another's entries for their own and do not wait for them.
+### What it guarantees, and what it does not
+
+A lookup sees every change update that any node acknowledged before the request asked the
+barrier. It does not order requests that overlap in time:
+
+- Two pushes of one new Change-Id to one branch that overlap, on one node or on two, can both
+  find no change and each create one, as on a single Gerrit server. They write different refs, so
+  the store's conditional write does not make one of them fail, and a retry of that write does
+  not repeat the lookup. Change-Ids are not unique; such a pair shows up as two changes with one
+  Change-Id on the branch, and Gerrit rejects later pushes of it (`has duplicates`) until one of
+  the two is deleted or moved to another branch.
+- A change that joins a topic, or is uploaded with it, after a submission's listing began may or
+  may not be part of that submission: nothing guarantees either. A single Gerrit server makes
+  the same choice at the moment it looks the topic up.
+- A rebuild that begins after a request passed the barrier is not held back for it. The request
+  then looks its Change-Id or topic up in indexes being emptied and refilled, and can miss what
+  they held. Rebuilds are rare, and the node revokes readiness before one begins, but a request
+  already admitted, or sent to the node directly, is not stopped. A request that is still in the
+  barrier when the rebuild begins is rejected.
+- Nodes that share a host name take one another's entries for their own and do not wait for
+  them. Every node needs its own.
+- The barrier covers the decisions above. Queries, dashboards and other reads see the index as it
+  is, and a REST call on a change this node's index does not hold yet can answer `404` until the
+  tailer catches up.
 
 ```ini
 [walgerrit]
   indexBarrierTimeout = 5 sec
 ```
 
-`0` turns the barrier off. The timer `walgerrit/index_barrier/latency` records how long each
-request spent in the barrier, by `outcome`:
+`0` turns the barrier off: every request continues on the index as it is, as do requests on a
+node that does not tail the log. The timer `walgerrit/index_barrier/latency` records how long each
+request spent in the barrier, by `scope` (`project` for one repository, `all` for every
+repository) and `outcome`:
 
-| Outcome | Meaning |
-| --- | --- |
-| `not_behind` | The index already held every entry other nodes wrote. |
-| `replayed` | The index was behind and caught up while the request waited. |
-| `timed_out` | `indexBarrierTimeout` ran out first. |
-| `failed` | Reading the store or replaying failed. |
-| `skipped` | Nothing was awaited: the tailer is not running or is rebuilding, the project has no active repository, the catalog is not replayed yet or is being replayed, no barrier thread was free, replay made no progress, or the cursor needs a rebuild. |
+| Outcome | Request | Meaning |
+| --- | --- | --- |
+| `not_behind` | continues | The index already held every entry other nodes wrote. |
+| `replayed` | continues | The index was behind and caught up while the request waited. |
+| `disabled` | continues | The node does not tail the log. |
+| `timed_out` | rejected | `indexBarrierTimeout` ran out first. |
+| `failed` | rejected | Reading the store or replaying failed. |
+| `unavailable` | rejected | The node cannot replay now, for one of the reasons above. |
 
 ## Replay
 

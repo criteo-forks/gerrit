@@ -49,6 +49,7 @@ import com.google.gerrit.server.change.ChangeJson;
 import com.google.gerrit.server.change.ChangeResource;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.git.GitRepositoryManager;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.notedb.ChangeUpdate;
 import com.google.gerrit.server.permissions.GlobalPermission;
 import com.google.gerrit.server.permissions.PermissionBackend;
@@ -80,6 +81,7 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
   private final ChangeJson.Factory json;
   private final GitRepositoryManager repoManager;
   private final Provider<InternalChangeQuery> queryProvider;
+  private final ChangeIndexFreshness changeIndexFreshness;
   private final ChangeMessagesUtil cmUtil;
   private final PatchSetUtil psUtil;
   private final ApprovalsUtil approvalsUtil;
@@ -93,6 +95,7 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
       ChangeJson.Factory json,
       GitRepositoryManager repoManager,
       Provider<InternalChangeQuery> queryProvider,
+      ChangeIndexFreshness changeIndexFreshness,
       ChangeMessagesUtil cmUtil,
       PatchSetUtil psUtil,
       ApprovalsUtil approvalsUtil,
@@ -103,6 +106,7 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
     this.json = json;
     this.repoManager = repoManager;
     this.queryProvider = queryProvider;
+    this.changeIndexFreshness = changeIndexFreshness;
     this.cmUtil = cmUtil;
     this.psUtil = psUtil;
     this.approvalsUtil = approvalsUtil;
@@ -156,6 +160,10 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
       throw new AuthException("move not permitted", denied);
     }
     projectCache.get(project).orElseThrow(illegalState(project)).checkStatePermitsWrite();
+
+    // The update below refuses a destination that already has a change with this Change-Id; it
+    // looks that up in the change index.
+    changeIndexFreshness.requireFresh(project);
 
     Op op = new Op(input);
     try (RefUpdateContext ctx = RefUpdateContext.open(CHANGE_MODIFICATION)) {

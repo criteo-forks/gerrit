@@ -108,9 +108,11 @@ listeners. A clean sweep creates `<indexCursorPath>/READY` and sets
 must require both the marker and a successful request to the local listener. See
 [index startup and readiness](docs/index-events.md#startup-and-readiness).
 
-A push looks its Change-Id up in the index. Before that lookup the node replays what other nodes
-wrote to the repository, waiting at most `indexBarrierTimeout`. See
-[change lookups](docs/index-events.md#change-lookups-wait-for-other-nodes-writes).
+A push looks its Change-Id up in the index, and a whole-topic submission looks the topic's
+members up there. Before either lookup the node replays what other nodes wrote, to the repository
+or to every repository, waiting at most `indexBarrierTimeout`; a request whose node cannot catch
+up is rejected and can be retried. This needs the `ChangeIndexFreshness` hook of the Gerrit fork.
+See [change lookups](docs/index-events.md#change-lookups-wait-for-other-nodes-writes).
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -118,7 +120,7 @@ wrote to the repository, waiting at most `indexBarrierTimeout`. See
 | `manifestRevalidateInterval` | `1 sec` | Interval checked by active handles; `0` disables periodic checks. |
 | `indexPollInterval` | `5 sec` | Delay between index sweeps. |
 | `indexReplayLimit` | `10000` | Maximum log entries to replay per repository before rebuilding indexes. |
-| `indexBarrierTimeout` | `5 sec` | Longest a push waits for the index to hold other nodes' writes to its repository; `0` disables the wait. |
+| `indexBarrierTimeout` | `5 sec` | Longest a push or whole-topic submission waits for the index to hold other nodes' writes before it is rejected; `0` disables the wait and the rejection. |
 
 Setting `manifestRevalidateOnOpen = false` allows an open to reuse a recently validated node
 view. This reduces reads during offline reindexing but gives up freshness at every open. Ref

@@ -86,6 +86,7 @@ import com.google.gerrit.server.git.CodeReviewCommit;
 import com.google.gerrit.server.git.MergeTip;
 import com.google.gerrit.server.git.validators.MergeValidationException;
 import com.google.gerrit.server.git.validators.MergeValidators;
+import com.google.gerrit.server.index.change.ChangeIndexNotFreshException;
 import com.google.gerrit.server.logging.Metadata;
 import com.google.gerrit.server.logging.RequestId;
 import com.google.gerrit.server.logging.TraceContext;
@@ -910,7 +911,9 @@ public class MergeOp implements AutoCloseable {
   private ChangeSet completeMergeChangeSetWithRetry(Change change)
       throws IOException, ResourceConflictException {
     try {
-      mergeSuperSet.setMergeOpRepoManager(orm);
+      // What is submitted together is decided here. A topic member this node's index does not hold
+      // would be left out, so topics are looked up only in an index that is up to date.
+      mergeSuperSet.setMergeOpRepoManager(orm).requireCompleteTopics();
       // Index can be stale for O(seconds), so attempting to merge the change right after it is
       // updated can result in an exception.
       // Reattempt evaluating the change set with the standard INDEX_QUERY retry timeout
@@ -946,7 +949,7 @@ public class MergeOp implements AutoCloseable {
               .retryOn(IOException.class::isInstance)
               .call();
       return resultSet;
-    } catch (ResourceConflictException | IOException e) {
+    } catch (ResourceConflictException | IOException | ChangeIndexNotFreshException e) {
       throw e;
     } catch (Exception e) {
       throw new IOException("Computing mergeSuperset has failed", e);

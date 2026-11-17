@@ -22,6 +22,7 @@ import static javax.servlet.http.HttpServletResponse.SC_METHOD_NOT_ALLOWED;
 import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
 import static javax.servlet.http.HttpServletResponse.SC_OK;
 import static javax.servlet.http.HttpServletResponse.SC_REQUEST_TIMEOUT;
+import static javax.servlet.http.HttpServletResponse.SC_SERVICE_UNAVAILABLE;
 
 import com.google.auto.value.AutoValue;
 import com.google.gerrit.server.permissions.PermissionDeniedException;
@@ -42,6 +43,7 @@ public abstract class RejectionReason {
     CANNOT_PUSH_MERGE_WITH_NEW_CHANGE_FOR_ALL_NOT_IN_TARGET(SC_BAD_REQUEST),
     CANNOT_SKIP_VALIDATION_FOR_MAGIC_PUSH(SC_BAD_REQUEST),
     CANNOT_TOGGLE_WIP(SC_FORBIDDEN),
+    CHANGE_INDEX_NOT_FRESH(SC_SERVICE_UNAVAILABLE),
     CHANGE_IS_CLOSED(SC_CONFLICT),
     CHANGE_NOT_FOUND(SC_NOT_FOUND),
     CLIENT_CLOSED_REQUEST(SC_CLIENT_CLOSED_REQUEST),
