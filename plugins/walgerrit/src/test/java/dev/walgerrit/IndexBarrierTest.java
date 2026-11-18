@@ -655,10 +655,10 @@ class IndexBarrierTest {
     Node second = node("second", "5 s");
     startWithProject(first, second);
     first.push(changeId(0));
-    NamespaceTest.prepareRename(first.repositories, "op-rename", PROJECT, OTHER);
+    NamespaceTest.prepareDelete(first.repositories, "op-delete", PROJECT);
 
     // Whether or not the node has seen the catalog change, the entries cannot be indexed under a
-    // name yet, and the push is not let through.
+    // name in flight, and the push is not let through.
     assertTrue(second.await().isPresent(), outcomes(second));
     second.repositories.catalog().snapshot(true);
     assertTrue(second.await().isPresent(), outcomes(second));
@@ -666,9 +666,11 @@ class IndexBarrierTest {
         0, second.barrier.count(Indexed.NOT_BEHIND) + second.barrier.count(Indexed.REPLAYED));
     assertTrue(second.barrier.count(Indexed.UNAVAILABLE) >= 1, outcomes(second));
 
-    first.repositories.namespace().resume("op-rename");
-    assertTrue(second.barrier.apply(Optional.of(OTHER.get())).isEmpty(), outcomes(second));
-    assertEquals(OTHER, second.index.byBranchKey(OTHER, BRANCH, changeId(0)).get(0).project());
+    // Once the name is retired it has no repository, and nothing of it to wait for or to index.
+    first.repositories.namespace().resume("op-delete");
+    assertTrue(second.await().isEmpty(), outcomes(second));
+    assertTrue(second.awaitAll().isEmpty(), outcomes(second));
+    assertTrue(second.index.byProject(PROJECT).isEmpty());
   }
 
   @Test
@@ -881,19 +883,21 @@ class IndexBarrierTest {
     startWithProject(first, second);
     assertTrue(second.awaitAll().isEmpty());
 
-    // A member another node pushed just before a rename began cannot be indexed under a name.
+    // A member another node pushed just before a deletion began cannot be indexed under a name
+    // in flight.
     first.push(PROJECT, changeId(0), "feature");
-    NamespaceTest.prepareRename(first.repositories, "op-rename", PROJECT, OTHER);
+    NamespaceTest.prepareDelete(first.repositories, "op-delete", PROJECT);
     assertTrue(second.topic("feature").isEmpty());
     assertEquals(1, second.barrier.count(Indexed.UNAVAILABLE));
 
-    first.repositories.namespace().resume("op-rename");
-    assertEquals(1, second.topic("feature").get().size());
-    assertEquals(OTHER, second.topic("feature").get().get(0).project());
+    first.repositories.namespace().resume("op-delete");
+    assertTrue(second.topic("feature").get().isEmpty(), "a retired name has nothing to index");
 
     // A name in flight whose repository has nothing left to index holds no one up.
-    Project.NameKey third = Project.nameKey("platform/third");
-    NamespaceTest.prepareRename(first.repositories, "op-again", OTHER, third);
+    first.repositories.createRepository(OTHER).close();
+    first.push(OTHER, changeId(1), "feature");
+    assertEquals(1, second.topic("feature").get().size());
+    NamespaceTest.prepareDelete(first.repositories, "op-again", OTHER);
     assertEquals(1, second.topic("feature").get().size());
     assertEquals(1, second.barrier.count(Indexed.UNAVAILABLE));
   }

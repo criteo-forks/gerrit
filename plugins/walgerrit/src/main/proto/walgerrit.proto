@@ -28,8 +28,8 @@ message Manifest {
   string head_transaction_id = 12;
   // Advances only when the repository is fenced for a namespace operation. A
   // publication carries the epoch its writer was admitted under and is refused
-  // when this differs, so a rename or deletion stops every writer admitted
-  // before it, on every node, at the commit point.
+  // when this differs, so a deletion stops every writer admitted before it,
+  // on every node, at the commit point.
   uint64 write_epoch = 13;
   // The namespace operation whose fence last advanced write_epoch; lets a
   // repeated fence recognise its own work.

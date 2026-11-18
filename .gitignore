@@ -50,7 +50,6 @@ js-to-ts.sh
 !/plugins/tsconfig.json
 !/plugins/tsconfig-plugins-base.json
 !/plugins/oidc
-!/plugins/rename-project
 !/plugins/yarn.lock
 !/plugins/BUILD
 !/plugins/codemirror-editor

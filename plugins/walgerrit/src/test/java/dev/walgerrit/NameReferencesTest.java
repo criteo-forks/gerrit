@@ -15,7 +15,6 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -52,9 +51,9 @@ import org.junit.jupiter.api.io.TempDir;
 class NameReferencesTest {
   private static final Project.NameKey ALL_USERS = Project.nameKey("All-Users");
   private static final Project.NameKey P = Project.nameKey("platform/p");
-  private static final Project.NameKey P2 = Project.nameKey("platform/p2");
   private static final String ALICE = "refs/users/01/1000001";
   private static final String BOB = "refs/users/02/1000002";
+  private static final String CAROL = "refs/users/03/1000003";
   private static final String WATCHES =
       """
       [project "platform/p"]
@@ -69,64 +68,6 @@ class NameReferencesTest {
   @TempDir Path root;
 
   @Test
-  void renameRewritesWatchesDestinationsAndSubscriptionPermissions() throws Exception {
-    WalGitRepositoryManager node = node("a");
-    node.createRepository(P).close();
-    Project.NameKey submodule = Project.nameKey("platform/lib");
-    node.createRepository(submodule).close();
-    config(node, submodule, "[allowSuperproject \"platform/p\"]\n\tmatching = refs/heads/*\n");
-    node.createRepository(ALL_USERS).close();
-    config(node, ALL_USERS, "[allowSuperproject \"platform/p\"]\n\tmatching = refs/heads/*\n");
-    file(node, ALL_USERS, ALICE, "watch.config", WATCHES);
-    file(node, ALL_USERS, ALICE, "destinations/mine", DESTINATIONS);
-    file(node, ALL_USERS, BOB, "watch.config", "[project \"other\"]\n\tnotify = * [ALL_COMMENTS]\n");
-    ObjectId bobBefore = tip(node, ALL_USERS, BOB);
-
-    node.namespace().rename(P, P2, false);
-
-    Config alice = parse(read(node, ALL_USERS, ALICE, "watch.config"));
-    assertFalse(alice.getSubsections("project").contains("platform/p"));
-    assertEquals(
-        List.of("* [ALL_COMMENTS, NEW_CHANGES]", "branch:main [SUBMITTED_CHANGES]"),
-        List.of(alice.getStringList("project", "platform/p2", "notify")));
-    assertEquals(
-        List.of("* [NEW_PATCHSETS]"), List.of(alice.getStringList("project", "other", "notify")));
-    assertEquals(
-        "# Ref\tProject\n#\nrefs/heads/main\tplatform/p2\nrefs/heads/dev\tother\n",
-        read(node, ALL_USERS, ALICE, "destinations/mine"));
-    assertEquals(bobBefore, tip(node, ALL_USERS, BOB), "an account without a reference is untouched");
-    Config lib = parse(read(node, submodule, "refs/meta/config", "project.config"));
-    assertEquals(List.of("platform/p2"), List.copyOf(lib.getSubsections("allowSuperproject")));
-    assertEquals("refs/heads/*", lib.getString("allowSuperproject", "platform/p2", "matching"));
-    Config users = parse(read(node, ALL_USERS, "refs/meta/config", "project.config"));
-    assertEquals(List.of("platform/p2"), List.copyOf(users.getSubsections("allowSuperproject")));
-    assertTrue(node.namespace().pending().isEmpty());
-    node.openRepository(P2).close();
-  }
-
-  @Test
-  void renameMergesNotifyValuesIntoAnExistingSectionOfTheNewName() throws Exception {
-    WalGitRepositoryManager node = node("a");
-    node.createRepository(P).close();
-    node.createRepository(ALL_USERS).close();
-    file(
-        node,
-        ALL_USERS,
-        ALICE,
-        "watch.config",
-        "[project \"platform/p\"]\n\tnotify = * [ALL_COMMENTS]\n\tnotify = branch:x [NEW_CHANGES]\n"
-            + "[project \"platform/p2\"]\n\tnotify = * [ALL_COMMENTS]\n");
-
-    node.namespace().rename(P, P2, false);
-
-    Config alice = parse(read(node, ALL_USERS, ALICE, "watch.config"));
-    assertEquals(List.of("platform/p2"), List.copyOf(alice.getSubsections("project")));
-    assertEquals(
-        List.of("* [ALL_COMMENTS]", "branch:x [NEW_CHANGES]"),
-        List.of(alice.getStringList("project", "platform/p2", "notify")));
-  }
-
-  @Test
   void deleteRemovesWatchesDestinationRowsAndSubscriptionPermissions() throws Exception {
     WalGitRepositoryManager node = node("a");
     node.createRepository(P).close();
@@ -138,6 +79,8 @@ class NameReferencesTest {
     file(node, ALL_USERS, ALICE, "watch.config", WATCHES);
     file(node, ALL_USERS, ALICE, "destinations/mine", DESTINATIONS);
     file(node, ALL_USERS, BOB, "destinations/only", "refs/heads/main\tplatform/p");
+    file(node, ALL_USERS, CAROL, "watch.config", "[project \"other\"]\n\tnotify = * [ALL_COMMENTS]\n");
+    ObjectId carolBefore = tip(node, ALL_USERS, CAROL);
 
     node.namespace().delete(P, false);
 
@@ -146,21 +89,21 @@ class NameReferencesTest {
     assertEquals(
         "# Ref\tProject\n#\nrefs/heads/dev\tother\n", read(node, ALL_USERS, ALICE, "destinations/mine"));
     assertEquals("", read(node, ALL_USERS, BOB, "destinations/only"), "the only row, without a final line break");
+    assertEquals(carolBefore, tip(node, ALL_USERS, CAROL), "an account without a reference is untouched");
     Config lib = parse(read(node, submodule, "refs/meta/config", "project.config"));
     assertTrue(lib.getSubsections("allowSuperproject").isEmpty());
     assertEquals("All-Projects", lib.getString("access", null, "inheritFrom"), "other keys stay");
     Config users = parse(read(node, ALL_USERS, "refs/meta/config", "project.config"));
     assertTrue(users.getSubsections("allowSuperproject").isEmpty());
+    assertTrue(node.namespace().pending().isEmpty());
   }
 
   @Test
   void destinationRowsKeepTheirFileShape() {
-    assertEquals(
-        "refs/heads/main\tplatform/p2", rewriteDestinations("refs/heads/main\tplatform/p", P, P2));
-    assertEquals("", rewriteDestinations("refs/heads/main\tplatform/p", P, null));
-    assertEquals("", rewriteDestinations("refs/heads/main\tplatform/p\n", P, null));
-    assertEquals("a\tx\n", rewriteDestinations("a\tx\nb\tplatform/p\n", P, null));
-    assertNull(rewriteDestinations("platform/p has no tab\nrefs/heads/dev\tother\n", P, null));
+    assertEquals("", withoutDestinations("refs/heads/main\tplatform/p", P));
+    assertEquals("", withoutDestinations("refs/heads/main\tplatform/p\n", P));
+    assertEquals("a\tx\n", withoutDestinations("a\tx\nb\tplatform/p\n", P));
+    assertNull(withoutDestinations("platform/p has no tab\nrefs/heads/dev\tother\n", P));
   }
 
   @Test
@@ -182,13 +125,13 @@ class NameReferencesTest {
 
     for (Project.NameKey name : List.of(leaf, orphan)) {
       IOException inherited =
-          assertThrows(IOException.class, () -> node.namespace().rename(name, P2, false));
+          assertThrows(IOException.class, () -> node.namespace().delete(name, false));
       assertTrue(inherited.getMessage().contains("allows superprojects"), inherited.getMessage());
     }
   }
 
   @Test
-  void anAccountRefDeletedUnderTheRewriteIsSettledNotRetried() throws Exception {
+  void anAccountRefDeletedUnderTheRemovalIsSettledNotRetried() throws Exception {
     WalGitRepositoryManager nodeA = node("a");
     WalGitRepositoryManager nodeB = node("b");
     nodeA.createRepository(P).close();
@@ -207,10 +150,10 @@ class NameReferencesTest {
         };
 
     new NameReferences(racing, Project.nameKey("All-Projects"), ALL_USERS, Clock.systemUTC())
-        .rewrite(P, P2, List.of(P, ALL_USERS), "op-race");
+        .remove(P, List.of(P, ALL_USERS), "op-race");
 
     Config alice = parse(read(nodeA, ALL_USERS, ALICE, "watch.config"));
-    assertTrue(alice.getSubsections("project").contains("platform/p2"));
+    assertEquals(List.of("other"), List.copyOf(alice.getSubsections("project")));
     assertNull(tip(nodeA, ALL_USERS, BOB));
   }
 
@@ -222,10 +165,10 @@ class NameReferencesTest {
     file(node, ALL_USERS, ALICE, "watch.config", WATCHES);
     ObjectId before = tip(node, ALL_USERS, ALICE);
 
-    node.namespace().rename(P, P2, true);
+    node.namespace().delete(P, true);
 
     assertEquals(before, tip(node, ALL_USERS, ALICE));
-    node.openRepository(P2).close();
+    assertThrows(RepositoryNotFoundException.class, () -> node.openRepository(P));
   }
 
   @Test
@@ -243,71 +186,67 @@ class NameReferencesTest {
     config(node, grandchild, "[access]\n\tinheritFrom = platform/child\n");
 
     IOException hasChildren =
-        assertThrows(IOException.class, () -> node.namespace().rename(parent, P2, false));
+        assertThrows(IOException.class, () -> node.namespace().delete(parent, false));
     assertTrue(hasChildren.getMessage().contains("parent of [platform/child]"), hasChildren.getMessage());
-    assertThrows(IOException.class, () -> node.namespace().delete(parent, false));
 
     IOException inherited =
-        assertThrows(IOException.class, () -> node.namespace().rename(grandchild, P2, false));
+        assertThrows(IOException.class, () -> node.namespace().delete(grandchild, false));
     assertTrue(inherited.getMessage().contains("allows superprojects"), inherited.getMessage());
 
-    node.namespace().rename(leaf, P2, false);
+    node.namespace().delete(leaf, false);
     assertTrue(node.namespace().pending().isEmpty());
-    for (Project.NameKey name : List.of(parent, child, grandchild, P2)) {
+    for (Project.NameKey name : List.of(parent, child, grandchild)) {
       node.openRepository(name).close();
     }
+    assertThrows(RepositoryNotFoundException.class, () -> node.openRepository(leaf));
   }
 
   @Test
-  void oneRenameOrDeletionIsInFlightAtATime() throws Exception {
+  void oneDeletionIsInFlightAtATime() throws Exception {
     WalGitRepositoryManager node = node("a");
     Project.NameKey other = Project.nameKey("platform/other");
     node.createRepository(P).close();
     node.createRepository(other).close();
-    NamespaceTest.prepareRename(node, "op-first", P, P2);
+    NamespaceTest.prepareDelete(node, "op-first", P);
 
-    IOException busy =
-        assertThrows(
-            IOException.class, () -> node.namespace().rename(other, Project.nameKey("platform/x"), false));
+    IOException busy = assertThrows(IOException.class, () -> node.namespace().delete(other, false));
     assertTrue(busy.getMessage().contains("op-first is in flight"), busy.getMessage());
-    assertThrows(IOException.class, () -> node.namespace().delete(other, false));
     node.createRepository(Project.nameKey("platform/created-meanwhile")).close();
 
     node.namespace().resume("op-first");
-    node.namespace().rename(other, Project.nameKey("platform/x"), false);
+    node.namespace().delete(other, false);
+    assertTrue(node.namespace().pending().isEmpty());
   }
 
   @Test
-  void repeatingARenameThatCompletedOrIsInFlightSucceeds() throws Exception {
+  void repeatingADeletionThatCompletedOrIsInFlightSucceeds() throws Exception {
     WalGitRepositoryManager node = node("a");
     node.createRepository(P).close();
-    node.namespace().rename(P, P2, true);
-    node.namespace().rename(P, P2, true);
-    assertThrows(IOException.class, () -> node.namespace().rename(P, Project.nameKey("platform/p3"), true));
+    node.namespace().delete(P, true);
+    node.namespace().delete(P, true);
 
     Project.NameKey q = Project.nameKey("platform/q");
     node.createRepository(q).close();
-    NamespaceTest.prepareRename(node, "op-q", q, Project.nameKey("platform/q2"));
-    node.namespace().rename(q, Project.nameKey("platform/q2"), true);
+    NamespaceTest.prepareDelete(node, "op-q", q);
+    node.namespace().delete(q, true);
     assertTrue(node.namespace().pending().isEmpty());
-    node.openRepository(Project.nameKey("platform/q2")).close();
+    assertTrue(node.namespace().deleted(q));
   }
 
   @Test
-  void resumeAfterTheFenceRewritesReferences() throws Exception {
+  void resumeAfterTheFenceRemovesReferences() throws Exception {
     WalGitRepositoryManager node = node("a");
     node.createRepository(P).close();
     node.createRepository(ALL_USERS).close();
     file(node, ALL_USERS, ALICE, "watch.config", WATCHES);
     RepositoryId id = node.idOf(P);
-    NamespaceTest.prepareRename(node, "op-fence", P, P2);
-    node.storage().manifestStore(id).fence(0, "op-fence", false);
+    NamespaceTest.prepareDelete(node, "op-fence", P);
+    node.storage().manifestStore(id).fence(0, "op-fence", true);
 
     node("b").namespace().resume("op-fence");
 
     Config alice = parse(read(node, ALL_USERS, ALICE, "watch.config"));
-    assertTrue(alice.getSubsections("project").contains("platform/p2"));
-    assertFalse(alice.getSubsections("project").contains("platform/p"));
+    assertEquals(List.of("other"), List.copyOf(alice.getSubsections("project")));
   }
 
   @Test
@@ -318,15 +257,14 @@ class NameReferencesTest {
     file(node, ALL_USERS, ALICE, "watch.config", "[project \"platform/p\"\n\tnotify = broken\n");
 
     IOException malformed =
-        assertThrows(IOException.class, () -> node.namespace().rename(P, P2, false));
+        assertThrows(IOException.class, () -> node.namespace().delete(P, false));
     assertTrue(malformed.getMessage().contains("Unreadable configuration in " + ALICE), malformed.getMessage());
     assertTrue(node.namespace().pending().isEmpty(), "nothing was prepared");
     node.openRepository(P).close();
-    assertThrows(RepositoryNotFoundException.class, () -> node.openRepository(P2));
   }
 
   @Test
-  void theReportSeparatesWhatIsRewrittenFromWhatIsOnlyMentioned() throws Exception {
+  void theReportSeparatesWhatIsRemovedFromWhatIsOnlyMentioned() throws Exception {
     WalGitRepositoryManager node = node("a");
     node.createRepository(P).close();
     node.createRepository(Project.nameKey("platform/lib")).close();
@@ -361,7 +299,7 @@ class NameReferencesTest {
     assertTrue(report.contains(ALICE + " watch.config: [project \"other\"] notify = project:platform/p"), report);
     assertTrue(
         report.contains(ALICE + " watch.config: [project \"platform/p\"] notify = project:platform/p [NEW_CHANGES]"),
-        "a filter inside the watch being renamed is a reference of its own: " + report);
+        "a filter inside the watch a deletion removes is a reference of its own: " + report);
     assertTrue(report.contains(ALICE + " queries: mine\tproject:platform/p is:open"), report);
   }
 
@@ -382,8 +320,14 @@ class NameReferencesTest {
   static void file(
       WalGitRepositoryManager node, Project.NameKey project, String ref, String path, String content)
       throws IOException {
-    try (Repository repository = node.openRepository(project);
-        ObjectInserter inserter = repository.newObjectInserter();
+    try (Repository repository = node.openRepository(project)) {
+      file(repository, ref, path, content);
+    }
+  }
+
+  static void file(Repository repository, String ref, String path, String content)
+      throws IOException {
+    try (ObjectInserter inserter = repository.newObjectInserter();
         ObjectReader reader = repository.newObjectReader();
         RevWalk walk = new RevWalk(reader)) {
       Ref current = repository.exactRef(ref);
@@ -463,9 +407,9 @@ class NameReferencesTest {
     }
   }
 
-  private static String rewriteDestinations(String file, Project.NameKey from, Project.NameKey to) {
-    byte[] rewritten = NameReferences.rewriteDestinations(file.getBytes(StandardCharsets.UTF_8), from, to);
-    return rewritten == null ? null : new String(rewritten, StandardCharsets.UTF_8);
+  private static String withoutDestinations(String file, Project.NameKey name) {
+    byte[] changed = NameReferences.withoutDestinations(file.getBytes(StandardCharsets.UTF_8), name);
+    return changed == null ? null : new String(changed, StandardCharsets.UTF_8);
   }
 
   private static Config parse(String text) throws Exception {

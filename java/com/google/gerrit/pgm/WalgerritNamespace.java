@@ -26,17 +26,19 @@ import java.util.List;
 import org.kohsuke.args4j.Argument;
 
 /**
- * Renames and deletes WalGerrit project names, and finishes such operations another node left
- * unfinished.
+ * Deletes WalGerrit project names, and finishes namespace operations another node left unfinished.
  *
- * <p>Usage: {@code java -jar gerrit.war walgerrit-namespace -d SITE rename OLD NEW}, {@code delete
+ * <p>Usage: {@code java -jar gerrit.war walgerrit-namespace -d SITE delete NAME}, {@code references
  * NAME}, {@code pending} or {@code resume OPERATION}. Like {@code walgerrit-import}, the
  * implementation lives in the WalGerrit library in the site's {@code lib/} and is loaded from there.
  */
 public class WalgerritNamespace extends SiteProgram {
   private static final String PROGRAM = "dev.walgerrit.NamespaceProgram";
 
-  @Argument(index = 0, metaVar = "COMMAND", usage = "rename OLD NEW | delete NAME | pending | resume OPERATION")
+  @Argument(
+      index = 0,
+      metaVar = "COMMAND",
+      usage = "delete NAME | references NAME | pending | resume OPERATION")
   private List<String> arguments = new ArrayList<>();
 
   @Override

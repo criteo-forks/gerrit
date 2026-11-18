@@ -133,10 +133,9 @@ final class GerritIndexEventApplier implements IndexEventApplier {
 
   /**
    * Caches first, so nothing below reads a stale project; then, per name, what the catalog says:
-   * an active name gets its project document and every change of its repository indexed under it,
-   * which also replaces the documents an old name left, since a change's document is keyed by its
-   * number; a deleted name loses its change documents and its project document; a name in flight
-   * is left to the finalize that follows.
+   * an active name gets its project document and every change of its repository indexed under it;
+   * a retired name loses its change documents and its project document; a name in flight is left
+   * to the finalize that follows.
    */
   @Override
   public void namespaceChanged(List<NamespaceChange> changes) {
@@ -166,10 +165,9 @@ final class GerritIndexEventApplier implements IndexEventApplier {
           }
         }
         logger.info(
-            "WalGerrit reconciled {} with the catalog: {}{}",
+            "WalGerrit reconciled {} with the catalog: {}",
             change.name().get(),
-            change.state().name().toLowerCase(java.util.Locale.ROOT),
-            change.movedTo() == null ? "" : ", moved to " + change.movedTo().get());
+            change.state().name().toLowerCase(java.util.Locale.ROOT));
       }
     }
   }

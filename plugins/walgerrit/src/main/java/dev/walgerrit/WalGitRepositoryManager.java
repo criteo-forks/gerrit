@@ -176,7 +176,7 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     // arrives after a plugin already acted on its own and proves nothing.
   }
 
-  /** Renames, deletes and resumes; the front end for plugins and the batch program. */
+  /** Deletes and resumes; the front end for plugins and the batch program. */
   public Namespace namespace() {
     return namespace;
   }
@@ -233,7 +233,6 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
         name, storage.manifestStore(id), configuration.manifestRevalidateInterval(), writeEpoch);
   }
 
-  /** Whether a binding answers reads: active, or the source of an operation in flight. */
   /** The name the catalog binds {@code id} to, for handles and logs; the id itself when none. */
   Project.NameKey nameOf(RepositoryId id) throws IOException {
     return catalog.bindingOf(id, false).map(Binding::name).orElse(Project.nameKey(id.value()));

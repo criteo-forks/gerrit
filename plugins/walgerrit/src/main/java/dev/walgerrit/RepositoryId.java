@@ -20,9 +20,9 @@ import java.util.regex.Pattern;
 
 /**
  * The key everything of one repository is stored under: manifest, packs, log, lease, cache and
- * cursor. Assigned once, at creation, and never derived from the project's name, so a rename or
- * deletion never moves data. The catalog repository has the fixed id {@link #CATALOG}, which no
- * random id can spell.
+ * cursor. Assigned once, at creation, and never derived from the project's name, so a deletion
+ * never moves data. The catalog repository has the fixed id {@link #CATALOG}, which no random id
+ * can spell.
  */
 record RepositoryId(String value) implements Comparable<RepositoryId> {
   private static final Pattern VALID = Pattern.compile("[0-9a-z]{1,64}");

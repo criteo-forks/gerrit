@@ -25,7 +25,7 @@ the committed inventory do not publish refs merely by existing in the store.
 ```
 
 A repository id is an opaque lowercase hexadecimal string chosen at creation. Project names are
-bindings in the [catalog](namespace.md), so renaming or deleting a project moves no files.
+bindings in the [catalog](namespace.md), so deleting a project moves no files.
 
 Pack families may also contain bitmap and reverse-index files. Large cached S3 packs can have a
 `.chunks` sidecar that records downloaded ranges. Staging files and cursors are node-local.
@@ -43,9 +43,8 @@ its source, files and sizes, object/delta counts, reftable update indices and pa
 The schema is [walgerrit.proto](../src/main/proto/walgerrit.proto).
 
 `revision` advances on every publication. `ref_revision` advances only when the live reftable
-stack changes, including reftable compaction. `write_epoch` advances only when a rename or
-deletion fences the repository; a publication whose writer was admitted under another epoch is
-refused. The object store's version token is separate from all three: it is the value used for
+stack changes, including reftable compaction. `write_epoch` advances only when a deletion
+fences the repository; a publication whose writer was admitted under another epoch is refused. The object store's version token is separate from all three: it is the value used for
 conditional replacement.
 
 Manifests have a dedicated prefix. A paginated listing discovers repository ids and manifest

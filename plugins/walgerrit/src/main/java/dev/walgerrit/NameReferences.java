@@ -57,20 +57,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Where Gerrit keeps a project's name outside the project's own repository, and what a rename or a
- * deletion does about it.
+ * Where Gerrit keeps a project's name outside the project's own repository, and what a deletion
+ * does about it.
  *
- * <p>Typed references are rewritten: the {@code [project "name"]} sections of every account's
- * {@code watch.config} and the project column of its {@code destinations/*} files in All-Users, and
- * the {@code [allowSuperproject "name"]} sections of the projects that let the name subscribe to
- * them. Account refs are changed a few hundred per ref transaction, each project in one, all with
- * expected old tips, so every node's tailer evicts and reindexes the accounts and projects as for
- * any write. Text that may mention a name (watch filters, named queries, plugin sections,
- * dashboards, {@code .gitmodules}) is never rewritten; the literal occurrences in All-Projects'
- * {@code project.config} and in accounts' watch filters and named queries are reported.
+ * <p>Typed references are removed: the {@code [project "name"]} sections of every account's {@code
+ * watch.config} and the rows of its {@code destinations/*} files in All-Users whose project column
+ * is the name, and the {@code [allowSuperproject "name"]} sections of the projects that let the
+ * name subscribe to them. Account refs are changed a few hundred per ref transaction, each project
+ * in one, all with expected old tips, so every node's tailer evicts and reindexes the accounts and
+ * projects as for any write. Text that may mention a name (watch filters, named queries, plugin
+ * sections, dashboards, {@code .gitmodules}) is never changed; the literal occurrences in
+ * All-Projects' {@code project.config} and in accounts' watch filters and named queries are
+ * reported.
  *
- * <p>Children are not rewritten: a parent is refused, because its children would inherit from
- * All-Projects while the name is pending.
+ * <p>A parent is refused: its children would inherit from All-Projects instead.
  */
 final class NameReferences {
   private static final Logger logger = LoggerFactory.getLogger(NameReferences.class);
@@ -228,41 +228,30 @@ final class NameReferences {
     return new Users(watchers, destinationRows, textual);
   }
 
-  /**
-   * Rewrites every typed reference to {@code from} into {@code to}, or removes it when {@code to}
-   * is null. Idempotent: a second run finds nothing to change.
-   */
-  void rewrite(
-      Project.NameKey from,
-      @Nullable Project.NameKey to,
-      Collection<Project.NameKey> activeNames,
-      String operationId)
+  /** Removes every typed reference to {@code name}. Idempotent. */
+  void remove(Project.NameKey name, Collection<Project.NameKey> activeNames, String operationId)
       throws IOException {
     String message =
-        (to == null ? "Delete " + from.get() : "Rename " + from.get() + " to " + to.get())
-            + "\n\nwalgerrit-namespace operation "
-            + operationId
-            + "\n";
-    int accounts = rewriteAccounts(from, to, message);
+        "Delete " + name.get() + "\n\nwalgerrit-namespace operation " + operationId + "\n";
+    int accounts = removeFromAccounts(name, message);
     int projects = 0;
     for (Project.NameKey project : activeNames) {
       try (Repository repository = opener.open(project)) {
-        if (rewriteProjectConfig(repository, project, from, to, message)) {
+        if (removeFromProjectConfig(repository, project, name, message)) {
           projects++;
         }
       }
     }
     logger.info(
-        "WalGerrit rewrote references to {} in {} account(s) and {} project(s) ({})",
-        from.get(),
+        "WalGerrit removed references to {} in {} account(s) and {} project(s) ({})",
+        name.get(),
         accounts,
         projects,
         operationId);
   }
 
-  private int rewriteAccounts(Project.NameKey from, @Nullable Project.NameKey to, String message)
-      throws IOException {
-    int rewritten = 0;
+  private int removeFromAccounts(Project.NameKey name, String message) throws IOException {
+    int changedRefs = 0;
     Repository users = openAllUsers();
     if (users == null) {
       return 0;
@@ -279,14 +268,14 @@ final class NameReferences {
             Map<String, byte[]> changes = new LinkedHashMap<>();
             byte[] watches = blob(reader, tip, WATCH_CONFIG);
             if (watches != null) {
-              byte[] changed = rewriteWatches(parse(watches, ref.getName()), from, to);
+              byte[] changed = withoutWatch(parse(watches, ref.getName()), name);
               if (changed != null) {
                 changes.put(WATCH_CONFIG, changed);
               }
             }
             for (Map.Entry<String, byte[]> destination :
                 blobsUnder(reader, tip, DESTINATIONS).entrySet()) {
-              byte[] changed = rewriteDestinations(destination.getValue(), from, to);
+              byte[] changed = withoutDestinations(destination.getValue(), name);
               if (changed != null) {
                 changes.put(destination.getKey(), changed);
               }
@@ -313,7 +302,7 @@ final class NameReferences {
           }
           for (ReceiveCommand command : chunk) {
             switch (command.getResult()) {
-              case OK -> rewritten++;
+              case OK -> changedRefs++;
               case LOCK_FAILURE, REJECTED_OTHER_REASON -> {
                 // The ref moved under the transaction; one deleted meanwhile has nothing left.
                 Ref current = repository.exactRef(command.getRefName());
@@ -323,7 +312,7 @@ final class NameReferences {
               }
               default ->
                   throw new IOException(
-                      "Rewriting " + command.getRefName() + " in " + allUsers.get() + " ended in "
+                      "Removing references from " + command.getRefName() + " in " + allUsers.get() + " ended in "
                           + command.getResult() + " " + command.getMessage());
             }
           }
@@ -333,17 +322,17 @@ final class NameReferences {
         }
         if (attempt >= MAX_ATTEMPTS) {
           throw new IOException(
-              "Rewriting " + retry.size() + " account ref(s) in " + allUsers.get() + " lost " + attempt
+              "Removing references from " + retry.size() + " account ref(s) in " + allUsers.get() + " lost " + attempt
                   + " races in a row");
         }
         remaining = retry;
       }
     }
-    return rewritten;
+    return changedRefs;
   }
 
-  private boolean rewriteProjectConfig(
-      Repository repository, Project.NameKey project, Project.NameKey from, @Nullable Project.NameKey to, String message)
+  private boolean removeFromProjectConfig(
+      Repository repository, Project.NameKey project, Project.NameKey name, String message)
       throws IOException {
     for (int attempt = 1; ; attempt++) {
       Ref ref = repository.exactRef(META_CONFIG);
@@ -360,19 +349,10 @@ final class NameReferences {
           return false;
         }
         Config config = parse(blob, project.get() + " " + META_CONFIG);
-        if (!config.getSubsections("allowSuperproject").contains(from.get())) {
+        if (!config.getSubsections("allowSuperproject").contains(name.get())) {
           return false;
         }
-        if (to != null) {
-          for (String key : config.getNames("allowSuperproject", from.get())) {
-            config.setStringList(
-                "allowSuperproject",
-                to.get(),
-                key,
-                List.of(config.getStringList("allowSuperproject", from.get(), key)));
-          }
-        }
-        config.unsetSection("allowSuperproject", from.get());
+        config.unsetSection("allowSuperproject", name.get());
         commitId =
             commit(
                 reader,
@@ -394,47 +374,35 @@ final class NameReferences {
         case LOCK_FAILURE, REJECTED -> {
           if (attempt >= MAX_ATTEMPTS) {
             throw new IOException(
-                "Rewriting " + META_CONFIG + " of " + project.get() + " lost " + attempt + " races in a row");
+                "Removing references from " + META_CONFIG + " of " + project.get() + " lost " + attempt + " races in a row");
           }
         }
         default ->
-            throw new IOException("Rewriting " + META_CONFIG + " of " + project.get() + " ended in " + result);
+            throw new IOException("Removing references from " + META_CONFIG + " of " + project.get() + " ended in " + result);
       }
     }
   }
 
-  /** The watch file with {@code from} moved to {@code to} (notify values unioned) or removed; null when untouched. */
+  /** The watch file without the section of {@code name}; null when untouched. */
   @Nullable
-  static byte[] rewriteWatches(Config config, Project.NameKey from, @Nullable Project.NameKey to) {
-    if (!config.getSubsections("project").contains(from.get())) {
+  static byte[] withoutWatch(Config config, Project.NameKey name) {
+    if (!config.getSubsections("project").contains(name.get())) {
       return null;
     }
-    if (to != null) {
-      List<String> merged = new ArrayList<>(List.of(config.getStringList("project", to.get(), "notify")));
-      for (String notify : config.getStringList("project", from.get(), "notify")) {
-        if (!merged.contains(notify)) {
-          merged.add(notify);
-        }
-      }
-      config.setStringList("project", to.get(), "notify", merged);
-    }
-    config.unsetSection("project", from.get());
+    config.unsetSection("project", name.get());
     return config.toText().getBytes(StandardCharsets.UTF_8);
   }
 
-  /** A destination file with rows of {@code from} moved to {@code to} or dropped; null when untouched. */
+  /** A destination file without the rows of {@code name}; null when untouched. */
   @Nullable
-  static byte[] rewriteDestinations(byte[] bytes, Project.NameKey from, @Nullable Project.NameKey to) {
+  static byte[] withoutDestinations(byte[] bytes, Project.NameKey name) {
     List<String> lines = new ArrayList<>();
     boolean changed = false;
     // Splitting keeps a final line break as an empty last line, so joining restores it.
     for (String line : new String(bytes, StandardCharsets.UTF_8).split("\n", -1)) {
-      if (projectColumn(line).equals(from.get())) {
+      if (projectColumn(line).equals(name.get())) {
         changed = true;
-        if (to == null) {
-          continue;
-        }
-        line = line.substring(0, line.indexOf('\t') + 1) + to.get();
+        continue;
       }
       lines.add(line);
     }

@@ -197,7 +197,7 @@ final class IndexEventTailer implements LifecycleListener {
     /** The name has no repository: there is nothing to index. */
     static final Head NO_REPOSITORY = new Head(null, 0, true);
 
-    /** The name is being created, renamed or deleted; its entries cannot be indexed yet. */
+    /** The name is being created or deleted; its entries cannot be indexed yet. */
     static final Head NAME_IN_FLIGHT = new Head(null, 0, false);
   }
 
@@ -705,7 +705,8 @@ final class IndexEventTailer implements LifecycleListener {
       if (applied == null) {
         continue;
       }
-      // The catalog's own entries are waited for too: its replay is what renames documents.
+      // The catalog's own entries are waited for too: its replay is what reconciles the documents
+      // of the names they touched.
       if (head.id().isCatalog()
           ? applied >= head.sequence()
           : indexed(head.id(), applied, head.sequence())) {
@@ -1093,9 +1094,9 @@ final class IndexEventTailer implements LifecycleListener {
    * a listed version, one conditional read is made.
    *
    * <p>Entries are indexed under the name the catalog binds the id to now. An id whose name is in
-   * flight is left where it is and retried, since its entries would be indexed under a name that is
-   * about to change; one with no active name has its entries acknowledged without indexing, the
-   * catalog's own replay having removed or replaced its documents.
+   * flight is left where it is and retried, since its entries cannot be indexed under a name that
+   * is not active; one with no active name has its entries acknowledged without indexing, the
+   * catalog's own replay having removed its documents.
    *
    * @throws IndexRebuildRequiredException when the cursor cannot be advanced by replay
    */
@@ -1493,7 +1494,7 @@ final class IndexEventTailer implements LifecycleListener {
     }
     Optional<Binding> binding = repositories.catalog().bindingOf(id, false);
     if (binding.isPresent() && binding.get().pending()) {
-      return; // The listeners would look the changes up under a name that is about to change.
+      return; // The listeners would look the changes up under a name that is not served.
     }
     Project.NameKey project = binding.filter(Binding::active).map(Binding::name).orElse(null);
     Map<OwedMerge, MergeEvents.Delivery> delivered = new LinkedHashMap<>();
@@ -1603,7 +1604,7 @@ final class IndexEventTailer implements LifecycleListener {
     for (Project.NameKey name : touched) {
       Binding binding = now.byName().get(name);
       if (binding != null) {
-        changes.add(new NamespaceChange(name, binding.id(), binding.state(), binding.movedTo()));
+        changes.add(new NamespaceChange(name, binding.id(), binding.state()));
       }
     }
     applier.namespaceChanged(changes);

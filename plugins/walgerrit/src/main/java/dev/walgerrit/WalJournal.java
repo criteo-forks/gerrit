@@ -267,8 +267,8 @@ final class WalJournal
       try {
         Optional<ManifestStore> store = repositories.manifestStoreFor(entry.getKey());
         if (store.isEmpty()) {
-          // Renamed or deleted since the work was done: the other nodes reconcile the project
-          // from the catalog instead, and nothing of this batch can apply under the old name.
+          // Deleted since the work was done: the other nodes reconcile the project from the
+          // catalog instead, and nothing of this batch can apply under a retired name.
           logger.info(
               "WalGerrit drops a journal batch for {}: no longer an active project",
               entry.getKey().get());

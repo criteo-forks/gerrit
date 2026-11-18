@@ -175,24 +175,21 @@ for another grace period. Only the sweep-lease holder deletes shared files. Cach
 node-local. Read [Compaction and reclamation](docs/compaction.md) before changing retention or
 cache limits.
 
-## Rename and delete projects
+## Delete projects
 
-Project names are bindings in a catalog the store holds beside the repositories. Renaming or
-deleting a project rewrites the binding and fences the repository's writers; no files move. Both
-run from any node against the shared store:
+Project names are bindings in a catalog the store holds beside the repositories. Deleting a
+project retires the binding and fences the repository's writers; no files move. It runs from any
+node against the shared store:
 
 ```bash
-java -jar gerrit.war walgerrit-namespace -d "$site" rename platform/old platform/new
 java -jar gerrit.war walgerrit-namespace -d "$site" delete platform/gone
 ```
 
 Every node's indexes follow the catalog. Account watches, destinations and subscription
-permissions naming the project are rewritten before the new name is served; a parent, or a project
-that superprojects may subscribe to, is refused. A name is never reused: pushing to the old name
-fails with the new one. Read [Project names](docs/namespace.md) for the protocol, what is rewritten
-and what is only reported, what a deletion keeps, and how to finish an operation whose node died.
-A replica following a Gerrit that runs the rename-project plugin installs this fork's
-`rename-project` plugin, which accepts that plugin's replication.
+permissions naming the project are removed before the name is retired; a parent, or a project
+that superprojects may subscribe to, is refused. A name is never reused: creating or pushing to a
+deleted name fails. Read [Project names](docs/namespace.md) for the protocol, what is removed and
+what is only reported, what a deletion keeps, and how to finish an operation whose node died.
 
 ## Verify the integration
 
@@ -205,8 +202,8 @@ GERRIT_WAR="$PWD/bazel-bin/release.war" plugins/walgerrit/scripts/smoke-test.sh
 ```
 
 The smoke script exercises initialization, reindexing, daemon readiness, compaction, restart,
-index rebuilding, import and renaming. The same database module serves daemon and batch programs; adding a
-separate batch database module would bind `GitRepositoryManager` twice.
+index rebuilding, import and deletion. The same database module serves daemon and batch programs;
+adding a separate batch database module would bind `GitRepositoryManager` twice.
 
 Run Gerrit's acceptance tests on the local WalGerrit backend with:
 
@@ -235,7 +232,7 @@ results for the revision being deployed.
 | --- | --- |
 | Components and fork boundary | [Architecture](docs/architecture.md) |
 | Files, manifests and log entries | [Storage format](docs/storage-format.md) |
-| Renaming and deleting projects | [Project names](docs/namespace.md) |
+| Creating and deleting projects | [Project names](docs/namespace.md) |
 | Publication, recovery and freshness | [Consistency](docs/consistency.md) |
 | JGit integration and test coverage | [JGit/CAS audit](docs/jgit-cas-deep-dive.md) |
 | Local search and recovery | [Index events](docs/index-events.md) |

@@ -15,7 +15,6 @@ CORE_PLUGINS = [
 
 CUSTOM_PLUGINS = [
     "oidc",
-    "rename-project",
 ]
 
 CUSTOM_PLUGINS_TEST_DEPS = [

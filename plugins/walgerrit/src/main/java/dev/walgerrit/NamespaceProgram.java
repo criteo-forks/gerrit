@@ -26,19 +26,18 @@ import java.util.Map;
 public final class NamespaceProgram {
   private static final String USAGE =
       """
-      Usage: walgerrit-namespace -d SITE rename OLD NEW [--replicated]
-             walgerrit-namespace -d SITE delete NAME [--replicated]
+      Usage: walgerrit-namespace -d SITE delete NAME [--replicated]
              walgerrit-namespace -d SITE references NAME
              walgerrit-namespace -d SITE pending
              walgerrit-namespace -d SITE resume OPERATION
 
-      rename and delete run against the shared store and take effect on every node. Writers
-      admitted under the old name are refused from the commit point on. A name is never reused.
-      A parent, or a project that superprojects may subscribe to, is refused. Watches,
-      destinations and subscription permissions naming the project are rewritten, unless
-      --replicated: the operation follows one a primary made, whose references arrive by
-      replication. references lists what names the project outside its repository. pending
-      lists the operations no node finished; resume finishes one from any node.
+      delete runs against the shared store and takes effect on every node. Writers admitted
+      under the name are refused from the commit point on. A name is never reused. A parent,
+      or a project that superprojects may subscribe to, is refused. Watches, destinations and
+      subscription permissions naming the project are removed, unless --replicated: the
+      deletion follows one a primary made, whose references arrive by replication. references
+      lists what names the project outside its repository. pending lists the operations no
+      node finished; resume finishes one from any node.
       """;
 
   private NamespaceProgram() {}
@@ -68,11 +67,6 @@ public final class NamespaceProgram {
       }
     }
     switch (command) {
-      case "rename" -> {
-        requireOperands(command, operands, 2);
-        namespace.rename(Project.nameKey(operands.get(0)), Project.nameKey(operands.get(1)), replicated);
-        out.println("Renamed " + operands.get(0) + " to " + operands.get(1));
-      }
       case "delete" -> {
         requireOperands(command, operands, 1);
         namespace.delete(Project.nameKey(operands.get(0)), replicated);
@@ -103,7 +97,7 @@ public final class NamespaceProgram {
   }
 
   private static void print(PrintStream out, String name, Namespace.Report report) {
-    out.println("Rewritten by a rename, removed by a deletion:");
+    out.println("Removed by a deletion:");
     out.println("  watching accounts: " + report.users().watchers());
     out.println("  destination rows: " + report.users().destinationRows());
     out.println(
@@ -112,7 +106,7 @@ public final class NamespaceProgram {
     out.println("  children: " + names(report.projects().children()));
     out.println(
         "  superprojects may subscribe to it: " + (report.projects().allowsSuperprojects() ? "yes" : "no"));
-    out.println("Possible textual references, never rewritten (a pattern may match without the literal):");
+    out.println("Possible textual references, never changed (a pattern may match without the literal):");
     List<String> textual = new ArrayList<>(report.projects().textual());
     textual.addAll(report.users().textual());
     if (textual.isEmpty()) {

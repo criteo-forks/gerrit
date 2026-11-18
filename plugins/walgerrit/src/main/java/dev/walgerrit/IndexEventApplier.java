@@ -14,7 +14,6 @@
 
 package dev.walgerrit;
 
-import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Project;
 import dev.walgerrit.proto.StorageProto.IndexUpdate;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
@@ -24,11 +23,7 @@ import java.util.Set;
 /** Consumer boundary for idempotently applying committed WAL entries to derived state. */
 interface IndexEventApplier {
   /** What the catalog says now about a name a replayed catalog transaction touched. */
-  record NamespaceChange(
-      Project.NameKey name,
-      RepositoryId id,
-      Catalog.State state,
-      @Nullable Project.NameKey movedTo) {}
+  record NamespaceChange(Project.NameKey name, RepositoryId id, Catalog.State state) {}
 
   void apply(Project.NameKey project, RefTransaction transaction);
 

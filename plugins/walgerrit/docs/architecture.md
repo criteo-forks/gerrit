@@ -38,11 +38,10 @@ See [Consistency](consistency.md) for retries, ambiguous outcomes and freshness,
 ## The catalog binds names to repositories
 
 Opening a project resolves its name through the catalog, a repository with a fixed id whose
-commits are the namespace's transitions. Renaming or deleting a project is three durable steps:
-the catalog marks the names pending, the repository's manifest advances its write epoch, which
-refuses every writer admitted under the old name at the commit point, and the catalog retires the
-old name and activates the new one. No files move, and a name is never reused. See
-[Project names](namespace.md).
+commits are the namespace's transitions. Deleting a project is three durable steps: the catalog
+marks the name pending, the repository's manifest advances its write epoch, which refuses every
+writer admitted under the name at the commit point, and the catalog retires the name. No files
+move, and a name is never reused. See [Project names](namespace.md).
 
 ## Every node derives its own search indexes
 

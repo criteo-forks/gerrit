@@ -96,9 +96,9 @@ Each sweep replays the [catalog](namespace.md) before any repository. A catalog 
 bindings it changed; the tailer evicts those projects' caches, refreshes the project list, and
 for each activated name reindexes the project and every change in the repository under that
 name. For a retired name it deletes the change documents by project and drops the project
-document. A repository whose only names are pending is left where it is and replayed once a name
-is active.
-Replayed entries are always indexed under the repository's current name.
+document. A repository whose name is pending is left where it is, and replayed once the name is
+active.
+Replayed entries are always indexed under the name the catalog binds the repository to.
 A failed startup sweep prevents startup; a failed background sweep revokes readiness. A later
 clean sweep restores it.
 
@@ -195,7 +195,7 @@ Change-Id up, the node brings the index up to date for the destination project:
 
 The index holds a repository under the name the catalog gave it when the node last replayed the
 catalog. While the catalog the node has read is ahead of the one it has replayed, for instance
-right after any node renamed or created a project, the catalog is replayed first. A name with no
+right after any node created or deleted a project, the catalog is replayed first. A name with no
 repository has nothing to wait for; Gerrit answers that request as it would anyway.
 
 ### Every repository
@@ -229,9 +229,9 @@ happens when:
 
 - `indexBarrierTimeout` runs out;
 - reading the store or replaying fails;
-- the node cannot replay now: it is stopping, a cursor needs a rebuild, a project's creation,
-  rename or deletion is in flight and its unreplayed entries touch changes, the catalog kept
-  moving, or more requests wait than the barrier takes;
+- the node cannot replay now: it is stopping, a cursor needs a rebuild, a project's creation or
+  deletion is in flight and its unreplayed entries touch changes, the catalog kept moving, or
+  more requests wait than the barrier takes;
 - the node's indexes are in doubt: it is rebuilding them, a rebuild began while the request
   waited, or its last rebuild failed. A rebuild empties the indexes before it refills them, and a
   failed one leaves the cursors saying what the indexes held before. The node therefore rejects

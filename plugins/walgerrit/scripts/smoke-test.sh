@@ -207,21 +207,20 @@ curl -fsS "${listen_url}projects/imported%2Ftools" | grep -q '"imported/tools"'
 curl -fsS "${listen_url}projects/imported%2Ftools/branches/main" | grep -q '"refs/heads/main"'
 stop_daemon
 
-# Rename the imported project while no daemon runs; the next daemon replays the catalog and
+# Delete the imported project while no daemon runs; the next daemon replays the catalog and
 # reconciles its project index with it before it becomes ready, without rebuilding.
 git config --file "$site/etc/gerrit.config" --unset walgerrit.indexReplayLimit
-run_gerrit walgerrit-namespace -d "$site" rename imported/tools imported/renamed
+run_gerrit walgerrit-namespace -d "$site" delete imported/tools
 test -z "$(run_gerrit walgerrit-namespace -d "$site" pending)"
-rename_log="$site/logs/walgerrit-rename-smoke.log"
-start_daemon "$rename_log"
-! grep -q "is rebuilding this node's indexes" "$rename_log"
-grep -q "reconciled imported/renamed with the catalog: active" "$rename_log"
-curl -fsS "${listen_url}projects/imported%2Frenamed/branches/main" | grep -q '"refs/heads/main"'
+delete_log="$site/logs/walgerrit-delete-smoke.log"
+start_daemon "$delete_log"
+! grep -q "is rebuilding this node's indexes" "$delete_log"
+grep -q "reconciled imported/tools with the catalog: retired" "$delete_log"
 test "$(curl -sS -o /dev/null -w '%{http_code}' "${listen_url}projects/imported%2Ftools")" = 404
-curl -fsS "${listen_url}projects/?query=name:imported%2Frenamed" | grep -q '"imported/renamed"'
 ! curl -fsS "${listen_url}projects/?query=name:imported%2Ftools" | grep -q '"imported/tools"'
+curl -fsS "${listen_url}projects/" | grep -q '"All-Projects"'
 stop_daemon
 
 echo "WalGerrit fork initialized, reindexed, caught up, folded its logs, rebuilt indexes for a" \
-  "replaced node, compacted and reclaimed its repositories, imported and renamed a repository," \
+  "replaced node, compacted and reclaimed its repositories, imported and deleted a repository," \
   "and published readiness successfully."

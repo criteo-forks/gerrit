@@ -33,8 +33,8 @@ import java.util.function.Consumer;
  * several nodes elects one holder with a {@link Lease} of the same name, and the compare-and-swap
  * on every cursor write keeps a holder that lost the lease from moving a cursor back.
  *
- * <p>Repositories are named by id. The project name an id is bound to can change by a rename; the
- * name returned with each read is the one the catalog binds the id to at that time.
+ * <p>Repositories are named by id. The name returned with each read is the one the catalog binds
+ * the id to at that time.
  *
  * <p>Reader names are lowercase letters, digits and dashes, starting with a letter or digit, at
  * most 63 characters; repository ids are what {@link #repositories()} returns.

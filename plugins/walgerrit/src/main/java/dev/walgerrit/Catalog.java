@@ -70,8 +70,8 @@ import org.slf4j.LoggerFactory;
  * machinery as every other write, with the history as commits.
  *
  * <p>A binding is {@code active}, {@code pending} while an operation is in flight, or {@code
- * retired} for good: a name is never rebound, so "never existed", "moved", "deleted" and "in flight"
- * are four distinct authoritative answers. A pending binding records its operation, so any node can
+ * retired} for good: a name is never rebound, so "never existed", "deleted" and "in flight" are
+ * three distinct authoritative answers. A pending binding records its operation, so any node can
  * finish an operation whose node died.
  *
  * <p>Reads are served from the catalog repository's handle and revalidate the way every handle
@@ -96,26 +96,48 @@ final class Catalog {
   enum Kind {
     CREATE,
     IMPORT,
-    RENAME,
-    DELETE
+    DELETE,
+    /** A kind another version of WalGerrit recorded and this one does not run. */
+    UNSUPPORTED;
+
+    static Kind named(String name) {
+      for (Kind kind : values()) {
+        if (kind != UNSUPPORTED && kind.name().equalsIgnoreCase(name)) {
+          return kind;
+        }
+      }
+      return UNSUPPORTED;
+    }
   }
 
   /**
-   * A namespace operation in flight, recorded on every binding it touches. {@code replicated}: the
+   * A namespace operation, recorded on the binding it touches. {@code kindName} is the kind as the
+   * catalog stores it, which says what an {@link Kind#UNSUPPORTED} one is. {@code replicated}: the
    * operation follows one a primary made, whose name references arrive by replication, so none are
-   * rewritten here.
+   * removed here.
    */
   record Operation(
       String id,
       Kind kind,
+      String kindName,
       long expectedEpoch,
       long targetEpoch,
-      @Nullable Project.NameKey other,
-      boolean replicated) {}
+      boolean replicated) {
+
+    Operation(String id, Kind kind, long expectedEpoch, long targetEpoch, boolean replicated) {
+      this(
+          id,
+          kind,
+          kind.name().toLowerCase(java.util.Locale.ROOT),
+          expectedEpoch,
+          targetEpoch,
+          replicated);
+    }
+  }
 
   /**
    * One name's binding. {@code epoch} is the repository write epoch writers admitted under this
-   * name carry. A retired binding keeps its last epoch and, after a rename, the destination.
+   * name carry. A retired binding keeps its last epoch.
    */
   record Binding(
       Project.NameKey name,
@@ -123,7 +145,6 @@ final class Catalog {
       State state,
       long epoch,
       @Nullable Operation operation,
-      @Nullable Project.NameKey movedTo,
       long sinceMillis) {
 
     boolean active() {
@@ -138,16 +159,8 @@ final class Catalog {
       return state == State.RETIRED;
     }
 
-    /** Whether this is the name a pending rename moves the repository away from. */
-    boolean pendingSource() {
-      return pending()
-          && operation != null
-          && (operation.kind() == Kind.DELETE
-              || (operation.kind() == Kind.RENAME && epoch == operation.expectedEpoch()));
-    }
-
-    Binding with(State newState, long newEpoch, @Nullable Operation op, @Nullable Project.NameKey to, long now) {
-      return new Binding(name, id, newState, newEpoch, op, to, now);
+    Binding with(State newState, long newEpoch, @Nullable Operation op, long now) {
+      return new Binding(name, id, newState, newEpoch, op, now);
     }
   }
 
@@ -576,18 +589,12 @@ final class Catalog {
     config.setString("binding", null, "state", binding.state().name().toLowerCase(java.util.Locale.ROOT));
     config.setLong("binding", null, "epoch", binding.epoch());
     config.setLong("binding", null, "since", binding.sinceMillis());
-    if (binding.movedTo() != null) {
-      config.setString("binding", null, "movedTo", binding.movedTo().get());
-    }
     Operation op = binding.operation();
     if (op != null) {
       config.setString("operation", null, "id", op.id());
-      config.setString("operation", null, "kind", op.kind().name().toLowerCase(java.util.Locale.ROOT));
+      config.setString("operation", null, "kind", op.kindName());
       config.setLong("operation", null, "expectedEpoch", op.expectedEpoch());
       config.setLong("operation", null, "targetEpoch", op.targetEpoch());
-      if (op.other() != null) {
-        config.setString("operation", null, "other", op.other().get());
-      }
       if (op.replicated()) {
         config.setBoolean("operation", null, "replicated", true);
       }
@@ -605,24 +612,22 @@ final class Catalog {
     Operation op = null;
     String opId = config.getString("operation", null, "id");
     if (opId != null) {
-      String other = config.getString("operation", null, "other");
+      String kind = config.getString("operation", null, "kind");
       op =
           new Operation(
               opId,
-              Kind.valueOf(config.getString("operation", null, "kind").toUpperCase(java.util.Locale.ROOT)),
+              Kind.named(kind),
+              kind,
               config.getLong("operation", null, "expectedEpoch", 0),
               config.getLong("operation", null, "targetEpoch", 0),
-              other == null ? null : Project.nameKey(other),
               config.getBoolean("operation", null, "replicated", false));
     }
-    String movedTo = config.getString("binding", null, "movedTo");
     return new Binding(
         Project.nameKey(config.getString("binding", null, "name")),
         new RepositoryId(config.getString("binding", null, "id")),
         State.valueOf(config.getString("binding", null, "state").toUpperCase(java.util.Locale.ROOT)),
         config.getLong("binding", null, "epoch", 0),
         op,
-        movedTo == null ? null : Project.nameKey(movedTo),
         config.getLong("binding", null, "since", 0));
   }
 }
