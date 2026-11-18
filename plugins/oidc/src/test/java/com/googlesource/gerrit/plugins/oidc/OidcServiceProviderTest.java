@@ -50,7 +50,7 @@ public class OidcServiceProviderTest {
   public void setUp() throws Exception {
     idp = new FakeProvider();
     accountCache = mock(AccountCache.class);
-    when(accountCache.getByUsername(anyString())).thenReturn(Optional.empty());
+    when(accountCache.getByUsernameForAuthentication(anyString())).thenReturn(Optional.empty());
     InternalAccountQuery query = mock(InternalAccountQuery.class);
     when(query.query(ArgumentMatchers.<Predicate<AccountState>>any()))
         .thenReturn(ImmutableList.of());
@@ -113,7 +113,7 @@ public class OidcServiceProviderTest {
 
   @Test
   public void existingUserKeepsTheIdentityLdapGaveIt() throws Exception {
-    when(accountCache.getByUsername("jdoe"))
+    when(accountCache.getByUsernameForAuthentication("jdoe"))
         .thenReturn(Optional.of(state("jdoe", true, gerrit("JDoe"))));
 
     OAuthUserInfo info = provider.getUserInfo(token(idToken(ISSUER, "gerrit", "gerrit")));

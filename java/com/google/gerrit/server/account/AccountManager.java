@@ -44,6 +44,7 @@ import com.google.gerrit.server.account.externalids.ExternalId;
 import com.google.gerrit.server.account.externalids.ExternalIdFactory;
 import com.google.gerrit.server.account.externalids.ExternalIdKeyFactory;
 import com.google.gerrit.server.account.externalids.ExternalIds;
+import com.google.gerrit.server.auth.AuthenticationUnavailableException;
 import com.google.gerrit.server.auth.NoSuchUserException;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.group.db.GroupDelta;
@@ -180,7 +181,9 @@ public class AccountManager {
       // return the identity to the caller.
       update(who, extId);
       return new AuthResult(extId.accountId(), who.getExternalIdKey(), false);
-    } catch (StorageException | ConfigInvalidException e) {
+    } catch (StorageException e) {
+      throw new AuthenticationUnavailableException("Could not read authentication data", e);
+    } catch (ConfigInvalidException e) {
       throw new AccountException("Authentication error", e);
     }
   }

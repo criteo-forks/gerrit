@@ -55,11 +55,8 @@ public class ServingGate {
   public static final Key<Supplier<Optional<String>>> GATE_KEY =
       Key.get(new TypeLiteral<Supplier<Optional<String>>>() {}, Names.named(GATE));
 
-  /**
-   * The request a closed gate still lets through, to tell a supervisor that the process is alive.
-   * Asked without credentials it reads no repository and no index.
-   */
-  public static final String LIVENESS_PATH = "/config/server/version";
+  /** The process probe, answered before authentication, REST dispatch and repository access. */
+  public static final String LIVENESS_PATH = "/livez";
 
   public static class ServingGateModule extends AbstractModule {
     @Override

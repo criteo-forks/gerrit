@@ -78,6 +78,11 @@ public interface AccountCache {
    */
   Optional<AccountState> getByUsername(String username);
 
+  /** Looks up a login name, preserving a failure to read account storage. */
+  default Optional<AccountState> getByUsernameForAuthentication(String username) {
+    return getByUsername(username);
+  }
+
   /**
    * Returns an {@code AccountState} instance for the given account ID at the given {@code metaId}
    * of {@link com.google.gerrit.entities.RefNames#refsUsers} ref.

@@ -98,7 +98,7 @@ class OidcLoginProvider implements OAuthLoginProvider {
     if (account.isEmpty()) {
       throw new IOException("No account for " + username);
     }
-    if (acceptsAuthTokens && authTokens.checkToken(account.get(), secret)) {
+    if (acceptsAuthTokens && authTokens.checkTokenForAuthentication(account.get(), secret)) {
       return userInfo(id);
     }
     try {
@@ -117,6 +117,10 @@ class OidcLoginProvider implements OAuthLoginProvider {
       claims = verifier.verify(token, cfg.acceptedIssuers(), cfg.audience());
     } catch (InvalidTokenException e) {
       throw new IOException("Rejected token: " + e.getMessage());
+    } catch (IOException unavailable) {
+      throw new IOException(
+          new AuthenticationUnavailableException(
+              "Could not fetch the identity provider's verification keys", unavailable));
     }
     String subject = Jwt.string(claims, cfg.usernameClaim());
     if (Strings.isNullOrEmpty(subject)) {

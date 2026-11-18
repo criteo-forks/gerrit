@@ -24,6 +24,7 @@ import com.google.inject.AbstractModule;
 import com.google.inject.Module;
 import com.google.inject.multibindings.OptionalBinder;
 import java.util.Optional;
+import org.apache.http.message.BasicHeader;
 import org.junit.After;
 import org.junit.Test;
 
@@ -58,6 +59,14 @@ public class ServingGateIT extends AbstractDaemonTest {
 
     anonymousRestSession.get(ServingGate.LIVENESS_PATH).assertOK();
     adminRestSession.get(ServingGate.LIVENESS_PATH).assertOK();
+
+    anonymousRestSession
+        .getWithHeaders("/livez", new BasicHeader("Authorization", "Basic malformed"))
+        .assertOK();
+    anonymousRestSession.head("/livez").assertOK();
+    anonymousRestSession.get("/config/server/version").assertOK();
+    anonymousRestSession.get("/livez/other").assertStatus(503);
+    anonymousRestSession.post("/livez").assertStatus(503);
 
     // Index, repository, health-check and page requests.
     for (String path :

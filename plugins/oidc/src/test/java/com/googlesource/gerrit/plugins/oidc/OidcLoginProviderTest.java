@@ -103,7 +103,7 @@ public class OidcLoginProviderTest {
     authTokens = mock(AuthTokenVerifier.class);
     authConfig = mock(AuthConfig.class);
     passwords = mock(OidcLoginProvider.Passwords.class);
-    when(accountCache.getByUsername(anyString())).thenReturn(Optional.empty());
+    when(accountCache.getByUsernameForAuthentication(anyString())).thenReturn(Optional.empty());
   }
 
   @After
@@ -195,7 +195,7 @@ public class OidcLoginProviderTest {
   @Test
   public void gerritAuthTokenWhenAccepted() throws Exception {
     account("jdoe", true, gerrit("jdoe"));
-    when(authTokens.checkToken(ACCOUNT, "gerrit-token")).thenReturn(true);
+    when(authTokens.checkTokenForAuthentication(ACCOUNT, "gerrit-token")).thenReturn(true);
 
     assertThat(provider(true).login("jdoe", "gerrit-token").getExternalId())
         .isEqualTo("gerrit:jdoe");
@@ -205,10 +205,10 @@ public class OidcLoginProviderTest {
   @Test
   public void gerritAuthTokenIgnoredWhenNotAccepted() throws Exception {
     account("jdoe", true, gerrit("jdoe"));
-    when(authTokens.checkToken(ACCOUNT, "gerrit-token")).thenReturn(true);
+    when(authTokens.checkTokenForAuthentication(ACCOUNT, "gerrit-token")).thenReturn(true);
 
     assertThrows(IOException.class, () -> provider(false).login("jdoe", "gerrit-token"));
-    verify(authTokens, never()).checkToken(any(), any());
+    verify(authTokens, never()).checkTokenForAuthentication(any(), any());
   }
 
   @Test
@@ -224,6 +224,15 @@ public class OidcLoginProviderTest {
     account("jdoe", true, gerrit("jdoe"));
 
     assertThrows(IOException.class, () -> provider(true).login("jdoe", "wrong"));
+  }
+
+  @Test
+  public void unavailableIssuerKeysAreNotRejectedCredentials() throws Exception {
+    String token = token(ISSUER, "jdoe", "gerrit");
+    idp = spy(idp);
+    doThrow(new IOException("issuer unavailable")).when(idp).get(any());
+    IOException e = assertThrows(IOException.class, () -> provider(true).login(null, token));
+    assertThat(e).hasCauseThat().isInstanceOf(AuthenticationUnavailableException.class);
   }
 
   @Test
@@ -748,7 +757,7 @@ public class OidcLoginProviderTest {
   }
 
   private void account(String username, boolean active, ExternalId... ids) {
-    when(accountCache.getByUsername(username))
+    when(accountCache.getByUsernameForAuthentication(username))
         .thenReturn(Optional.of(state(username, active, ids)));
   }
 

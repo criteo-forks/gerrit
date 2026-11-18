@@ -69,12 +69,27 @@ public class ServingGateFilter implements Filter {
   @Override
   public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
       throws IOException, ServletException {
+    HttpServletRequest req = (HttpServletRequest) request;
+    HttpServletResponse rsp = (HttpServletResponse) response;
+    boolean read = "GET".equals(req.getMethod()) || "HEAD".equals(req.getMethod());
+    String path = req.getRequestURI().substring(req.getContextPath().length());
+    if (read
+        && (path.equals(ServingGate.LIVENESS_PATH)
+            || path.equals("/a" + ServingGate.LIVENESS_PATH))) {
+      CacheHeaders.setNotCacheable(rsp);
+      rsp.setStatus(HttpServletResponse.SC_OK);
+      rsp.setContentLength(0);
+      return;
+    }
     Optional<String> closed = gate.closed();
-    if (closed.isEmpty() || isLivenessRequest((HttpServletRequest) request)) {
+    // Keep version probes working while the chart and the release roll independently.
+    if (closed.isEmpty()
+        || (read
+            && (path.equals("/config/server/version")
+                || path.equals("/a/config/server/version")))) {
       chain.doFilter(request, response);
       return;
     }
-    HttpServletResponse rsp = (HttpServletResponse) response;
     rsp.setStatus(SC_SERVICE_UNAVAILABLE);
     rsp.setHeader(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS);
     CacheHeaders.setNotCacheable(rsp);
@@ -85,11 +100,4 @@ public class ServingGateFilter implements Filter {
     rsp.getOutputStream().write(body);
   }
 
-  private static boolean isLivenessRequest(HttpServletRequest req) {
-    if (!"GET".equals(req.getMethod()) && !"HEAD".equals(req.getMethod())) {
-      return false;
-    }
-    String path = req.getRequestURI().substring(req.getContextPath().length());
-    return path.equals(ServingGate.LIVENESS_PATH) || path.equals("/a" + ServingGate.LIVENESS_PATH);
-  }
 }

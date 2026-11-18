@@ -21,19 +21,34 @@ import static com.google.gerrit.server.account.externalids.ExternalId.SCHEME_HTT
 import static com.google.gerrit.server.account.externalids.ExternalId.SCHEME_MAILTO;
 import static com.google.gerrit.server.account.externalids.ExternalId.SCHEME_USERNAME;
 import static com.google.gerrit.server.account.externalids.ExternalId.SCHEME_XRI;
+import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.when;
 
 import com.google.gerrit.entities.Account;
+import com.google.gerrit.extensions.auth.oauth.OAuthLoginProvider;
+import com.google.gerrit.extensions.registration.DynamicMap;
+import com.google.gerrit.server.account.AccountException;
+import com.google.gerrit.server.account.AuthRequest;
 import com.google.gerrit.server.account.externalids.ExternalId;
 import com.google.gerrit.server.account.externalids.ExternalIdFactory;
+import com.google.gerrit.server.auth.AuthenticationUnavailableException;
 import com.google.gerrit.testing.InMemoryModule;
 import com.google.inject.Guice;
 import com.google.inject.Inject;
 import com.google.inject.Injector;
+import java.io.IOException;
 import java.util.Arrays;
+import org.eclipse.jgit.lib.Config;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.Mock;
+import org.mockito.junit.MockitoJUnitRunner;
 
+@RunWith(MockitoJUnitRunner.class)
 public final class OAuthRealmTest {
+  @Mock private DynamicMap<OAuthLoginProvider> providers;
+  @Inject private AuthRequest.Factory authRequests;
   @Inject private OAuthRealm oauthRealm;
   @Inject private ExternalIdFactory externalIdFactory;
 
@@ -53,6 +68,35 @@ public final class OAuthRealmTest {
 
   private boolean accountBelongsToRealm(String scheme, String id) {
     return accountBelongsToRealm(id(scheme, id));
+  }
+
+  @Test
+  public void backendOutageSurvivesTheProviderBoundary() throws Exception {
+    AuthenticationUnavailableException unavailable =
+        new AuthenticationUnavailableException(
+            "LDAP unavailable", new IOException("connection refused"));
+    when(providers.get("oidc", "login"))
+        .thenReturn(
+            (name, password) -> {
+              throw new IOException("Cannot verify password", unavailable);
+            });
+    AuthRequest request = authRequests.createForUser("alice");
+    request.setAuthPlugin("oidc");
+    request.setAuthProvider("login");
+    request.setPassword("secret");
+    OAuthRealm realm = new OAuthRealm(providers, new Config());
+    assertThat(
+            assertThrows(
+                AuthenticationUnavailableException.class, () -> realm.authenticate(request)))
+        .isSameInstanceAs(unavailable);
+
+    when(providers.get("oidc", "login"))
+        .thenReturn(
+            (name, password) -> {
+              throw new IOException("Rejected credential");
+            });
+    assertThat(assertThrows(AccountException.class, () -> realm.authenticate(request)).getClass())
+        .isEqualTo(AccountException.class);
   }
 
   @Test

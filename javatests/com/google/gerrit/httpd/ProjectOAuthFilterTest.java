@@ -25,6 +25,7 @@ import static org.mockito.Mockito.verify;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.gerrit.entities.Account;
+import com.google.gerrit.exceptions.StorageException;
 import com.google.gerrit.extensions.auth.oauth.OAuthLoginProvider;
 import com.google.gerrit.extensions.auth.oauth.OAuthUserInfo;
 import com.google.gerrit.extensions.registration.DynamicItem;
@@ -40,6 +41,7 @@ import com.google.gerrit.server.account.externalids.ExternalId;
 import com.google.gerrit.server.account.externalids.ExternalIdFactory;
 import com.google.gerrit.server.account.externalids.ExternalIdKeyFactory;
 import com.google.gerrit.server.account.externalids.storage.notedb.ExternalIdFactoryNoteDbImpl;
+import com.google.gerrit.server.auth.AuthenticationUnavailableException;
 import com.google.gerrit.server.config.AuthConfig;
 import com.google.gerrit.util.http.testutil.FakeHttpServletRequest;
 import com.google.gerrit.util.http.testutil.FakeHttpServletResponse;
@@ -225,7 +227,7 @@ public class ProjectOAuthFilterTest {
 
   @Test
   public void shouldFailAuthenticationIfGerritUserDoesNotExist() throws Exception {
-    doReturn(Optional.empty()).when(accountCache).getByUsername(AUTH_USER);
+    doReturn(Optional.empty()).when(accountCache).getByUsernameForAuthentication(AUTH_USER);
     initWebSession();
     requestBasicAuth(req, OAUTH_TOKEN);
 
@@ -266,6 +268,42 @@ public class ProjectOAuthFilterTest {
 
     verify(chain).doFilter(eq(req), any());
     assertThat(res.getStatus()).isEqualTo(HttpServletResponse.SC_OK);
+  }
+
+  @Test
+  public void unavailableAccountStoreDoesNotChallengeForCredentials() throws Exception {
+    doThrow(new StorageException("store unavailable"))
+        .when(accountCache)
+        .getByUsernameForAuthentication(AUTH_USER);
+    assertBackendUnavailable();
+  }
+
+  @Test
+  public void unavailableRealmDoesNotChallengeForCredentials() throws Exception {
+    initAccount();
+    doThrow(
+            new AuthenticationUnavailableException(
+                "LDAP unavailable", new IOException("LDAP unavailable")))
+        .when(accountManager)
+        .authenticate(any());
+    assertBackendUnavailable();
+  }
+
+  private void assertBackendUnavailable() throws Exception {
+    initWebSession();
+    requestBasicAuth(req, OAUTH_TOKEN);
+    new ProjectOAuthFilter(
+            webSessionItem,
+            pluginsProvider,
+            accountCache,
+            accountManager,
+            gerritConfig,
+            authRequestFactory)
+        .doFilter(req, res, chain);
+    verify(chain, never()).doFilter(any(), any());
+    assertThat(res.getStatus()).isEqualTo(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+    assertThat(res.getHeader("Retry-After")).isEqualTo("30");
+    assertThat(res.getHeader("WWW-Authenticate")).isNull();
   }
 
   @Test
@@ -410,7 +448,9 @@ public class ProjectOAuthFilterTest {
     Account account =
         Account.builder(AUTH_ACCOUNT_ID, Instant.now()).setPreferredEmail(preferredEmail).build();
     AccountState accountState = AccountState.forAccount(account, extIds);
-    doReturn(Optional.of(accountState)).when(accountCache).getByUsername(AUTH_USER);
+    doReturn(Optional.of(accountState))
+        .when(accountCache)
+        .getByUsernameForAuthentication(AUTH_USER);
   }
 
   private void initWebSession() {

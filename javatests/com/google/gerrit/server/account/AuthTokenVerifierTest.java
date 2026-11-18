@@ -15,12 +15,16 @@
 package com.google.gerrit.server.account;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableList;
 import com.google.gerrit.entities.Account;
+import com.google.gerrit.exceptions.StorageException;
+import java.io.IOException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
@@ -63,6 +67,16 @@ public class AuthTokenVerifierTest {
     assertThat(tokenVerifier.checkToken(ACCOUNT_ID, "another_Token")).isTrue();
     assertThat(tokenVerifier.checkToken(ACCOUNT_ID, "invalid")).isFalse();
     assertThat(tokenVerifier.checkToken(ACCOUNT_ID, "another_token")).isFalse();
+  }
+
+  @Test
+  public void authenticationDistinguishesAnUnreadableTokenStoreFromAMismatch() throws Exception {
+    assertThat(tokenVerifier.checkTokenForAuthentication(ACCOUNT_ID, "wrong")).isFalse();
+    cache.invalidateAll();
+    doThrow(new IOException("store unavailable")).when(loader).load(ACCOUNT_ID);
+    assertThrows(
+        StorageException.class,
+        () -> tokenVerifier.checkTokenForAuthentication(ACCOUNT_ID, "presented-token"));
   }
 
   @Test

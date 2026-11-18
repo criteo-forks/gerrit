@@ -25,6 +25,7 @@ import static org.mockito.Mockito.verify;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.gerrit.entities.Account;
+import com.google.gerrit.exceptions.StorageException;
 import com.google.gerrit.extensions.client.GitBasicAuthPolicy;
 import com.google.gerrit.extensions.registration.DynamicItem;
 import com.google.gerrit.server.IdentifiedUser;
@@ -223,8 +224,31 @@ public class ProjectBasicAuthFilterTest {
   }
 
   @Test
+  public void unavailableAccountStoreDoesNotChallengeForCredentials() throws Exception {
+    initWebSessionWithoutCookie();
+    requestBasicAuth(req);
+    doReturn(GitBasicAuthPolicy.HTTP).when(authConfig).getGitBasicAuthPolicy();
+    doThrow(new StorageException("store unavailable"))
+        .when(accountCache)
+        .getByUsernameForAuthentication(AUTH_USER);
+
+    new ProjectBasicAuthFilter(
+            webSessionItem,
+            accountCache,
+            accountManager,
+            authConfig,
+            authRequestFactory,
+            tokenVerifier)
+        .doFilter(req, res, chain);
+    verify(chain, never()).doFilter(any(), any());
+    assertThat(res.getStatus()).isEqualTo(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+    assertThat(res.getHeader("Retry-After")).isEqualTo("30");
+    assertThat(res.getHeader("WWW-Authenticate")).isNull();
+  }
+
+  @Test
   public void shouldFailAuthenticationIfGerritUserDoesNotExist() throws Exception {
-    doReturn(Optional.empty()).when(accountCache).getByUsername(AUTH_USER);
+    doReturn(Optional.empty()).when(accountCache).getByUsernameForAuthentication(AUTH_USER);
     initWebSessionWithoutCookie();
     requestBasicAuth(req);
     doReturn(GitBasicAuthPolicy.HTTP).when(authConfig).getGitBasicAuthPolicy();
@@ -377,7 +401,9 @@ public class ProjectBasicAuthFilterTest {
   private void initAccount(Collection<ExternalId> extIds) throws Exception {
     Account account = Account.builder(AUTH_ACCOUNT_ID, Instant.now()).build();
     AccountState accountState = AccountState.forAccount(account, extIds);
-    doReturn(Optional.of(accountState)).when(accountCache).getByUsername(AUTH_USER);
+    doReturn(Optional.of(accountState))
+        .when(accountCache)
+        .getByUsernameForAuthentication(AUTH_USER);
     doReturn(Optional.of(accountState)).when(accountCache).get(AUTH_ACCOUNT_ID);
   }
 

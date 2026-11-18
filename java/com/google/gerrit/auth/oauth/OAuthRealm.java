@@ -27,6 +27,7 @@ import com.google.gerrit.server.account.AccountException;
 import com.google.gerrit.server.account.AccountManager;
 import com.google.gerrit.server.account.AuthRequest;
 import com.google.gerrit.server.account.externalids.ExternalId;
+import com.google.gerrit.server.auth.AuthenticationUnavailableException;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
@@ -94,6 +95,9 @@ public class OAuthRealm extends AbstractRealm {
     try {
       userInfo = loginProvider.login(who.getUserName().orElse(null), who.getPassword());
     } catch (IOException e) {
+      if (e.getCause() instanceof AuthenticationUnavailableException unavailable) {
+        throw unavailable;
+      }
       throw new AccountException("Cannot authenticate", e);
     }
     if (userInfo == null) {

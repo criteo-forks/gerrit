@@ -6,6 +6,7 @@ junit_tests(
     deps = [
         "//java/com/google/gerrit/auth",
         "//java/com/google/gerrit/entities",
+        "//java/com/google/gerrit/exceptions",
         "//java/com/google/gerrit/extensions:api",
         "//java/com/google/gerrit/httpd",
         "//java/com/google/gerrit/httpd/auth/oauth",

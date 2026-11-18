@@ -18,6 +18,7 @@ import com.google.common.base.Strings;
 import com.google.common.flogger.FluentLogger;
 import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Account;
+import com.google.gerrit.exceptions.StorageException;
 import com.google.inject.Inject;
 import java.io.IOException;
 import org.eclipse.jgit.errors.ConfigInvalidException;
@@ -42,23 +43,33 @@ public class AuthTokenVerifier {
    * @return whether there is a token hash stored for the account that matches the provided token.
    */
   public boolean checkToken(Account.Id accountId, @Nullable String providedToken) {
+    try {
+      return matches(accountId, providedToken);
+    } catch (IOException | ConfigInvalidException | HashedPassword.DecoderException e) {
+      logger.atSevere().withCause(e).log("Could not check tokens for account %s", accountId);
+      return false;
+    }
+  }
+
+  /** Checks a presented credential and preserves failures to read or decode the stored hashes. */
+  public boolean checkTokenForAuthentication(Account.Id accountId, @Nullable String providedToken) {
+    try {
+      return matches(accountId, providedToken);
+    } catch (IOException | ConfigInvalidException | HashedPassword.DecoderException e) {
+      throw new StorageException("Could not check tokens for account " + accountId, e);
+    }
+  }
+
+  private boolean matches(Account.Id accountId, @Nullable String providedToken)
+      throws IOException, ConfigInvalidException, HashedPassword.DecoderException {
     if (Strings.isNullOrEmpty(providedToken)
         || providedToken.length() >= MAX_PASSWORD_LENGTH_ACCORDING_TO_BCRYPT_LIMITS) {
       return false;
     }
-
-    try {
-      for (AuthToken t : tokenAccessor.getValidTokens(accountId)) {
-        if (HashedPassword.decode(t.hashedToken()).checkPassword(providedToken)) {
-          return true;
-        }
+    for (AuthToken t : tokenAccessor.getValidTokens(accountId)) {
+      if (HashedPassword.decode(t.hashedToken()).checkPassword(providedToken)) {
+        return true;
       }
-    } catch (IOException | ConfigInvalidException e) {
-      logger.atSevere().withCause(e).log(
-          "Could not read tokens for account %s: %s ", accountId, e.getMessage());
-    } catch (HashedPassword.DecoderException e) {
-      logger.atSevere().withCause(e).log(
-          "Could not decode token for account %s: %s ", accountId, e.getMessage());
     }
     return false;
   }

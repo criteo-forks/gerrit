@@ -67,7 +67,7 @@ class Identities {
    * another case.
    */
   private Optional<AccountState> account(String username) {
-    Optional<AccountState> exact = accountCache.getByUsername(username);
+    Optional<AccountState> exact = accountCache.getByUsernameForAuthentication(username);
     if (exact.isPresent()) {
       return exact;
     }

@@ -15,6 +15,7 @@
 package com.google.gerrit.httpd;
 
 import static com.google.gerrit.httpd.ProjectBasicAuthFilter.authenticationFailedMsg;
+import static com.google.gerrit.httpd.ProjectBasicAuthFilter.authenticationUnavailable;
 import static com.google.gerrit.server.account.externalids.ExternalId.SCHEME_GERRIT;
 import static com.google.gerrit.server.account.externalids.ExternalId.SCHEME_USERNAME;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -27,6 +28,7 @@ import com.google.common.flogger.FluentLogger;
 import com.google.common.io.BaseEncoding;
 import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Account;
+import com.google.gerrit.exceptions.StorageException;
 import com.google.gerrit.extensions.auth.oauth.OAuthLoginProvider;
 import com.google.gerrit.extensions.registration.DynamicItem;
 import com.google.gerrit.extensions.registration.DynamicMap;
@@ -39,6 +41,7 @@ import com.google.gerrit.server.account.AccountState;
 import com.google.gerrit.server.account.AuthRequest;
 import com.google.gerrit.server.account.AuthResult;
 import com.google.gerrit.server.account.externalids.ExternalId;
+import com.google.gerrit.server.auth.AuthenticationUnavailableException;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
@@ -120,9 +123,15 @@ class ProjectOAuthFilter implements Filter {
       throws IOException, ServletException {
     HttpServletRequest req = (HttpServletRequest) request;
     Response rsp = new Response((HttpServletResponse) response);
-    if (verify(req, rsp)) {
-      chain.doFilter(req, rsp);
+    try {
+      if (!verify(req, rsp)) {
+        return;
+      }
+    } catch (StorageException e) {
+      authenticationUnavailable(rsp, e);
+      return;
     }
+    chain.doFilter(req, rsp);
   }
 
   private boolean verify(HttpServletRequest req, Response rsp) throws IOException {
@@ -133,6 +142,10 @@ class ProjectOAuthFilter implements Filter {
     // first check if there is a BEARER authentication header
     if (hdr != null && hdr.startsWith(BEARER)) {
       authInfo = extractAuthInfoFromBearer(hdr);
+      if (Strings.isNullOrEmpty(authInfo.tokenOrSecret)) {
+        rsp.sendError(SC_UNAUTHORIZED);
+        return false;
+      }
       authRequest = authRequestFactory.createForBearerToken(authInfo.tokenOrSecret);
       // or if there is a BASIC authentication header
     } else {
@@ -158,8 +171,14 @@ class ProjectOAuthFilter implements Filter {
           return true;
         }
       }
+      if (Strings.isNullOrEmpty(authInfo.tokenOrSecret)) {
+        rsp.sendError(SC_UNAUTHORIZED);
+        return false;
+      }
       Optional<AccountState> who =
-          accountCache.getByUsername(authInfo.username).filter(a -> a.account().isActive());
+          accountCache
+              .getByUsernameForAuthentication(authInfo.username)
+              .filter(a -> a.account().isActive());
       if (!who.isPresent()) {
         logger.atWarning().log(
             "%s: account inactive or not provisioned in Gerrit",
@@ -197,12 +216,6 @@ class ProjectOAuthFilter implements Filter {
       authRequest.setPassword(authInfo.tokenOrSecret);
     }
 
-    // if there is authentication information but no secret => 401
-    if (Strings.isNullOrEmpty(authInfo.tokenOrSecret)) {
-      rsp.sendError(SC_UNAUTHORIZED);
-      return false;
-    }
-
     authRequest.setAuthPlugin(authInfo.pluginName);
     authRequest.setAuthProvider(authInfo.exportName);
 
@@ -213,6 +226,9 @@ class ProjectOAuthFilter implements Filter {
       ws.setAccessPathOk(AccessPath.GIT, true);
       ws.setAccessPathOk(AccessPath.REST_API, true);
       return true;
+    } catch (AuthenticationUnavailableException | IOException e) {
+      authenticationUnavailable(rsp, e);
+      return false;
     } catch (AccountException e) {
       logger.atWarning().withCause(e).log("%s", authenticationFailedMsg(authInfo.username, req));
       rsp.sendError(SC_UNAUTHORIZED);

@@ -179,14 +179,26 @@ public class AccountCacheImpl implements AccountCache {
   @Override
   public Optional<AccountState> getByUsername(String username) {
     try {
-      return externalIds
-          .get(externalIdKeyFactory.create(SCHEME_USERNAME, username))
-          .map(e -> get(e.accountId()))
-          .orElseGet(Optional::empty);
+      return readByUsername(username);
     } catch (IOException e) {
       logger.atWarning().withCause(e).log("Cannot load AccountState for username %s", username);
       return Optional.empty();
     }
+  }
+
+  @Override
+  public Optional<AccountState> getByUsernameForAuthentication(String username) {
+    try {
+      return readByUsername(username);
+    } catch (IOException e) {
+      throw new StorageException("Could not read the account for authentication", e);
+    }
+  }
+
+  private Optional<AccountState> readByUsername(String username) throws IOException {
+    return externalIds
+        .get(externalIdKeyFactory.create(SCHEME_USERNAME, username))
+        .flatMap(e -> get(e.accountId()));
   }
 
   private AccountState missing(Account.Id accountId) {

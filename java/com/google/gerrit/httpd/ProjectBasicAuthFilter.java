@@ -24,6 +24,7 @@ import com.google.common.flogger.FluentLogger;
 import com.google.common.io.BaseEncoding;
 import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Account;
+import com.google.gerrit.exceptions.StorageException;
 import com.google.gerrit.extensions.client.GitBasicAuthPolicy;
 import com.google.gerrit.extensions.registration.DynamicItem;
 import com.google.gerrit.server.AccessPath;
@@ -107,9 +108,15 @@ class ProjectBasicAuthFilter implements Filter {
     HttpServletRequest req = (HttpServletRequest) request;
     Response rsp = new Response((HttpServletResponse) response);
 
-    if (isSignedInGitRequest(req) || verify(req, rsp)) {
-      chain.doFilter(req, rsp);
+    try {
+      if (!isSignedInGitRequest(req) && !verify(req, rsp)) {
+        return;
+      }
+    } catch (StorageException e) {
+      authenticationUnavailable(rsp, e);
+      return;
     }
+    chain.doFilter(req, rsp);
   }
 
   private boolean isSignedInGitRequest(HttpServletRequest req) {
@@ -152,7 +159,7 @@ class ProjectBasicAuthFilter implements Filter {
     if (gitBasicAuthPolicy == GitBasicAuthPolicy.HTTP
         || gitBasicAuthPolicy == GitBasicAuthPolicy.HTTP_LDAP) {
       Optional<AccountState> accountState =
-          accountCache.getByUsername(username).filter(a -> a.account().isActive());
+          accountCache.getByUsernameForAuthentication(username).filter(a -> a.account().isActive());
       if (!accountState.isPresent()) {
         logger.atWarning().log(
             "Authentication failed for %s: account inactive or not provisioned in Gerrit",
@@ -162,7 +169,7 @@ class ProjectBasicAuthFilter implements Filter {
       }
 
       AccountState who = accountState.get();
-      if (tokenVerifier.checkToken(who.account().id(), password)) {
+      if (tokenVerifier.checkTokenForAuthentication(who.account().id(), password)) {
         logger.atFine().log(
             "HTTP:%s %s username/password authentication succeeded",
             req.getMethod(), req.getRequestURI());
@@ -190,8 +197,9 @@ class ProjectBasicAuthFilter implements Filter {
       // where the account is checked *also* for its HTTP password as a fallback, because
       // of the need to still be able to authenticate service users.
       Optional<AccountState> who =
-          accountCache.getByUsername(username).filter(a -> a.account().isActive());
-      if (who.isPresent() && tokenVerifier.checkToken(who.get().account().id(), password)) {
+          accountCache.getByUsernameForAuthentication(username).filter(a -> a.account().isActive());
+      if (who.isPresent()
+          && tokenVerifier.checkTokenForAuthentication(who.get().account().id(), password)) {
         return succeedAuthentication(who.get(), null);
       }
       logger.atWarning().withCause(e).log("%s", authenticationFailedMsg(username, req));
@@ -203,9 +211,8 @@ class ProjectBasicAuthFilter implements Filter {
       logger.atWarning().log(authenticationFailedMsg(username, req) + ": %s", e.getMessage());
       rsp.sendError(SC_UNAUTHORIZED);
       return false;
-    } catch (AuthenticationUnavailableException e) {
-      logger.atSevere().withCause(e).log("could not reach authentication backend");
-      rsp.sendError(SC_SERVICE_UNAVAILABLE);
+    } catch (AuthenticationUnavailableException | IOException e) {
+      authenticationUnavailable(rsp, e);
       return false;
     } catch (AccountException e) {
       logger.atWarning().withCause(e).log("%s", authenticationFailedMsg(username, req));
@@ -226,6 +233,13 @@ class ProjectBasicAuthFilter implements Filter {
         authenticationFailedMsg(username, req));
     rsp.sendError(SC_UNAUTHORIZED);
     return false;
+  }
+
+  static void authenticationUnavailable(HttpServletResponse rsp, Exception failure)
+      throws IOException {
+    logger.atWarning().withCause(failure).log("Authentication backend unavailable");
+    rsp.setHeader("Retry-After", "30");
+    rsp.sendError(SC_SERVICE_UNAVAILABLE);
   }
 
   static String authenticationFailedMsg(String username, HttpServletRequest req) {
