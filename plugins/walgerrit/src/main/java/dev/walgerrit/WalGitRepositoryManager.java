@@ -49,6 +49,9 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   private final Compactor compactor;
   private final GerritRuntime runtime;
 
+  /** The repository whose log entry the thread is applying; see {@link #applyingReplay}. */
+  private final ThreadLocal<RepositoryId> applyingReplay = new ThreadLocal<>();
+
   @Inject
   WalGitRepositoryManager(
       @GerritServerConfig Config serverConfig, @SitePath Path sitePath, GerritRuntime runtime) {
@@ -122,6 +125,19 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   }
 
   /**
+   * Marks the calling thread as applying a log entry of {@code repository} until the scope closes.
+   * The replay read that repository's manifest to find the entry, so a handle the thread opens on
+   * it starts from a view at least as new as the entry, without a conditional read of its own
+   * unless the revalidation interval has passed. The catalog and every other repository are
+   * validated as on any open.
+   */
+  EventReplay.Scope applyingReplay(RepositoryId repository) {
+    RepositoryId outer = applyingReplay.get();
+    applyingReplay.set(repository);
+    return () -> applyingReplay.set(outer);
+  }
+
+  /**
    * Opening a handle is the request-level freshness boundary: one conditional read of the catalog,
    * which every repository shares, and one of the repository's manifest.
    */
@@ -138,7 +154,7 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     }
     ManifestStore manifestStore = storage.manifestStore(binding.id());
     boolean exists =
-        revalidate
+        revalidate && !binding.id().equals(applyingReplay.get())
             ? manifestStore.exists()
             : manifestStore.existsUnlessRecentlyValidated(
                 configuration.manifestRevalidateInterval());

@@ -393,6 +393,55 @@ class ReturningNodeTest {
     }
   }
 
+  @Test
+  void replayDoesNotValidateTheManifestItReplaysAtEachOpen() throws Exception {
+    // As deployed: every open revalidates, and a validated manifest is reused for a second.
+    revalidateInterval = "1 sec";
+    Process before = returning();
+    before.startAndCatchUp();
+    before.stop();
+
+    int changes = 24;
+    for (int change = 100; change < 100 + changes; change++) {
+      change(late, change);
+      star(change, USER);
+    }
+    long entries = backlog(before, allUsers) + backlog(before, late);
+
+    Process back = returning();
+    back.startAndCatchUp();
+    try {
+      assertTrue(back.readiness.isReady());
+      assertEquals(changes, index.documents.size());
+      assertEquals(2 * changes, entries);
+      assertEquals(
+          entries,
+          back.logEntriesRead(allUsers).size() + back.logEntriesRead(late).size(),
+          "one read per log entry");
+      // Each change opens its repository and the users repository; only the manifest of the
+      // repository whose entries are replayed is not validated again.
+      String replayed = "manifests/" + back.repositories.idOf(late) + "/";
+      long ofTheReplayed =
+          back.store.conditionalReads.stream().filter(key -> key.startsWith(replayed)).count();
+      assertTrue(
+          ofTheReplayed <= 2,
+          ofTheReplayed + " conditional reads of the replayed repository's manifest");
+      String users = "manifests/" + back.repositories.idOf(allUsers) + "/";
+      long ofTheUsers =
+          back.store.conditionalReads.stream().filter(key -> key.startsWith(users)).count();
+      assertTrue(
+          ofTheUsers >= changes,
+          ofTheUsers + " conditional reads of the users repository's manifest");
+      long ofTheCatalog =
+          back.store.conditionalReads.stream()
+              .filter(key -> key.startsWith("manifests/catalog/"))
+              .count();
+      assertTrue(ofTheCatalog >= 2 * changes, ofTheCatalog + " conditional reads of the catalog");
+    } finally {
+      back.stop();
+    }
+  }
+
   /** What ends a process without its shutdown: nothing after it runs. */
   private static final class Killed extends Error {
     private static final long serialVersionUID = 1L;
@@ -448,6 +497,13 @@ class ReturningNodeTest {
       update.setForceUpdate(true);
       assertEquals(RefUpdate.Result.FORCED, update.delete());
     }
+  }
+
+  /** The entries of {@code project} published since {@code process} replayed it. */
+  private long backlog(Process process, Project.NameKey project) throws IOException {
+    ManifestStore manifests = process.repositories.manifestStore(project);
+    return writer.manifestStore(project).read().getHeadSeq()
+        - new IndexCursorStore(manifests.indexCursorPath()).read().getSequence();
   }
 
   // The returning node.

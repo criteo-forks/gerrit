@@ -1278,7 +1278,9 @@ final class IndexEventTailer implements LifecycleListener {
                   + project.get()
                   + " has no ref transaction payload");
         }
-        noteUnindexed(id, applier.applyReporting(project, entry.getRefTransaction()));
+        try (EventReplay.Scope applying = repositories.applyingReplay(id)) {
+          noteUnindexed(id, applier.applyReporting(project, entry.getRefTransaction()));
+        }
         // This repository's cursor is replaced below.
         unindexedOutdated.remove(id);
         writeOutdatedUnindexedLists();
@@ -1289,7 +1291,9 @@ final class IndexEventTailer implements LifecycleListener {
         replayed++;
       }
       if (project != null && foreign && entry.hasIndexUpdate()) {
-        applier.reindex(project, entry.getIndexUpdate(), reindexedByRefs);
+        try (EventReplay.Scope applying = repositories.applyingReplay(id)) {
+          applier.reindex(project, entry.getIndexUpdate(), reindexedByRefs);
+        }
         reindexed++;
       }
       if (tracking && project != null) {

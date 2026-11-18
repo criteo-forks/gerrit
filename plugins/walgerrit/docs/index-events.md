@@ -342,6 +342,11 @@ The manifest names the log head; each entry names its predecessor. The tailer wa
 the cursor, validates its transaction ID, then applies the entries forward. Catch-up reads one
 log object per intervening entry. See [Storage format](storage-format.md#the-log-chain).
 
+Indexing a change opens its repository and All-Users. While the tailer applies an entry, an open
+of the entry's own repository does not validate its manifest again unless
+`manifestRevalidateInterval` has passed: the replay read that manifest to find the entry, and
+the handle starts from it. The catalog and every other repository are validated as on any open.
+
 `indexReplayLimit` counts all publications, including object, compaction and notification entries.
 If any repository exceeds the limit, the configured automatic rebuild covers all four logical
 indexes, whichever repository triggered it.
