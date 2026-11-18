@@ -471,6 +471,7 @@ final class IndexEventTailer implements LifecycleListener {
       }
       participating = false;
       stopped = true;
+      readiness.forgetCoverage();
       readiness.markNotReady();
       runningExecutor = executor;
       executor = null;
@@ -524,6 +525,20 @@ final class IndexEventTailer implements LifecycleListener {
             });
     pool.allowCoreThreadTimeOut(true);
     return pool;
+  }
+
+  /** A fresh index generation, or -1 when a user search has to wait for a full inventory. */
+  long searchGeneration() {
+    if (!tailing()) {
+      return 0;
+    }
+    long generation = rebuildsBegun.get();
+    if (indexesInDoubt()
+        || !readiness.coveredWithin(repositories.configuration().indexMaxSearchAge())
+        || rebuildsBegun.get() != generation) {
+      return -1;
+    }
+    return generation;
   }
 
   Duration indexBarrierTimeout() {
@@ -955,13 +970,14 @@ final class IndexEventTailer implements LifecycleListener {
    * rebuilt and every cursor reseeded, then the sweep runs once more to replay whatever was
    * published during the rebuild.
    */
-  void runOnce() throws IOException {
-    Map<RepositoryId, IndexRebuildRequiredException> stale = sweep();
-    if (stale.isEmpty()) {
-      return;
+  boolean runOnce() throws IOException {
+    Sweep first = sweep();
+    if (first.stale().isEmpty() && !indexesIncomplete) {
+      return first.coversChanges();
     }
-    rebuildIndexes(stale);
-    Map<RepositoryId, IndexRebuildRequiredException> stillStale = sweep();
+    rebuildIndexes(first.stale());
+    Sweep after = sweep();
+    Map<RepositoryId, IndexRebuildRequiredException> stillStale = after.stale();
     if (!stillStale.isEmpty()) {
       IOException failure =
           new IOException(
@@ -969,18 +985,23 @@ final class IndexEventTailer implements LifecycleListener {
       stillStale.values().forEach(failure::addSuppressed);
       throw failure;
     }
+    return after.coversChanges();
   }
+
+  private record Sweep(
+      Map<RepositoryId, IndexRebuildRequiredException> stale, boolean coversChanges) {}
 
   /**
    * Lists every repository and replays those whose manifest changed, the catalog first.
    *
-   * <p>The logs of different repositories have no common order, so an entry's work can need what
-   * a repository this sweep replays later provides, or what was published after the sweep's
-   * listing. A repository whose replay failed is therefore {@linkplain #replayWaiting replayed once
-   * more} after the others. What fails then fails the sweep. A change that a star or draft names
-   * and the index does not hold is not a failure; see {@link #retryUnindexed}.
+   * <p>The logs of different repositories have no common order, so an entry's work can need what a
+   * repository this sweep replays later provides, or what was published after the sweep's listing.
+   * A repository whose replay failed is therefore {@linkplain #replayWaiting replayed once more}
+   * after the others. What fails then fails the sweep. A change that a star or draft names and the
+   * index does not hold is not a failure; see {@link #retryUnindexed}.
    */
-  private Map<RepositoryId, IndexRebuildRequiredException> sweep() throws IOException {
+  private Sweep sweep() throws IOException {
+    boolean coversChanges = true;
     NavigableMap<RepositoryId, String> heads = repositories.storage().listManifestVersions();
     caughtUpVersions.keySet().retainAll(heads.keySet());
     appliedSequences.keySet().retainAll(heads.keySet());
@@ -997,7 +1018,10 @@ final class IndexEventTailer implements LifecycleListener {
         continue;
       }
       try {
-        catchUp(id, head.getValue());
+        Replay replay = replayLocked(id, head.getValue());
+        if (replay.nameInFlight() && replay.changesWaiting()) {
+          coversChanges = false;
+        }
       } catch (IndexRebuildRequiredException rebuildRequired) {
         stale.put(id, rebuildRequired);
       } catch (ReplayBusyException busy) {
@@ -1042,7 +1066,9 @@ final class IndexEventTailer implements LifecycleListener {
       }
       throw (RuntimeException) first;
     }
-    return stale;
+    // A second pass can stop at a previously known head. The next complete inventory
+    // will certify those repositories without assuming a newer version was covered.
+    return new Sweep(stale, coversChanges && waiting.isEmpty());
   }
 
   /**
@@ -1248,7 +1274,11 @@ final class IndexEventTailer implements LifecycleListener {
             id,
             binding.get().name().get(),
             Namespace.describe(binding.get()));
-        return new Replay(0, true, !changesTouched(entries).isEmpty());
+        return new Replay(
+            0,
+            true,
+            !changesTouched(entries).isEmpty()
+                || entries.stream().anyMatch(e -> e.getIndexUpdate().getChangesCount() > 0));
       }
       project = binding.filter(Binding::active).map(Binding::name).orElse(null);
     }
@@ -1825,9 +1855,10 @@ final class IndexEventTailer implements LifecycleListener {
       if (participating) {
         readiness.markNotReady();
       }
+      readiness.forgetCoverage();
+      rebuildsBegun.incrementAndGet();
+      rebuilding = true;
     }
-    rebuildsBegun.incrementAndGet();
-    rebuilding = true;
     try {
       // No replay runs during a rebuild: one that started earlier finishes first.
       Lock namespace = namespaceLock.writeLock();
@@ -1867,7 +1898,6 @@ final class IndexEventTailer implements LifecycleListener {
     ownSequences.clear();
     unindexedChanges.clear();
     unindexedOutdated.clear();
-    indexesIncomplete = false;
 
     for (Map.Entry<RepositoryId, IndexCursor> seed : seeds.entrySet()) {
       ReentrantLock replaying = lockForReplay(seed.getKey());
@@ -1888,6 +1918,7 @@ final class IndexEventTailer implements LifecycleListener {
       }
     }
     caughtUpVersions.clear();
+    indexesIncomplete = false;
     logger.info(
         "WalGerrit rebuilt this node's indexes in {} s and seeded cursors for {} repositories",
         TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started),
@@ -1980,12 +2011,17 @@ final class IndexEventTailer implements LifecycleListener {
   }
 
   void runBackgroundSweep() {
+    long generation = rebuildsBegun.get();
+    long started = readiness.now();
     try {
-      runOnce();
+      boolean coversChanges = runOnce();
       boolean caughtUp = false;
       synchronized (this) {
         if (participating) {
           readiness.markReady();
+          if (coversChanges && rebuildsBegun.get() == generation && !indexesInDoubt()) {
+            readiness.coveredFrom(started);
+          }
           caughtUp = catchingUp;
           catchingUp = false;
         }

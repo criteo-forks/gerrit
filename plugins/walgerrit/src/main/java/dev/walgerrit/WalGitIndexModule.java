@@ -27,6 +27,7 @@ import com.google.inject.multibindings.OptionalBinder;
 import com.google.inject.name.Names;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /** Installs WAL-driven secondary-index convergence in Gerrit's system injector. */
@@ -48,6 +49,9 @@ public final class WalGitIndexModule extends LifecycleModule {
   static final Key<Supplier<Optional<String>>> SERVING_GATE =
       Key.get(new TypeLiteral<Supplier<Optional<String>>>() {}, Names.named("servingGate"));
 
+  static final Key<LongSupplier> SEARCH_FRESHNESS =
+      Key.get(LongSupplier.class, Names.named("changeIndexSearchGeneration"));
+
   @Override
   protected void configure() {
     // First: a Gerrit build that never calls the barrier or the gate is not worth a startup sweep.
@@ -58,6 +62,9 @@ public final class WalGitIndexModule extends LifecycleModule {
     listener().to(IndexEventTailer.class);
     // Gerrit declares the binding with a default that waits for nothing; this replaces it.
     OptionalBinder.newOptionalBinder(binder(), INDEX_FRESHNESS_BARRIER)
+        .setBinding()
+        .to(IndexBarrier.class);
+    OptionalBinder.newOptionalBinder(binder(), SEARCH_FRESHNESS)
         .setBinding()
         .to(IndexBarrier.class);
     OptionalBinder.newOptionalBinder(binder(), SERVING_GATE).setBinding().to(StartupGate.class);

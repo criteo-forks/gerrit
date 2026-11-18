@@ -40,6 +40,7 @@ import static javax.servlet.http.HttpServletResponse.SC_REQUEST_TIMEOUT;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
+import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.Iterables;
@@ -111,6 +112,7 @@ import com.google.gerrit.server.cancellation.RequestStateProvider;
 import com.google.gerrit.server.change.ChangeFinder;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.group.GroupAuditService;
+import com.google.gerrit.server.index.change.ChangeIndexNotFreshException;
 import com.google.gerrit.server.logging.PerformanceLogContext;
 import com.google.gerrit.server.logging.PerformanceLogger;
 import com.google.gerrit.server.logging.RequestId;
@@ -747,6 +749,10 @@ public class RestApiServlet extends HttpServlet {
           }
         } else {
           res.reset();
+          if (Throwables.getCausalChain(e).stream()
+              .anyMatch(ChangeIndexNotFreshException.class::isInstance)) {
+            res.setHeader(HttpHeaders.RETRY_AFTER, "5");
+          }
           TraceContext.getTraceIds().forEach(traceId -> res.addHeader(X_GERRIT_TRACE, traceId));
 
           if (status.isPresent()) {

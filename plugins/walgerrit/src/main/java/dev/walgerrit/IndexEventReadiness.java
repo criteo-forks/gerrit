@@ -25,7 +25,10 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,6 +40,8 @@ final class IndexEventReadiness {
 
   private final AtomicBoolean ready = new AtomicBoolean();
   private final Path markerPath;
+  private final LongSupplier nanoTime;
+  private volatile Long coveredFrom;
 
   @Inject
   IndexEventReadiness(GitRepositoryManager repositories, MetricMaker metrics) {
@@ -48,14 +53,48 @@ final class IndexEventReadiness {
                 "Whether this node completed a clean full WalGerrit index-event sweep")
             .setGauge(),
         ready::get);
+    metrics.newCallbackMetric(
+        "walgerrit/index_events/search_coverage_age_seconds",
+        Long.class,
+        new Description(
+                "Age of the last inventory covered by this change index, or -1 before coverage")
+            .setGauge()
+            .setUnit("seconds"),
+        () -> {
+          Long start = coveredFrom;
+          return start == null ? -1L : TimeUnit.NANOSECONDS.toSeconds(now() - start);
+        });
   }
 
   IndexEventReadiness(Path markerPath) {
+    this(markerPath, System::nanoTime);
+  }
+
+  IndexEventReadiness(Path markerPath, LongSupplier nanoTime) {
+    this.nanoTime = nanoTime;
     this.markerPath = markerPath.toAbsolutePath().normalize();
+  }
+
+  long now() {
+    return nanoTime.getAsLong();
+  }
+
+  void coveredFrom(long inventoryStarted) {
+    coveredFrom = inventoryStarted;
+  }
+
+  void forgetCoverage() {
+    coveredFrom = null;
+  }
+
+  boolean coveredWithin(Duration maxAge) {
+    Long start = coveredFrom;
+    return start != null && now() - start < TimeUnit.NANOSECONDS.convert(maxAge);
   }
 
   /** Clears a marker left by an earlier process before the startup catch-up begins. */
   void beginStartup() throws IOException {
+    forgetCoverage();
     ready.set(false);
     Files.deleteIfExists(markerPath);
   }

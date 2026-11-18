@@ -128,7 +128,7 @@ backlog. Until that sweep completes cleanly the node's indexes are behind, and t
 nothing but a liveness request:
 
 - HTTP requests get `503` with `Retry-After: 30`, except `GET` and `HEAD` of
-  `/config/server/version` and `/a/config/server/version`;
+  `/livez`. The legacy version probes also work during an image-first upgrade;
 - SSH commands are refused with the same message;
 - the index barrier rejects what reaches it from inside the process, such as a plugin's
   submission;
@@ -154,14 +154,28 @@ test -f /var/gerrit/data/walgerrit-index-events/READY &&
   curl -fsS http://127.0.0.1:8080/ >/dev/null
 ```
 
-Adjust the paths and URL for the deployment. A startup or liveness probe reads
-`/config/server/version`, which is answered from the moment the listeners open; a probe of any
-other path fails for as long as the catch-up takes.
+For startup and liveness, use `GET /livez` or `HEAD /livez`. The HTTP filter returns an
+empty 200 before it consults authentication, permissions or storage. Keep the readiness probe
+on the index marker and the deployment's deep health check.
 
-Readiness describes the most recently completed sweep. It does not promise that every write
-committed afterward has been indexed. The gate closes only for the startup catch-up: revoking
-readiness later, after a failed sweep or during a background rebuild, does not refuse requests,
-and traffic routing must honor the signal.
+## Change search during replay delays
+
+Each daemon records when it started the last complete manifest inventory whose change updates
+it has indexed. A clean inventory renews this timestamp even on an idle repository. If the
+inventory or replay stalls, the age keeps increasing. A rebuild clears it before touching the
+index. After a rebuild, the next complete inventory establishes coverage again.
+
+REST change searches and lookups that need the change index return 503 with `Retry-After: 5`
+once the age reaches `walgerrit.indexMaxSearchAge`. An SSH `gerrit query` exits with a retry
+message. Gerrit checks the age in memory on each request, including requests sent straight to a
+pod. A project and numeric change number, such as `GET /changes/my-project~123/detail`, can
+still read NoteDb directly. Git ref reads and background index replay also remain available when
+their own dependencies are healthy.
+
+The default age is 75 seconds, the limit used in the B5 experiment. Compare
+`walgerrit/index_events/search_coverage_age_seconds` against that limit on each pod during normal
+peak traffic. It reads `-1` before coverage is established. The strict barrier for write
+decisions still catches up to publications acknowledged before the call.
 
 ## Configuration
 
@@ -173,6 +187,7 @@ and traffic routing must honor the signal.
 [walgerrit]
   indexTailerEnabled = true
   indexPollInterval = 5 sec
+  indexMaxSearchAge = 75 sec
   indexCursorPath = data/walgerrit-index-events
   indexReplayLimit = 10000
   indexRebuildOnStaleCursor = true

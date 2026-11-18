@@ -40,6 +40,7 @@ record WalGitConfiguration(
     Path indexCursorPath,
     boolean indexTailerEnabled,
     Duration indexPollInterval,
+    Duration indexMaxSearchAge,
     Duration manifestRevalidateInterval,
     boolean manifestRevalidateOnOpen,
     long indexReplayLimit,
@@ -155,6 +156,8 @@ record WalGitConfiguration(
   /** How often peer names are resolved again, so a replaced pod is reached without a restart. */
   static final Duration DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL = Duration.ofSeconds(30);
 
+  static final Duration DEFAULT_INDEX_MAX_SEARCH_AGE = Duration.ofSeconds(75);
+
   private static final String SECTION = "walgerrit";
 
   /** The local backend below the site's data directory, with every other setting at its default. */
@@ -174,6 +177,7 @@ record WalGitConfiguration(
         storagePath.resolve("index-events"),
         true,
         Duration.ofSeconds(5),
+        DEFAULT_INDEX_MAX_SEARCH_AGE,
         DEFAULT_MANIFEST_REVALIDATE_INTERVAL,
         true,
         DEFAULT_INDEX_REPLAY_LIMIT,
@@ -239,6 +243,7 @@ record WalGitConfiguration(
             path(config, sitePath, "indexCursorPath", "data/walgerrit-index-events"),
             config.getBoolean(SECTION, null, "indexTailerEnabled", true),
             duration(config, "indexPollInterval", Duration.ofSeconds(5)),
+            duration(config, "indexMaxSearchAge", DEFAULT_INDEX_MAX_SEARCH_AGE),
             duration(config, "manifestRevalidateInterval", DEFAULT_MANIFEST_REVALIDATE_INTERVAL),
             config.getBoolean(SECTION, null, "manifestRevalidateOnOpen", true),
             config.getLong(SECTION, null, "indexReplayLimit", DEFAULT_INDEX_REPLAY_LIMIT),
@@ -317,6 +322,7 @@ record WalGitConfiguration(
     require(isPositive(s3ConnectTimeout), "s3ConnectTimeout must be positive");
     require(isPositive(s3SocketTimeout), "s3SocketTimeout must be positive");
     require(s3MaxAttempts >= 1, "s3MaxAttempts must be at least 1");
+    require(isPositive(indexMaxSearchAge), "indexMaxSearchAge must be positive");
     require(isPositive(indexPollInterval), "indexPollInterval must be positive");
     require(
         !manifestRevalidateInterval.isNegative(),

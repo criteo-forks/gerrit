@@ -17,13 +17,17 @@ package com.google.gerrit.acceptance.server.httpd;
 import static com.google.common.truth.Truth.assertThat;
 
 import com.google.gerrit.acceptance.AbstractDaemonTest;
+import com.google.gerrit.acceptance.PushOneCommit;
 import com.google.gerrit.acceptance.RestResponse;
 import com.google.gerrit.acceptance.UseSsh;
 import com.google.gerrit.server.ServingGate;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.inject.AbstractModule;
 import com.google.inject.Module;
 import com.google.inject.multibindings.OptionalBinder;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.apache.http.message.BasicHeader;
 import org.junit.After;
 import org.junit.Test;
@@ -33,6 +37,7 @@ import org.junit.Test;
 public class ServingGateIT extends AbstractDaemonTest {
   private static final String CATCHING_UP = "This server is catching up. Please retry.";
 
+  private static volatile LongSupplier searchGeneration = () -> 0L;
   private static volatile Optional<String> closed = Optional.empty();
 
   @Override
@@ -40,6 +45,9 @@ public class ServingGateIT extends AbstractDaemonTest {
     return new AbstractModule() {
       @Override
       protected void configure() {
+        OptionalBinder.newOptionalBinder(binder(), ChangeIndexFreshness.SEARCH_KEY)
+            .setBinding()
+            .toInstance(() -> searchGeneration.getAsLong());
         OptionalBinder.newOptionalBinder(binder(), ServingGate.GATE_KEY)
             .setBinding()
             .toInstance(() -> closed);
@@ -49,6 +57,7 @@ public class ServingGateIT extends AbstractDaemonTest {
 
   @After
   public void openGate() {
+    searchGeneration = () -> 0L;
     closed = Optional.empty();
   }
 
@@ -59,7 +68,6 @@ public class ServingGateIT extends AbstractDaemonTest {
 
     anonymousRestSession.get(ServingGate.LIVENESS_PATH).assertOK();
     adminRestSession.get(ServingGate.LIVENESS_PATH).assertOK();
-
     anonymousRestSession
         .getWithHeaders("/livez", new BasicHeader("Authorization", "Basic malformed"))
         .assertOK();
@@ -93,6 +101,43 @@ public class ServingGateIT extends AbstractDaemonTest {
     adminSshSession.assertFailure(CATCHING_UP);
     adminSshSession.exec("git-upload-pack " + project.get());
     adminSshSession.assertFailure(CATCHING_UP);
+  }
+
+  @Test
+  public void staleChangeSearchRefusesRestAndSshAndResumesOnTheSameConnection() throws Exception {
+    PushOneCommit.Result change = createChange();
+    String number = change.getChange().getId().toString();
+    String search = "/changes/?q=change:" + number;
+    adminSshSession.exec("gerrit query change:" + number);
+    adminSshSession.assertSuccess();
+    searchGeneration = () -> -1L;
+
+    RestResponse refused = anonymousRestSession.get(search);
+    refused.assertStatus(503);
+    assertThat(refused.getHeader("Retry-After")).isEqualTo("5");
+    adminRestSession.get(search).assertStatus(503);
+    adminRestSession.get("/changes/" + change.getChangeId()).assertStatus(503);
+    assertThat(adminSshSession.exec("gerrit query --format=JSON change:" + number)).isEmpty();
+    adminSshSession.assertFailure("Please retry");
+
+    adminRestSession.get("/changes/" + project.get() + "~" + number + "/detail").assertOK();
+    anonymousRestSession.get("/" + project.get() + "/info/refs?service=git-upload-pack").assertOK();
+    anonymousRestSession.get("/livez").assertOK();
+
+    searchGeneration = () -> 0L;
+    adminRestSession.get(search).assertOK();
+    assertThat(adminSshSession.exec("gerrit query --format=JSON change:" + number))
+        .contains(change.getChangeId());
+    adminSshSession.assertSuccess();
+  }
+
+  @Test
+  public void aSearchCrossingARebuildReturnsNoResults() throws Exception {
+    createChange();
+    searchGeneration = new AtomicLong()::getAndIncrement;
+    adminRestSession.get("/changes/?q=status:open").assertStatus(503);
+    assertThat(adminSshSession.exec("gerrit query --format=JSON status:open")).isEmpty();
+    adminSshSession.assertFailure("Please retry");
   }
 
   @Test

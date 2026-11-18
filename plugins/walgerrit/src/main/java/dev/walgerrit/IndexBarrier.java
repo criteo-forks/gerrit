@@ -31,6 +31,7 @@ import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,7 +52,7 @@ import org.slf4j.LoggerFactory;
  */
 @Singleton
 final class IndexBarrier
-    implements Function<Optional<String>, Optional<String>>, LifecycleListener {
+    implements Function<Optional<String>, Optional<String>>, LongSupplier, LifecycleListener {
   private static final Logger logger = LoggerFactory.getLogger(IndexBarrier.class);
 
   /** The Gerrit class that calls the barrier; absent from a build without the hook. */
@@ -107,6 +108,12 @@ final class IndexBarrier
               + " run without the barrier.",
           missing);
     }
+  }
+
+  /** A user search reads the age of the last complete sweep without waiting for the store. */
+  @Override
+  public long getAsLong() {
+    return tailer.searchGeneration();
   }
 
   @Override

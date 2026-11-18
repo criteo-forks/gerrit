@@ -25,6 +25,7 @@ import com.google.inject.name.Named;
 import com.google.inject.name.Names;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 /**
  * Requires this node's change index to be up to date before a decision that is wrong on a stale
@@ -59,10 +60,15 @@ public class ChangeIndexFreshness {
       Key.get(
           new TypeLiteral<Function<Optional<String>, Optional<String>>>() {}, Names.named(BARRIER));
 
+  private static final String SEARCH = "changeIndexSearchGeneration";
+  public static final Key<LongSupplier> SEARCH_KEY =
+      Key.get(LongSupplier.class, Names.named(SEARCH));
+
   /** Declares the barrier binding with a default that takes the index to be fresh. */
   public static class ChangeIndexFreshnessModule extends AbstractModule {
     @Override
     protected void configure() {
+      OptionalBinder.newOptionalBinder(binder(), SEARCH_KEY).setDefault().toInstance(() -> 0L);
       OptionalBinder.newOptionalBinder(binder(), BARRIER_KEY)
           .setDefault()
           .toInstance(scope -> Optional.empty());
@@ -71,9 +77,14 @@ public class ChangeIndexFreshness {
 
   private final Function<Optional<String>, Optional<String>> barrier;
 
+  private final LongSupplier searchGeneration;
+
   @Inject
-  ChangeIndexFreshness(@Named(BARRIER) Function<Optional<String>, Optional<String>> barrier) {
+  ChangeIndexFreshness(
+      @Named(BARRIER) Function<Optional<String>, Optional<String>> barrier,
+      @Named(SEARCH) LongSupplier searchGeneration) {
     this.barrier = barrier;
+    this.searchGeneration = searchGeneration;
   }
 
   /**
@@ -93,6 +104,27 @@ public class ChangeIndexFreshness {
    */
   public void requireAllFresh() {
     require(Optional.empty(), "all projects");
+  }
+
+  /** Refuses a user search when this node cannot confirm its index stayed within its age limit. */
+  public long requireSearchFresh() {
+    long generation = searchGeneration.getAsLong();
+    if (generation < 0) {
+      throw searchUnavailable();
+    }
+    return generation;
+  }
+
+  /** A query crossing an index rebuild must discard results from its old generation. */
+  public void checkSearchResult(long generation) {
+    if (generation != searchGeneration.getAsLong()) {
+      throw searchUnavailable();
+    }
+  }
+
+  private static ChangeIndexNotFreshException searchUnavailable() {
+    return new ChangeIndexNotFreshException(
+        "This server cannot confirm its change index is up to date. Please retry.");
   }
 
   private void require(Optional<String> scope, String description) {

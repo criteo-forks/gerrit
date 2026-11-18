@@ -55,12 +55,15 @@ final class StartupGate implements Supplier<Optional<String>>, LifecycleListener
       return;
     }
     try {
-      Class.forName(HOOK, false, StartupGate.class.getClassLoader());
-    } catch (ClassNotFoundException | LinkageError missing) {
+      ClassLoader loader = StartupGate.class.getClassLoader();
+      Class.forName(HOOK, false, loader);
+      Class.forName("com.google.gerrit.server.index.change.ChangeIndexFreshness", false, loader)
+          .getMethod("requireSearchFresh");
+    } catch (ReflectiveOperationException | LinkageError missing) {
       throw new IllegalStateException(
           "This Gerrit build has no "
               + HOOK
-              + ", so nothing would keep requests out of this node while its indexes catch up."
+              + " or the bounded change-search freshness hook."
               + " Deploy the WalGerrit library with the fork WAR it was built for.",
           missing);
     }

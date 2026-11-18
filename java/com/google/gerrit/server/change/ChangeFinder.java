@@ -32,6 +32,7 @@ import com.google.gerrit.metrics.Field;
 import com.google.gerrit.metrics.MetricMaker;
 import com.google.gerrit.server.cache.CacheModule;
 import com.google.gerrit.server.config.GerritImportedServerIdsProvider;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.logging.Metadata;
 import com.google.gerrit.server.notedb.ChangeNotes;
 import com.google.gerrit.server.project.NoSuchChangeException;
@@ -73,6 +74,7 @@ public class ChangeFinder {
     COMMIT_HASH
   }
 
+  private final ChangeIndexFreshness freshness;
   private final IndexConfig indexConfig;
   private final boolean hasImportedChanges;
   private final Cache<Change.Id, String> changeIdProjectCache;
@@ -82,12 +84,14 @@ public class ChangeFinder {
 
   @Inject
   ChangeFinder(
+      ChangeIndexFreshness freshness,
       IndexConfig indexConfig,
       GerritImportedServerIdsProvider gerritImportedServerIdsProvider,
       @Named(CACHE_NAME) Cache<Change.Id, String> changeIdProjectCache,
       Provider<InternalChangeQuery> queryProvider,
       ChangeNotes.Factory changeNotesFactory,
       MetricMaker metricMaker) {
+    this.freshness = freshness;
     this.indexConfig = indexConfig;
     this.hasImportedChanges = gerritImportedServerIdsProvider.hasImportedServerIds();
     this.changeIdProjectCache = changeIdProjectCache;
@@ -158,6 +162,7 @@ public class ChangeFinder {
 
     // Use the index to search for changes, but don't return any stored fields,
     // to force rereading in case the index is stale.
+    long generation = freshness.requireSearchFresh();
     InternalChangeQuery query = queryProvider.get().noFields();
     if (queryLimit > 0) {
       query.setLimit(queryLimit);
@@ -166,7 +171,7 @@ public class ChangeFinder {
     // Try commit hash
     if (id.matches("^([0-9a-fA-F]{" + ObjectIds.ABBREV_STR_LEN + "," + ObjectIds.STR_LEN + "})$")) {
       changeIdCounter.increment(ChangeIdType.COMMIT_HASH);
-      return asChangeNotes(query.byCommit(id));
+      return asChangeNotes(query.byCommit(id), generation);
     }
 
     if (y > 0 && z > 0) {
@@ -175,12 +180,12 @@ public class ChangeFinder {
       if (triplet.isPresent()) {
         ChangeTriplet t = triplet.get();
         changeIdCounter.increment(ChangeIdType.TRIPLET);
-        return asChangeNotes(query.byBranchKey(t.branch(), t.id()));
+        return asChangeNotes(query.byBranchKey(t.branch(), t.id()), generation);
       }
     }
 
     // Try isolated Ihash... format ("Change-Id: Ihash").
-    List<ChangeNotes> notes = asChangeNotes(query.byKeyPrefix(id));
+    List<ChangeNotes> notes = asChangeNotes(query.byKeyPrefix(id), generation);
     if (!notes.isEmpty()) {
       changeIdCounter.increment(ChangeIdType.I_HASH);
     }
@@ -226,16 +231,19 @@ public class ChangeFinder {
 
     // Use the index to search for changes, but don't return any stored fields,
     // to force rereading in case the index is stale.
+    long generation = freshness.requireSearchFresh();
     InternalChangeQuery query = queryProvider.get().noFields();
     List<ChangeData> r = hasImportedChanges ? query.byChangeNumber(id) : query.byLegacyChangeId(id);
 
+    List<ChangeNotes> notes = asChangeNotes(r, generation);
     if (r.size() == 1) {
       changeIdProjectCache.put(id, Url.encode(r.get(0).project().get()));
     }
-    return asChangeNotes(r);
+    return notes;
   }
 
-  private List<ChangeNotes> asChangeNotes(List<ChangeData> cds) {
+  private List<ChangeNotes> asChangeNotes(List<ChangeData> cds, long generation) {
+    freshness.checkSearchResult(generation);
     List<ChangeNotes> notes = new ArrayList<>(cds.size());
     if (!indexConfig.separateChangeSubIndexes()) {
       for (ChangeData cd : cds) {

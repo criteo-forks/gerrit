@@ -32,6 +32,7 @@ import com.google.gerrit.server.AnonymousUser;
 import com.google.gerrit.server.CurrentUser;
 import com.google.gerrit.server.DynamicOptions;
 import com.google.gerrit.server.change.ChangeJson;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.permissions.GlobalPermission;
 import com.google.gerrit.server.permissions.PermissionBackend;
 import com.google.gerrit.server.permissions.PermissionBackendException;
@@ -50,6 +51,7 @@ import org.kohsuke.args4j.Option;
 public class QueryChanges implements RestReadView<TopLevelResource>, DynamicOptions.BeanReceiver {
   private static final FluentLogger logger = FluentLogger.forEnclosingClass();
 
+  private final ChangeIndexFreshness freshness;
   private final ChangeJson.Factory json;
   private final ChangeQueryBuilder qb;
   private final Provider<ChangeQueryProcessor> queryProcessorProvider;
@@ -138,7 +140,9 @@ public class QueryChanges implements RestReadView<TopLevelResource>, DynamicOpti
       ChangeQueryBuilder qb,
       Provider<ChangeQueryProcessor> queryProcessorProvider,
       Provider<CurrentUser> userProvider,
-      PermissionBackend permissionBackend) {
+      PermissionBackend permissionBackend,
+      ChangeIndexFreshness freshness) {
+    this.freshness = freshness;
     this.json = json;
     this.qb = qb;
     this.queryProcessorProvider = queryProcessorProvider;
@@ -162,6 +166,7 @@ public class QueryChanges implements RestReadView<TopLevelResource>, DynamicOpti
   @Override
   public Response<List<?>> apply(TopLevelResource rsrc)
       throws BadRequestException, AuthException, PermissionBackendException {
+    long generation = freshness.requireSearchFresh();
     List<List<ChangeInfo>> out;
     try {
       applyPermissionBackendFilter();
@@ -172,6 +177,7 @@ public class QueryChanges implements RestReadView<TopLevelResource>, DynamicOpti
       logger.atFine().withCause(e).log("Reject change query with 400 Bad Request: %s", queries);
       throw new BadRequestException(e.getMessage(), e);
     }
+    freshness.checkSearchResult(generation);
     return Response.ok(out.size() == 1 ? out.get(0) : out);
   }
 

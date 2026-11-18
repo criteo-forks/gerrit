@@ -15,6 +15,7 @@
 package com.google.gerrit.sshd.commands;
 
 import com.google.gerrit.server.DynamicOptions;
+import com.google.gerrit.server.index.change.ChangeIndexNotFreshException;
 import com.google.gerrit.server.query.change.OutputStreamQuery;
 import com.google.gerrit.server.query.change.OutputStreamQuery.OutputFormat;
 import com.google.gerrit.sshd.CommandMetaData;
@@ -107,7 +108,11 @@ public class Query extends SshCommand implements DynamicOptions.BeanReceiver {
   @Override
   protected void run() throws Exception {
     enableGracefulStop();
-    processor.query(join(query, " "));
+    try {
+      processor.query(join(query, " "));
+    } catch (ChangeIndexNotFreshException e) {
+      throw die(e.getMessage());
+    }
   }
 
   @Override

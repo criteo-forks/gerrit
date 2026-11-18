@@ -36,6 +36,7 @@ import com.google.gerrit.server.data.PatchSetAttribute;
 import com.google.gerrit.server.data.QueryStatsAttribute;
 import com.google.gerrit.server.events.EventFactory;
 import com.google.gerrit.server.git.GitRepositoryManager;
+import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.project.SubmitRuleEvaluator;
 import com.google.gerrit.server.project.SubmitRuleOptions;
 import com.google.gerrit.server.util.time.TimeUtil;
@@ -90,6 +91,7 @@ public class OutputStreamQuery {
   private final TrackingFooters trackingFooters;
   private final SubmitRuleEvaluator.Factory submitRuleEvaluatorFactory;
   private final AccountAttributeLoader.Factory accountAttributeLoaderFactory;
+  private final ChangeIndexFreshness freshness;
 
   private OutputFormat outputFormat = OutputFormat.TEXT;
   private boolean includePatchSets;
@@ -115,7 +117,9 @@ public class OutputStreamQuery {
       EventFactory eventFactory,
       TrackingFooters trackingFooters,
       SubmitRuleEvaluator.Factory submitRuleEvaluatorFactory,
-      AccountAttributeLoader.Factory accountAttributeLoaderFactory) {
+      AccountAttributeLoader.Factory accountAttributeLoaderFactory,
+      ChangeIndexFreshness freshness) {
+    this.freshness = freshness;
     this.repoManager = repoManager;
     this.queryBuilder = queryBuilder;
     this.queryProcessor = queryProcessor;
@@ -199,6 +203,7 @@ public class OutputStreamQuery {
   }
 
   public void query(String queryString) throws IOException {
+    long generation = freshness.requireSearchFresh();
     out =
         new PrintWriter( //
             new BufferedWriter( //
@@ -228,6 +233,7 @@ public class OutputStreamQuery {
                 buildChangeAttribute(d, repos, revWalks, accountLoader, attributesNodeProviders));
           }
           accountLoader.fill();
+          freshness.checkSearchResult(generation);
           changeAttributes.forEach(c -> show(c));
         } finally {
           closeAll(revWalks.values(), repos.values());

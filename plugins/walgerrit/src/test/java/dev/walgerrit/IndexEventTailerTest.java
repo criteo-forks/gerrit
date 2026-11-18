@@ -29,6 +29,7 @@ import dev.walgerrit.proto.StorageProto.RefTransaction;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -36,6 +37,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
@@ -243,6 +245,64 @@ class IndexEventTailerTest {
     } finally {
       tailer.stop();
     }
+  }
+
+  @Test
+  void searchCoverageAgesFromTheListingAndOnlyACompleteSweepRenewsIt() throws Exception {
+    var store = new ManifestReadCountTest.CountingObjectStore(new FileObjectStore(storagePath));
+    WalGitRepositoryManager manager = sweptManager(store);
+    Project.NameKey project = Project.nameKey("platform/search-freshness");
+    manager.createRepository(project).close();
+    AtomicLong now = new AtomicLong();
+    AtomicBoolean slow = new AtomicBoolean();
+    AtomicBoolean fail = new AtomicBoolean();
+    long budget = Duration.ofSeconds(75).toNanos();
+    IndexEventReadiness readiness =
+        new IndexEventReadiness(storagePath.resolve("node/READY"), now::get);
+    IndexEventTailer tailer =
+        startingTailer(
+            manager,
+            (p, tx) -> {
+              if (fail.get()) {
+                throw new IllegalStateException("Cannot replay");
+              }
+              if (slow.get()) {
+                now.addAndGet(budget);
+              }
+            },
+            readiness);
+    assertEquals(-1, tailer.searchGeneration());
+    TestStores.startCaughtUp(tailer);
+    try {
+      String counts = store.toString();
+      assertTrue(tailer.searchGeneration() >= 0);
+      now.addAndGet(budget);
+      assertEquals(
+          -1, tailer.searchGeneration(), "the sweep thread need not run to expire its coverage");
+      assertEquals(counts, store.toString(), "search admission never calls the store");
+
+      tailer.runBackgroundSweep();
+      assertTrue(tailer.searchGeneration() >= 0, "an idle but fully inventoried node is fresh");
+      publishRef(manager, project, Constants.R_HEADS + "new");
+      now.addAndGet(budget);
+      fail.set(true);
+      tailer.runBackgroundSweep();
+      assertEquals(-1, tailer.searchGeneration());
+      fail.set(false);
+      slow.set(true);
+      tailer.runBackgroundSweep();
+      assertTrue(readiness.isReady());
+      assertEquals(
+          -1,
+          tailer.searchGeneration(),
+          "work taking the whole window cannot certify fresh results");
+      slow.set(false);
+      tailer.runBackgroundSweep();
+      assertTrue(tailer.searchGeneration() >= 0);
+    } finally {
+      tailer.stop();
+    }
+    assertEquals(-1, tailer.searchGeneration());
   }
 
   @Test
