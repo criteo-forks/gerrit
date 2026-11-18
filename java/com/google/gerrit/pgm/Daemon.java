@@ -38,6 +38,7 @@ import com.google.gerrit.httpd.RequestCleanupFilter;
 import com.google.gerrit.httpd.RequestContextFilter;
 import com.google.gerrit.httpd.RequestMetricsFilter;
 import com.google.gerrit.httpd.RequireSslFilter.RequireSslFilterModule;
+import com.google.gerrit.httpd.ServingGateFilter;
 import com.google.gerrit.httpd.SetThreadNameFilter;
 import com.google.gerrit.httpd.WebModule;
 import com.google.gerrit.httpd.WebSshGlueModule;
@@ -678,6 +679,7 @@ public class Daemon extends SiteProgram {
 
   private Injector createWebInjector() {
     final List<Module> modules = new ArrayList<>();
+    modules.add(ServingGateFilter.module());
     modules.add(RequestContextFilter.module());
     modules.add(RequestMetricsFilter.module());
     modules.add(H2CacheBasedWebSession.module());

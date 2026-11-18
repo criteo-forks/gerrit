@@ -21,6 +21,7 @@ import com.google.common.util.concurrent.Atomics;
 import com.google.gerrit.extensions.registration.DynamicSet;
 import com.google.gerrit.extensions.restapi.AuthException;
 import com.google.gerrit.server.DynamicOptions;
+import com.google.gerrit.server.ServingGate;
 import com.google.gerrit.server.args4j.SubcommandHandler;
 import com.google.gerrit.server.permissions.GlobalPermission;
 import com.google.gerrit.server.permissions.PermissionBackend;
@@ -32,6 +33,7 @@ import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.sshd.server.Environment;
 import org.apache.sshd.server.channel.ChannelSession;
@@ -45,6 +47,7 @@ final class DispatchCommand extends BaseCommand {
   }
 
   private final PermissionBackend permissionBackend;
+  private final ServingGate servingGate;
   private final Map<String, CommandProvider> commands;
   private final AtomicReference<Command> atomicCmd;
   private final DynamicSet<SshExecuteCommandInterceptor> commandInterceptors;
@@ -58,9 +61,11 @@ final class DispatchCommand extends BaseCommand {
   @Inject
   DispatchCommand(
       PermissionBackend permissionBackend,
+      ServingGate servingGate,
       DynamicSet<SshExecuteCommandInterceptor> commandInterceptors,
       @Assisted Map<String, CommandProvider> all) {
     this.permissionBackend = permissionBackend;
+    this.servingGate = servingGate;
     commands = all;
     atomicCmd = Atomics.newReference();
     this.commandInterceptors = commandInterceptors;
@@ -73,6 +78,10 @@ final class DispatchCommand extends BaseCommand {
   @Override
   public void start(ChannelSession channel, Environment env) throws IOException {
     try (DynamicOptions pluginOptions = new DynamicOptions(injector, dynamicBeans)) {
+      Optional<String> closed = servingGate.closed();
+      if (closed.isPresent()) {
+        throw new UnloggedFailure(1, "fatal: " + closed.get());
+      }
       parseCommandLine(pluginOptions);
       if (Strings.isNullOrEmpty(commandName)) {
         StringWriter msg = new StringWriter();

@@ -94,6 +94,7 @@ import com.google.gerrit.server.PerformanceMetrics;
 import com.google.gerrit.server.PluginPushOption;
 import com.google.gerrit.server.RequestListener;
 import com.google.gerrit.server.ServerStateProvider;
+import com.google.gerrit.server.ServingGate.ServingGateModule;
 import com.google.gerrit.server.TraceRequestListener;
 import com.google.gerrit.server.ValidationOptionsListener;
 import com.google.gerrit.server.account.AccountControl;
@@ -294,6 +295,7 @@ public class GerritGlobalModule extends FactoryModule {
     install(new GitModule());
     install(new GroupDbModule());
     install(new GroupModule());
+    install(new ServingGateModule());
     install(new NoteDbModule());
     install(new PrologModule(cfg));
     install(new DefaultSubmitRuleModule());
