@@ -344,7 +344,7 @@ class ManifestReadCountTest {
   }
 
   /** Counts every object-store operation by kind and normalized key. */
-  static final class CountingObjectStore implements ObjectStore {
+  static class CountingObjectStore implements ObjectStore {
     private final ObjectStore delegate;
     private final Map<String, AtomicLong> counts = new ConcurrentSkipListMap<>();
 

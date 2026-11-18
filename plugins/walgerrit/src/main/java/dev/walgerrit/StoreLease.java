@@ -13,11 +13,15 @@
 // limitations under the License.
 package dev.walgerrit;
 
-import dev.walgerrit.proto.StorageProto;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import dev.walgerrit.proto.StorageProto.CompactionLease;
 import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * One repository's compaction lease: a small object whose expiry says which node is compacting.
@@ -36,81 +40,139 @@ final class StoreLease {
   private final Clock clock;
   private final String owner;
 
+  private final Cache<String, Boolean> abandoned;
+
+  // A live process can relinquish its own abandoned claims after connectivity returns. Eviction
+  // or a process restart falls back to the normal lease expiry.
+  static Cache<String, Boolean> abandonedClaims() {
+    return CacheBuilder.newBuilder().maximumSize(4096).build();
+  }
+
   StoreLease(ObjectStore store, String key, Clock clock, String owner) {
+    this(store, key, clock, owner, abandonedClaims());
+  }
+
+  StoreLease(
+      ObjectStore store, String key, Clock clock, String owner, Cache<String, Boolean> abandoned) {
     this.store = store;
     this.key = key;
     this.clock = clock;
     this.owner = owner;
+    this.abandoned = abandoned;
   }
 
-  /** Takes the lease for {@code duration} unless another owner holds an unexpired one. */
   Optional<Held> acquire(Duration duration) throws IOException {
-    long now = clock.millis();
-    byte[] claim = lease(now + duration.toMillis()).toByteArray();
     Optional<ObjectStore.StoredObject> current = store.get(key);
-    if (current.isEmpty()) {
-      try {
-        return Optional.of(new Held(store.putIfAbsent(key, claim).version()));
-      } catch (ObjectAlreadyExistsException raced) {
-        current = store.get(key);
-        if (current.isEmpty()) {
-          return Optional.empty();
-        }
+    long now = clock.millis();
+    if (current.isPresent()) {
+      CompactionLease existing = CompactionLease.parseFrom(current.get().bytes());
+      if (existing.getExpiresAtEpochMillis() > now
+          && abandoned.getIfPresent(existing.getAcquisitionId()) == null) {
+        return Optional.empty();
       }
     }
-    StorageProto.CompactionLease held =
-        StorageProto.CompactionLease.parseFrom(current.get().bytes());
-    if (held.getExpiresAtEpochMillis() > now) {
-      return Optional.empty();
-    }
+    String id = UUID.randomUUID().toString();
+    CompactionLease claim = lease(id, now + duration.toMillis());
     try {
-      return Optional.of(new Held(store.compareAndSwap(key, current.get().version(), claim).version()));
-    } catch (ObjectStoreConflictException raced) {
-      return Optional.empty();
+      return writeClaim(current.map(ObjectStore.StoredObject::version), claim)
+          .map(version -> new Held(id, version));
+    } catch (IOException unavailable) {
+      // The original request may still be in flight. No worker will use this acquisition.
+      abandoned.put(id, true);
+      throw unavailable;
     }
   }
 
-  /** The current holder as recorded in the store, for diagnostics and tests. */
-  Optional<StorageProto.CompactionLease> current() throws IOException {
+  /** Resolves an ambiguous conditional write with one authoritative read of its exact claim. */
+  private Optional<String> writeClaim(Optional<String> expectedVersion, CompactionLease claim)
+      throws IOException {
+    byte[] bytes = claim.toByteArray();
+    ObjectStore.StoredObject applied;
+    try {
+      applied =
+          expectedVersion.isEmpty()
+              ? store.putIfAbsent(key, bytes)
+              : store.compareAndSwap(key, expectedVersion.get(), bytes);
+    } catch (IOException failure) {
+      Optional<ObjectStore.StoredObject> found;
+      try {
+        found = store.get(key).filter(stored -> Arrays.equals(stored.bytes(), bytes));
+      } catch (IOException unreadable) {
+        if (unreadable != failure) {
+          failure.addSuppressed(unreadable);
+        }
+        throw failure;
+      }
+      if (found.isEmpty()) {
+        if (failure instanceof ObjectAlreadyExistsException
+            || failure instanceof ObjectStoreConflictException) {
+          return Optional.empty();
+        }
+        throw failure;
+      }
+      applied = found.get();
+    }
+    return clock.millis() < claim.getExpiresAtEpochMillis()
+        ? Optional.of(applied.version())
+        : Optional.empty();
+  }
+
+  Optional<CompactionLease> current() throws IOException {
     Optional<ObjectStore.StoredObject> stored = store.get(key);
-    if (stored.isEmpty()) {
-      return Optional.empty();
-    }
-    return Optional.of(StorageProto.CompactionLease.parseFrom(stored.get().bytes()));
+    return stored.isEmpty()
+        ? Optional.empty()
+        : Optional.of(CompactionLease.parseFrom(stored.get().bytes()));
   }
 
-  private StorageProto.CompactionLease lease(long expiresAt) {
-    return StorageProto.CompactionLease.newBuilder()
+  private CompactionLease lease(String id, long expiresAt) {
+    return CompactionLease.newBuilder()
         .setOwner(owner)
+        .setAcquisitionId(id)
         .setExpiresAtEpochMillis(expiresAt)
         .build();
   }
 
-  /** A lease this node holds; closing it releases the lease. */
   final class Held implements AutoCloseable {
+    private final String id;
     private String version;
 
-    private Held(String version) {
+    private Held(String id, String version) {
+      this.id = id;
       this.version = version;
     }
 
-    /** Extends the lease by {@code duration} from now; fails if another owner took it over. */
-    void renew(Duration duration) throws IOException {
-      byte[] claim = lease(clock.millis() + duration.toMillis()).toByteArray();
-      try {
-        version = store.compareAndSwap(key, version, claim).version();
-      } catch (ObjectStoreConflictException lost) {
-        throw new IOException("Compaction lease " + key + " was taken over by another node", lost);
+    synchronized void renew(Duration duration) throws IOException {
+      if (version == null) {
+        throw new IOException("Lease " + key + " is closed");
       }
+      CompactionLease claim = lease(id, clock.millis() + duration.toMillis());
+      version =
+          writeClaim(Optional.of(version), claim)
+              .orElseThrow(() -> new IOException("This process no longer holds lease " + key));
     }
 
-    /** Marks the lease expired so the next compactor can take it immediately; best effort. */
     @Override
-    public void close() {
+    public synchronized void close() {
+      if (version == null) {
+        return;
+      }
+      byte[] released = lease(id, 0).toByteArray();
       try {
-        store.compareAndSwap(key, version, lease(0).toByteArray());
-      } catch (IOException alreadyLost) {
-        // Another node took the lease over after it expired; nothing to release.
+        store.compareAndSwap(key, version, released);
+      } catch (IOException uncertain) {
+        try {
+          Optional<ObjectStore.StoredObject> current = store.get(key);
+          if (current.isPresent()) {
+            CompactionLease held = CompactionLease.parseFrom(current.get().bytes());
+            if (id.equals(held.getAcquisitionId()) && held.getExpiresAtEpochMillis() > 0) {
+              store.compareAndSwap(key, current.get().version(), released);
+            }
+          }
+        } catch (IOException unavailable) {
+          abandoned.put(id, true);
+        }
+      } finally {
+        version = null;
       }
     }
   }

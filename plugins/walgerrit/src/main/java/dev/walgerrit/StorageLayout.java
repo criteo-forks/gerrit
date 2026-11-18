@@ -14,6 +14,7 @@
 
 package dev.walgerrit;
 
+import com.google.common.cache.Cache;
 import dev.walgerrit.ManifestCache.VersionedManifest;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -53,6 +54,7 @@ final class StorageLayout {
   private final String clusterPrefix;
   private final boolean cacheIsStore;
   private final long packFetchChunkSize;
+  private final Cache<String, Boolean> abandonedLeases = StoreLease.abandonedClaims();
   private final ManifestCache manifestCache = new ManifestCache();
   private final java.util.concurrent.ConcurrentHashMap<Path, ChunkedFile> chunkedFiles =
       new java.util.concurrent.ConcurrentHashMap<>();
@@ -155,7 +157,8 @@ final class StorageLayout {
         objectStore,
         leasesPrefix + "/" + CLUSTER_DIRECTORY + "/" + name,
         Clock.systemUTC(),
-        ManifestStore.writerIdentity());
+        ManifestStore.writerIdentity(),
+        abandonedLeases);
   }
 
   StoreLease compactionLease(RepositoryId id) {
@@ -163,7 +166,8 @@ final class StorageLayout {
         objectStore,
         leasesPrefix + "/" + id.value() + "/" + StoreLease.FILE,
         Clock.systemUTC(),
-        ManifestStore.writerIdentity());
+        ManifestStore.writerIdentity(),
+        abandonedLeases);
   }
 
   ManifestStore manifestStore(RepositoryId id) {

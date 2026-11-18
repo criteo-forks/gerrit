@@ -56,8 +56,11 @@ including imports and batch-program writes. The default delay between sweeps is 
 background maintenance.
 
 The compaction lease defaults to 30 minutes and is acquired or renewed by conditional write.
-It avoids duplicate work. Correctness comes from the manifest CAS and input checks, so a lost
-lease cannot authorize dropping another writer's data.
+Each acquisition carries its own ID. When a write reply is lost, the holder reads the lease
+back and continues only if the exact claim is still current and unexpired. Release uses a
+conditional write against the holder's own claim. A process that could not release during an
+outage can reclaim its abandoned acquisition once the store responds. Other processes wait
+until release or expiry. The manifest CAS and input checks protect compaction data.
 
 ## Reclamation
 
