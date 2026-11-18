@@ -69,8 +69,9 @@ final class IndexCursorStore {
   /**
    * The cursor that replaces {@code this} one when it is moved to an entry without the entries in
    * between being read, as an index rebuild and an offline reindex do. The merges it holds stay,
-   * and it remembers up to where merges were read, so that the next replay reads the rest. A node
-   * that had no cursor has read nothing and owes nothing.
+   * and it remembers up to where merges were read, so that the next replay reads the rest. The
+   * changes it lists as unindexed go: both index every change the repositories hold. A node that
+   * had no cursor has read nothing and owes nothing.
    */
   IndexCursor movedTo(long sequence, String transactionId, String manifestVersion)
       throws IOException {
@@ -78,7 +79,8 @@ final class IndexCursorStore {
       return at(IndexCursor.getDefaultInstance(), sequence, transactionId, manifestVersion);
     }
     IndexCursor old = read();
-    IndexCursor.Builder moved = at(old, sequence, transactionId, manifestVersion).toBuilder();
+    IndexCursor.Builder moved =
+        at(old, sequence, transactionId, manifestVersion).toBuilder().clearUnindexed();
     if (!old.hasMergesReadTo() && old.getSequence() != sequence) {
       moved.setMergesReadTo(
           LogPosition.newBuilder()

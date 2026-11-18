@@ -17,10 +17,22 @@ package dev.walgerrit;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
+import java.time.Duration;
 
-/** Finds the one project repository of a test's store, whatever id it drew. */
+/** Helpers that tests of several classes share. */
 final class TestStores {
   private TestStores() {}
+
+  /**
+   * Starts {@code tailer} and, on a node that tails the log, waits for its startup catch-up, after
+   * which the node is ready.
+   */
+  static void startCaughtUp(IndexEventTailer tailer) throws InterruptedException {
+    tailer.start();
+    if (tailer.tailing() && !tailer.awaitStartupCatchUp(Duration.ofSeconds(60))) {
+      throw new AssertionError("The startup catch-up did not complete within 60 seconds");
+    }
+  }
 
   /** The single repository in the store apart from the catalog. */
   static RepositoryId onlyRepository(ObjectStore store) {

@@ -351,7 +351,7 @@ class OwedMergeEventsTest {
             () -> rebuilt.add("all"));
     next.mergeEvents(merges);
     next.process("second");
-    next.start();
+    TestStores.startCaughtUp(next);
     try {
       assertEquals(List.of("all"), rebuilt);
       assertEquals(
@@ -559,7 +559,8 @@ class OwedMergeEventsTest {
   }
 
   /** A later process's tailer after its start-up sweep, as Gerrit starts it. */
-  private IndexEventTailer started(WalGitRepositoryManager node, String process) {
+  private IndexEventTailer started(WalGitRepositoryManager node, String process)
+      throws InterruptedException {
     IndexEventTailer tailer =
         new IndexEventTailer(
             node,
@@ -571,7 +572,7 @@ class OwedMergeEventsTest {
             null);
     tailer.mergeEvents(merges);
     tailer.process(process);
-    tailer.start();
+    TestStores.startCaughtUp(tailer);
     return tailer;
   }
 

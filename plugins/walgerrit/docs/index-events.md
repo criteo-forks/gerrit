@@ -77,15 +77,30 @@ batched durable checkpoints remain future work.
 
 Order is per repository. An All-Users draft or star update can arrive before its project's change
 is indexed, whichever node wrote it: a node replays its own All-Users entries too, and has a change
-another node created only once it has replayed that creation. A live update whose change cannot
-yet be resolved fails; a deletion can safely encounter an already deleted change.
+another node created only once it has replayed that creation. The change can also have been
+deleted since. Neither is a failure. The entry is passed and its account and group updates are
+applied; the change's document is left to the replay of the entry that creates the change, which
+indexes it with the stars and drafts All-Users holds at that time.
+
+The cursor that passes such an entry lists the change, in the same file replacement, until the
+node has indexed it. A change leaves the list when:
+
+- a replay of its own repository indexes it, or removes it because it was deleted;
+- the lookup at the end of a sweep finds it in the index, and indexes it again. This is a change
+  whose document a request of this node was writing when the star or draft was replayed;
+- the indexes are rebuilt;
+- it has been listed for an hour of one process's run and is still not in the index. Nothing on
+  the node says which repository held a change its index does not hold, so the change is taken
+  to be deleted, and the log says so.
+
+A process that starts reads the lists from its cursors and looks again.
 
 A missing or malformed `REF_UPDATE` payload, missing log entry, sequence error, index failure or
 cursor-write failure stops replay for that repository. Other repositories are still attempted.
 
 A sweep replays a repository whose replay failed once more after the others. Before it does, it
-lists the store again and replays what is behind that listing, since the change an entry waits for
-may have been created after the sweep's first listing. The second replay stops at the head the
+lists the store again and replays what is behind that listing, since what a failed entry needs
+may have been published after the sweep's first listing. The second replay stops at the head the
 node knew when the first one failed: later entries may wait for publications later still, and
 are left to the next wake-up or sweep. The extra listing is made only in a sweep where a replay
 failed. A replay that fails again fails the sweep. A wake-up that fails is left to the next sweep.
@@ -99,31 +114,54 @@ name. For a retired name it deletes the change documents by project and drops th
 document. A repository whose name is pending is left where it is, and replayed once the name is
 active.
 Replayed entries are always indexed under the name the catalog binds the repository to.
-A failed startup sweep prevents startup; a failed background sweep revokes readiness. A later
-clean sweep restores it.
+A failed sweep revokes readiness, or withholds it during the startup catch-up. The next clean
+sweep publishes it.
 
 Cursors that are ahead of the head, on another history, or beyond the replay limit take the
 rebuild path when enabled. They are not silently advanced past unknown index work.
 
 ## Startup and readiness
 
-The system-injector lifecycle starts the tailer before Gerrit's serving listeners. Its first sweep
-is synchronous. The sweep lists current manifest versions, reuses valid cursor/version matches,
-and catches up changed repositories. It need not fetch every manifest body.
+The tailer's first sweep is the startup catch-up: it replays what was published while the node
+was away. It runs on the tailer's thread, so Gerrit's listeners open at once, whatever the
+backlog. Until that sweep completes cleanly the node's indexes are behind, and the node answers
+nothing but a liveness request:
+
+- HTTP requests get `503` with `Retry-After: 30`, except `GET` and `HEAD` of
+  `/config/server/version` and `/a/config/server/version`;
+- SSH commands are refused with the same message;
+- the index barrier rejects what reaches it from inside the process, such as a plugin's
+  submission;
+- change-merged events an earlier process owes are not fired.
+
+This needs the fork's `ServingGate` hook; a node whose Gerrit build lacks it refuses to start.
+
+A sweep that fails during the catch-up is logged and tried again after `indexPollInterval`; the
+daemon does not exit. Cursors are saved entry by entry, so a process that ends during the
+catch-up loses no progress: the next one continues from them.
+
+The sweep lists current manifest versions, reuses valid cursor/version matches, and catches up
+changed repositories. It need not fetch every manifest body.
 
 After a clean sweep, the daemon sets `walgerrit/index_events/ready = true` and creates
-`<indexCursorPath>/READY`. Startup, a failed later sweep, and orderly shutdown clear readiness.
-A hard kill can leave the file behind, so a probe must also check the local listener:
+`<indexCursorPath>/READY`. The first one also opens the gate and logs `index-event tailer is
+ready after its startup catch-up`. Startup, a failed later sweep, and orderly shutdown clear
+readiness. A hard kill can leave the file behind, so a readiness probe must also check the local
+listener:
 
 ```sh
 test -f /var/gerrit/data/walgerrit-index-events/READY &&
   curl -fsS http://127.0.0.1:8080/ >/dev/null
 ```
 
-Adjust the paths and URL for the deployment. Readiness describes the most recently completed
-sweep. It does not promise that every write committed afterward has been indexed. Revoking
-readiness during a background rebuild does not close listeners; traffic routing must honor the
-signal.
+Adjust the paths and URL for the deployment. A startup or liveness probe reads
+`/config/server/version`, which is answered from the moment the listeners open; a probe of any
+other path fails for as long as the catch-up takes.
+
+Readiness describes the most recently completed sweep. It does not promise that every write
+committed afterward has been indexed. The gate closes only for the startup catch-up: revoking
+readiness later, after a failed sweep or during a background rebuild, does not refuse requests,
+and traffic routing must honor the signal.
 
 ## Configuration
 
@@ -229,6 +267,7 @@ happens when:
 
 - `indexBarrierTimeout` runs out;
 - reading the store or replaying fails;
+- the node is still catching up after its start;
 - the node cannot replay now: it is stopping, a cursor needs a rebuild, a project's creation or
   deletion is in flight and its unreplayed entries touch changes, the catalog kept moving, or
   more requests wait than the barrier takes;
@@ -317,7 +356,8 @@ A stale cursor triggers this sequence:
 4. Sweep again to replay writes published during the rebuild.
 5. Publish readiness after the clean sweep.
 
-At startup this finishes before listeners open. During a background rebuild readiness is revoked.
+At startup this is part of the catch-up, and the node answers no request until the sweep after
+the rebuild is clean. During a background rebuild readiness is revoked.
 The work can be as expensive as a full offline reindex. A fresh node may need it, but the trigger
 is the log-distance and history check, whether or not the volume is new.
 

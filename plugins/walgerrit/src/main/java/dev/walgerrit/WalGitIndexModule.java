@@ -27,6 +27,7 @@ import com.google.inject.multibindings.OptionalBinder;
 import com.google.inject.name.Names;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Installs WAL-driven secondary-index convergence in Gerrit's system injector. */
 public final class WalGitIndexModule extends LifecycleModule {
@@ -40,10 +41,18 @@ public final class WalGitIndexModule extends LifecycleModule {
           new TypeLiteral<Function<Optional<String>, Optional<String>>>() {},
           Names.named("changeIndexFreshnessBarrier"));
 
+  /**
+   * The binding Gerrit asks before it answers a request. The name and type mirror {@code
+   * com.google.gerrit.server.ServingGate} in the WalGerrit fork of Gerrit.
+   */
+  static final Key<Supplier<Optional<String>>> SERVING_GATE =
+      Key.get(new TypeLiteral<Supplier<Optional<String>>>() {}, Names.named("servingGate"));
+
   @Override
   protected void configure() {
-    // First: a Gerrit build that never calls the barrier is not worth a startup sweep.
+    // First: a Gerrit build that never calls the barrier or the gate is not worth a startup sweep.
     listener().to(IndexBarrier.class);
+    listener().to(StartupGate.class);
     // Peers' wake-ups let the tailer replay a repository before its next sweep finds it.
     listener().to(GossipEndpoint.class);
     listener().to(IndexEventTailer.class);
@@ -51,6 +60,7 @@ public final class WalGitIndexModule extends LifecycleModule {
     OptionalBinder.newOptionalBinder(binder(), INDEX_FRESHNESS_BARRIER)
         .setBinding()
         .to(IndexBarrier.class);
+    OptionalBinder.newOptionalBinder(binder(), SERVING_GATE).setBinding().to(StartupGate.class);
     // What this node does travels in the WAL to the other nodes' tailers: the events it fires and
     // the documents it reindexes with no ref update behind them.
     DynamicSet.bind(binder(), EventListener.class).to(WalJournal.class);

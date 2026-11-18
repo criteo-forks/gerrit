@@ -171,12 +171,12 @@ rejected rather than served from the index as it is. Requests that overlap in ti
 ordered. See [Index events](index-events.md#change-lookups-wait-for-other-nodes-writes).
 
 A malformed payload, log gap or index failure stops progress for that repository. A stale or
-divergent cursor can trigger a full index rebuild. Startup completes a clean sweep before
-listeners open; a failed background sweep revokes readiness. Readiness reports the last sweep,
-not a cross-repository snapshot or a barrier against later writes.
+divergent cursor can trigger a full index rebuild. A starting node answers no request until it
+has completed a clean sweep; a failed background sweep revokes readiness. Readiness reports the
+last sweep, not a cross-repository snapshot or a barrier against later writes.
 
-Repository streams have no global order. An All-Users draft or star update that depends on a
-change not yet discoverable in its project is retried, within the sweep after the other
-repositories and otherwise by the next one. See [Index events](index-events.md).
+Repository streams have no global order. An All-Users draft or star update whose change is not
+in the index yet is passed: the replay that creates the change indexes it with its stars and
+drafts. See [Index events](index-events.md).
 Separate public `EVENT` notifications are [best effort](events.md), with possible loss and
 duplication; they do not inherit the ref payload's durability guarantee.

@@ -165,7 +165,7 @@ class IndexEventTailerTest {
   }
 
   @Test
-  void startupSynchronouslyCatchesUpBeforePublishingReadiness() throws Exception {
+  void startupCatchesUpBeforePublishingReadiness() throws Exception {
     WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/startup-catch-up");
     manager.createRepository(project).close();
@@ -181,7 +181,7 @@ class IndexEventTailerTest {
     RecordingApplier applier = new RecordingApplier();
     IndexEventReadiness readiness = readiness("startup-node");
     IndexEventTailer tailer = startingTailer(manager, applier, readiness);
-    tailer.start();
+    TestStores.startCaughtUp(tailer);
     try {
       assertTrue(
           applier.transactions.stream()
@@ -205,7 +205,7 @@ class IndexEventTailerTest {
   }
 
   @Test
-  void startupFailureClearsStaleMarkerAndRefusesReadiness() throws Exception {
+  void failedStartupCatchUpKeepsTheNodeNotReadyUntilASweepSucceeds() throws Exception {
     WalGitRepositoryManager manager = manager();
     Project.NameKey project = Project.nameKey("platform/startup-failure");
     manager.createRepository(project).close();
@@ -213,19 +213,36 @@ class IndexEventTailerTest {
     IndexEventReadiness readiness = readiness("failed-node");
     Files.createDirectories(readiness.markerPath().getParent());
     Files.writeString(readiness.markerPath(), "stale\n");
+    AtomicBoolean fail = new AtomicBoolean(true);
+    CountDownLatch failed = new CountDownLatch(1);
     IndexEventTailer tailer =
         startingTailer(
             manager,
             (ignoredProject, ignoredTransaction) -> {
-              throw new IllegalStateException("injected startup failure");
+              if (fail.get()) {
+                failed.countDown();
+                throw new IllegalStateException("injected startup failure");
+              }
             },
             readiness);
 
-    IllegalStateException failure = assertThrows(IllegalStateException.class, tailer::start);
+    // The daemon starts all the same: a replay that fails is tried again, not a reason to exit.
+    tailer.start();
+    try {
+      assertTrue(failed.await(30, TimeUnit.SECONDS));
+      tailer.runBackgroundSweep();
+      assertFalse(readiness.isReady());
+      assertTrue(Files.notExists(readiness.markerPath()));
+      assertTrue(tailer.catchingUp(), "the node answers no request while it has not caught up");
 
-    assertTrue(failure.getMessage().contains("refusing to become ready"));
-    assertFalse(readiness.isReady());
-    assertTrue(Files.notExists(readiness.markerPath()));
+      fail.set(false);
+      tailer.runBackgroundSweep();
+      assertTrue(readiness.isReady());
+      assertTrue(Files.isRegularFile(readiness.markerPath()));
+      assertFalse(tailer.catchingUp());
+    } finally {
+      tailer.stop();
+    }
   }
 
   @Test
@@ -245,7 +262,7 @@ class IndexEventTailerTest {
         };
     IndexEventReadiness readiness = readiness("recovering-node");
     IndexEventTailer tailer = startingTailer(manager, applier, readiness);
-    tailer.start();
+    TestStores.startCaughtUp(tailer);
     try {
       try (Repository repository = manager.openRepository(project)) {
         ObjectId commit = WalGitRepositoryManagerTest.insertCommit(repository, "during failure");
@@ -310,7 +327,7 @@ class IndexEventTailerTest {
     RecordingApplier applier = new RecordingApplier();
     IndexEventTailer tailer = startingTailer(reader, applier, readiness("wake-up-node"));
     tailer.wake(reader.idOf(project), null); // No tailer thread yet: the startup sweep covers this.
-    tailer.start();
+    TestStores.startCaughtUp(tailer);
     try {
       ObjectId commit;
       try (Repository repository = writer.openRepository(project)) {
@@ -376,7 +393,7 @@ class IndexEventTailerTest {
               applied.apply(name, transaction);
             },
             readiness("queued"));
-    tailer.start();
+    TestStores.startCaughtUp(tailer);
     try {
       block.set(true);
       publishRef(writer, blocker, "refs/heads/block");
@@ -617,7 +634,7 @@ class IndexEventTailerTest {
             durableLuceneConfig(),
             readiness,
             rebuilder);
-    tailerB.start();
+    TestStores.startCaughtUp(tailerB);
     try {
       assertEquals(1, rebuilder.rebuilds.get(), "a fresh node too far behind rebuilds once");
       assertTrue(applierB.transactions.isEmpty(), "history was rebuilt, not replayed");
@@ -669,7 +686,7 @@ class IndexEventTailerTest {
             durableLuceneConfig(),
             readiness("during-node-b"),
             rebuilder);
-    tailerB.start();
+    TestStores.startCaughtUp(tailerB);
     try {
       assertEquals(1, rebuilder.rebuilds.get());
       assertTrue(
@@ -746,9 +763,16 @@ class IndexEventTailerTest {
             durableLuceneConfig(),
             readiness,
             null);
-    IllegalStateException failure = assertThrows(IllegalStateException.class, noRebuilder::start);
-    assertTrue(failure.getCause().getMessage().contains("offline reindex"));
-    assertFalse(readiness.isReady());
+    IOException failure = assertThrows(IOException.class, noRebuilder::runOnce);
+    assertTrue(failure.getMessage().contains("offline reindex"));
+    noRebuilder.start();
+    try {
+      noRebuilder.runBackgroundSweep();
+      assertFalse(readiness.isReady());
+      assertTrue(noRebuilder.catchingUp());
+    } finally {
+      noRebuilder.stop();
+    }
 
     Config config = replayLimitConfig(shared, "node-c");
     config.setBoolean("walgerrit", null, "indexRebuildOnStaleCursor", false);
@@ -764,8 +788,8 @@ class IndexEventTailerTest {
             durableLuceneConfig(),
             readiness("closed-node-c"),
             new FakeRebuilder());
-    failure = assertThrows(IllegalStateException.class, disabled::start);
-    assertTrue(failure.getCause().getMessage().contains("disabled"));
+    failure = assertThrows(IOException.class, disabled::runOnce);
+    assertTrue(failure.getMessage().contains("disabled"));
   }
 
   @ParameterizedTest(name = "entries of another node: {0}")
@@ -779,7 +803,7 @@ class IndexEventTailerTest {
     IndexEventTailer tailer = startingTailer(manager, applier, readiness);
     // The tailer applies this node's own ref transactions like any other node's.
     tailer.foreignWriter(writer -> foreign);
-    tailer.start();
+    TestStores.startCaughtUp(tailer);
     try {
       // The change is created before it is starred, but the sweep reaches the star first.
       publishRef(manager, repos.second(), CHANGE_1);
@@ -812,7 +836,7 @@ class IndexEventTailerTest {
     StarApplier applier = new StarApplier(repos.first());
     IndexEventReadiness readiness = readiness("late-dependency-node");
     IndexEventTailer tailer = startingTailer(manager, applier, readiness);
-    tailer.start();
+    TestStores.startCaughtUp(tailer);
     try {
       publishRef(manager, repos.first(), STAR_1);
       // The sweep has listed the change's repository as unchanged when the change is created.
@@ -837,7 +861,7 @@ class IndexEventTailerTest {
     StarApplier applier = new StarApplier(repos.first());
     IndexEventReadiness readiness = readiness("chasing-node");
     IndexEventTailer tailer = startingTailer(manager, applier, readiness);
-    tailer.start();
+    TestStores.startCaughtUp(tailer);
     try {
       publishRef(manager, repos.second(), CHANGE_1);
       publishRef(manager, repos.first(), STAR_1);
@@ -934,8 +958,10 @@ class IndexEventTailerTest {
   }
 
   /**
-   * Stands in for the change index: a star in the users repository is applied only once the
-   * change's own repository has been replayed, as in {@code GerritIndexEventApplier}.
+   * An applier whose work on one repository fails until another repository has been replayed:
+   * here a star in the users repository, which fails while the change's own repository has not
+   * been. {@code GerritIndexEventApplier} passes such a star instead; see {@code
+   * ReturningNodeTest}.
    */
   private static final class StarApplier implements IndexEventApplier {
     private final Project.NameKey users;

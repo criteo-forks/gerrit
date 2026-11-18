@@ -492,8 +492,8 @@ class IndexBarrierTest {
     rebuilt[0] = second;
     first.repositories.createRepository(PROJECT).close();
     first.repositories.createRepository(OTHER).close();
-    first.tailer.start();
-    second.tailer.start();
+    TestStores.startCaughtUp(first.tailer);
+    TestStores.startCaughtUp(second.tailer);
     Push original = first.push(changeId(0));
     second.tailer.catchUp(second.id());
     assertEquals(1, second.index.byProject(PROJECT).size());
@@ -530,8 +530,8 @@ class IndexBarrierTest {
     rebuilt[0] = second;
     first.repositories.createRepository(PROJECT).close();
     first.repositories.createRepository(OTHER).close();
-    first.tailer.start();
-    second.tailer.start();
+    TestStores.startCaughtUp(first.tailer);
+    TestStores.startCaughtUp(second.tailer);
     Push original = first.push(changeId(0));
     second.tailer.catchUp(second.id());
     for (int i = 1; i <= 8; i++) {
@@ -1373,7 +1373,7 @@ class IndexBarrierTest {
   private static void startWithProject(Node... started) throws Exception {
     started[0].repositories.createRepository(PROJECT).close();
     for (Node node : started) {
-      node.tailer.start();
+      TestStores.startCaughtUp(node.tailer);
     }
   }
 

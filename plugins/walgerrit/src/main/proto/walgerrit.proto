@@ -161,6 +161,10 @@ message IndexCursor {
   // recorded in `owed`. The next replay reads the entries between it and the
   // cursor for merges and their events only, and clears it.
   LogPosition merges_read_to = 5;
+  // Changes of other repositories that entries up to the cursor named while
+  // this node's change index did not hold them, and that it has not indexed
+  // since; replaced together with the cursor. See docs/index-events.md.
+  repeated int32 unindexed = 6;
 }
 
 // The entry at `sequence`, named as a cursor names it.

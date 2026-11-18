@@ -49,8 +49,9 @@ A ref transaction's WAL entry includes its logical ref updates. Each node applie
 local indexes and saves a durable cursor after the index writes finish. A listing of the
 `manifests/` prefix discovers repositories and changed manifest versions.
 
-Startup catches up before Gerrit opens its listeners. Later sweeps maintain readiness; a cursor
-that cannot be replayed can trigger a full rebuild. Search convergence is asynchronous and has
+A starting node opens its listeners at once and answers only a liveness request until it has
+caught up. Later sweeps maintain readiness; a cursor that cannot be replayed can trigger a full
+rebuild. Search convergence is asynchronous and has
 no global order across repositories. See [Index events](index-events.md).
 
 After publication, a node with peers configured sends them a UDP hint. Receivers queue replay

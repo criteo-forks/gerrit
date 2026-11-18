@@ -185,7 +185,7 @@ class GossipEndpointTest {
     GossipEndpoint receiving = endpoint(nodeB, noPeers(), GossipCodec.unsigned());
     receiving.foreignWriter(writer -> true);
     receiving.onHint((woken, hint) -> tailerB.wake(woken, hint.getManifestVersion()));
-    tailerB.start(); // The startup sweep seeds node B's cursor at the current head.
+    TestStores.startCaughtUp(tailerB); // The startup sweep seeds node B's cursor at the current head.
     receiving.start();
     GossipEndpoint sending =
         endpoint(nodeA, peers("127.0.0.1:" + receiving.port()), GossipCodec.unsigned());

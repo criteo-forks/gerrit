@@ -46,6 +46,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -171,9 +172,10 @@ final class IndexEventTailer implements LifecycleListener {
     /** Reading the store or replaying failed. */
     FAILED(false),
     /**
-     * The node cannot replay now, or cannot say what its indexes hold: it is stopping or rebuilding
-     * its indexes, a rebuild began during the wait or the last one failed, a repository's name is
-     * in flight, a cursor needs a rebuild, or more requests wait than the barrier takes.
+     * The node cannot replay now, or cannot say what its indexes hold: it is catching up after its
+     * start, stopping or rebuilding its indexes, a rebuild began during the wait or the last one
+     * failed, a repository's name is in flight, a cursor needs a rebuild, or more requests wait
+     * than the barrier takes.
      */
     UNAVAILABLE(false);
 
@@ -287,6 +289,12 @@ final class IndexEventTailer implements LifecycleListener {
   /** Set once a tailer that was running is stopped: its index no longer follows the log. */
   private volatile boolean stopped;
 
+  /** Set from {@link #start} until the first clean sweep; see {@link #catchingUp()}. */
+  private volatile boolean catchingUp;
+
+  /** Released by the first clean sweep after {@link #start}. */
+  private final CountDownLatch startupCatchUp = new CountDownLatch(1);
+
   /** Longest a replay or a rebuild waits for the replays other threads are running. */
   private volatile Duration replayLockWait = Duration.ofMinutes(1);
 
@@ -301,6 +309,27 @@ final class IndexEventTailer implements LifecycleListener {
    * and every replay during a rebuild.
    */
   private final ReadWriteLock namespaceLock = new ReentrantReadWriteLock();
+
+  /**
+   * A change that a replayed entry named while this node's change index did not hold it: the
+   * repository whose cursor lists it, and when this process first knew of it.
+   */
+  private record Unindexed(RepositoryId listedBy, long sinceNanos) {}
+
+  /** The changes the cursors list as unindexed; see {@link #retryUnindexed}. */
+  private final Map<Integer, Unindexed> unindexedChanges = new ConcurrentHashMap<>();
+
+  /** Repositories whose cursor this process has read for the changes it lists as unindexed. */
+  private final Set<RepositoryId> unindexedRead = ConcurrentHashMap.newKeySet();
+
+  /** Repositories whose cursor lists a change that {@link #unindexedChanges} no longer holds. */
+  private final Set<RepositoryId> unindexedOutdated = ConcurrentHashMap.newKeySet();
+
+  /**
+   * How long a listed change is looked for. An index write that a request of this node began
+   * before the entry was replayed is searchable long before this has passed.
+   */
+  private volatile Duration unindexedGiveUp = Duration.ofHours(1);
 
   /** Repositories a peer's wake-up queued for replay that the tailer thread has not started. */
   private final Set<RepositoryId> pendingWakeUps = ConcurrentHashMap.newKeySet();
@@ -391,46 +420,45 @@ final class IndexEventTailer implements LifecycleListener {
     if (!tailing()) {
       return;
     }
-    participating = true;
+    validateIndexDurability(indexType, serverConfig);
     try {
       readiness.beginStartup();
-      validateIndexDurability(indexType, serverConfig);
-      runOnce();
-
-      long pollMillis = Math.max(1, configuration.indexPollInterval().toMillis());
-      executor =
-          Executors.newSingleThreadScheduledExecutor(
-              runnable -> {
-                Thread thread = new Thread(runnable, "WalGerrit-Index-Events");
-                thread.setDaemon(true);
-                return thread;
-              });
-      executor.scheduleWithFixedDelay(
-          this::runBackgroundSweep, pollMillis, pollMillis, TimeUnit.MILLISECONDS);
-      barrierPools =
-          new BarrierPools(
-              newBarrierPool("WalGerrit-Index-Barrier-Read-", BARRIER_READ_THREADS),
-              newBarrierPool("WalGerrit-Index-Barrier-Replay-", BARRIER_REPLAY_THREADS));
-      readiness.markReady();
-      logger.info(
-          "WalGerrit index-event tailer is ready after synchronous catch-up; poll interval {}, "
-              + "marker {}",
-          configuration.indexPollInterval(),
-          readiness.markerPath());
-    } catch (IOException | RuntimeException exception) {
-      if (executor != null) {
-        executor.shutdownNow();
-        executor = null;
-      }
-      if (barrierPools != null) {
-        barrierPools.shutdownNow();
-        barrierPools = null;
-      }
-      participating = false;
-      readiness.markNotReady();
+    } catch (IOException exception) {
       throw new IllegalStateException(
-          "WalGerrit initial index-event catch-up failed; refusing to become ready", exception);
+          "WalGerrit cannot remove the readiness marker " + readiness.markerPath(), exception);
     }
+    participating = true;
+    catchingUp = true;
+    long pollMillis = Math.max(1, configuration.indexPollInterval().toMillis());
+    executor =
+        Executors.newSingleThreadScheduledExecutor(
+            runnable -> {
+              Thread thread = new Thread(runnable, "WalGerrit-Index-Events");
+              thread.setDaemon(true);
+              return thread;
+            });
+    barrierPools =
+        new BarrierPools(
+            newBarrierPool("WalGerrit-Index-Barrier-Read-", BARRIER_READ_THREADS),
+            newBarrierPool("WalGerrit-Index-Barrier-Replay-", BARRIER_REPLAY_THREADS));
+    executor.scheduleWithFixedDelay(this::scheduledSweep, 0, pollMillis, TimeUnit.MILLISECONDS);
+    logger.info(
+        "WalGerrit index-event tailer started its startup catch-up; this node answers no request"
+            + " and is not ready until it completes");
+  }
+
+  /**
+   * Whether this node is still replaying what was published while it was away: from {@link #start}
+   * until its first clean sweep. Its indexes are behind until then, so it must not answer requests;
+   * {@link StartupGate} is what keeps them out.
+   */
+  boolean catchingUp() {
+    return catchingUp;
+  }
+
+  /** Waits up to {@code timeout} for the startup catch-up; true once it has completed. */
+  boolean awaitStartupCatchUp(Duration timeout) throws InterruptedException {
+    return startupCatchUp.await(timeout.toNanos(), TimeUnit.NANOSECONDS);
   }
 
   @Override
@@ -527,8 +555,9 @@ final class IndexEventTailer implements LifecycleListener {
     if (pools == null) {
       return stopped ? Indexed.UNAVAILABLE : Indexed.DISABLED;
     }
-    if (indexesInDoubt() || replayLock.isHeldByCurrentThread()) {
-      // A replay cannot wait for another one, nor for itself.
+    if (catchingUp || indexesInDoubt() || replayLock.isHeldByCurrentThread()) {
+      // The startup catch-up outlasts any request. A replay cannot wait for another one, nor
+      // for itself.
       return Indexed.UNAVAILABLE;
     }
     long deadline = System.nanoTime() + timeout.toNanos();
@@ -592,7 +621,7 @@ final class IndexEventTailer implements LifecycleListener {
     if (pools == null) {
       return stopped ? Indexed.UNAVAILABLE : Indexed.DISABLED;
     }
-    if (indexesInDoubt() || replayLock.isHeldByCurrentThread()) {
+    if (catchingUp || indexesInDoubt() || replayLock.isHeldByCurrentThread()) {
       return Indexed.UNAVAILABLE;
     }
     try {
@@ -857,9 +886,9 @@ final class IndexEventTailer implements LifecycleListener {
    * Lists every repository and replays those behind the listing, the catalog first. True when
    * anything was replayed.
    *
-   * <p>The logs of different repositories have no common order: an All-Users entry can name a
-   * change whose own repository is replayed later in the pass. A repository whose replay failed is
-   * therefore tried once more after the others.
+   * <p>The logs of different repositories have no common order, so an entry's work can need what
+   * a repository replayed later in the pass provides. A repository whose replay failed is therefore
+   * tried once more after the others.
    */
   private boolean replayListed() throws IOException {
     if (indexesInDoubt()) {
@@ -945,10 +974,11 @@ final class IndexEventTailer implements LifecycleListener {
   /**
    * Lists every repository and replays those whose manifest changed, the catalog first.
    *
-   * <p>The logs of different repositories have no common order: an All-Users entry can name a
-   * change whose own repository this sweep replays later, or whose creation was published after the
-   * sweep's listing. A repository whose replay failed is therefore {@linkplain #replayWaiting
-   * replayed once more} after the others. What fails then fails the sweep.
+   * <p>The logs of different repositories have no common order, so an entry's work can need what
+   * a repository this sweep replays later provides, or what was published after the sweep's
+   * listing. A repository whose replay failed is therefore {@linkplain #replayWaiting replayed once
+   * more} after the others. What fails then fails the sweep. A change that a star or draft names
+   * and the index does not hold is not a failure; see {@link #retryUnindexed}.
    */
   private Map<RepositoryId, IndexRebuildRequiredException> sweep() throws IOException {
     NavigableMap<RepositoryId, String> heads = repositories.storage().listManifestVersions();
@@ -992,6 +1022,17 @@ final class IndexEventTailer implements LifecycleListener {
     }
     if (!waiting.isEmpty()) {
       replayWaiting(waiting, stale, failures);
+    }
+    try {
+      retryUnindexed();
+    } catch (ReplayBusyException busy) {
+      throw busy;
+    } catch (IOException | RuntimeException exception) {
+      logger.error(
+          "WalGerrit could not index the changes that stars or drafts named before the index held"
+              + " them",
+          exception);
+      failures.add(exception);
     }
     if (!failures.isEmpty()) {
       Exception first = failures.get(0);
@@ -1154,6 +1195,12 @@ final class IndexEventTailer implements LifecycleListener {
     IndexCursorStore cursorStore = new IndexCursorStore(manifestStore.indexCursorPath());
     IndexCursor cursor = cursorStore.read();
     noteApplied(id, cursor.getSequence());
+    if (unindexedRead.add(id)) {
+      long now = System.nanoTime();
+      for (int change : cursor.getUnindexedList()) {
+        unindexedChanges.putIfAbsent(change, new Unindexed(id, now));
+      }
+    }
     boolean tracking = !id.isCatalog() && tracksMerges();
     if (listedVersion != null
         && !cursor.getManifestVersion().isEmpty()
@@ -1231,7 +1278,10 @@ final class IndexEventTailer implements LifecycleListener {
                   + project.get()
                   + " has no ref transaction payload");
         }
-        applier.apply(project, entry.getRefTransaction());
+        noteUnindexed(id, applier.applyReporting(project, entry.getRefTransaction()));
+        // This repository's cursor is replaced below.
+        unindexedOutdated.remove(id);
+        writeOutdatedUnindexedLists();
         applied++;
       }
       if (project != null && foreign && entry.getEventJsonCount() > 0) {
@@ -1245,11 +1295,14 @@ final class IndexEventTailer implements LifecycleListener {
       if (tracking && project != null) {
         trackMerges(id, project, entry, owed);
       }
-      // One replacement of the file passes the entry and records what it merged or announced.
+      // One replacement of the file passes the entry and records what it merged or announced,
+      // and the changes it named that the index does not hold.
       cursor =
           IndexCursorStore.at(cursor, entry.getSeq(), entry.getTransactionId(), "").toBuilder()
               .clearOwed()
               .addAllOwed(owed)
+              .clearUnindexed()
+              .addAllUnindexed(unindexedListedBy(id))
               .build();
       cursorStore.write(cursor);
       noteApplied(id, entry.getSeq());
@@ -1285,6 +1338,110 @@ final class IndexEventTailer implements LifecycleListener {
       noteOwed(id, owed);
     }
     return new Replay(applied, false, false);
+  }
+
+  /**
+   * Lists the changes that an entry of {@code id} named and the index does not hold, and drops
+   * those it indexed from its own repository. The caller saves the list of {@code id} with its
+   * cursor.
+   */
+  private void noteUnindexed(RepositoryId id, IndexEventApplier.Applied applied) {
+    applied.indexed().forEach(this::forgetUnindexed);
+    long now = System.nanoTime();
+    for (int change : applied.unindexed()) {
+      unindexedChanges.putIfAbsent(change, new Unindexed(id, now));
+    }
+  }
+
+  private void forgetUnindexed(int change) {
+    Unindexed listed = unindexedChanges.remove(change);
+    if (listed != null) {
+      unindexedOutdated.add(listed.listedBy());
+    }
+  }
+
+  /** The changes the cursor of {@code id} is to list as unindexed, in order. */
+  private List<Integer> unindexedListedBy(RepositoryId id) {
+    if (unindexedChanges.isEmpty()) {
+      return List.of();
+    }
+    return unindexedChanges.entrySet().stream()
+        .filter(listed -> listed.getValue().listedBy().equals(id))
+        .map(Map.Entry::getKey)
+        .sorted()
+        .toList();
+  }
+
+  /**
+   * Indexes the changes that an entry named while the index did not hold them and that the replay
+   * of their own repository has not indexed since.
+   *
+   * <p>A change another node created is indexed when its repository is replayed up to its
+   * creation, with its stars and drafts as they are then, and is dropped from the list there. What
+   * is left is a change whose document a request of this node was writing when the entry was
+   * replayed, or a change that is deleted. The first is in the index soon after and is indexed
+   * once more here. The second never is: nothing in this node's indexes says which repository
+   * held a change they do not hold, so it is looked for until {@link #unindexedGiveUp} has passed
+   * and is then taken to be deleted.
+   */
+  private void retryUnindexed() throws IOException {
+    if (unindexedChanges.isEmpty() && unindexedOutdated.isEmpty()) {
+      return;
+    }
+    Lock namespace = namespaceLock.readLock();
+    lockForReplay(namespace, "indexing changes named before the index held them");
+    try {
+      lockForReplay(replayLock, "indexing changes named before the index held them");
+      try {
+        long now = System.nanoTime();
+        List<Integer> givenUp = new ArrayList<>();
+        for (Map.Entry<Integer, Unindexed> listed : unindexedChanges.entrySet()) {
+          if (applier.reindexIfIndexed(listed.getKey())) {
+            forgetUnindexed(listed.getKey());
+          } else if (now - listed.getValue().sinceNanos() >= unindexedGiveUp.toNanos()) {
+            forgetUnindexed(listed.getKey());
+            givenUp.add(listed.getKey());
+          }
+        }
+        if (!givenUp.isEmpty()) {
+          logger.info(
+              "WalGerrit stops looking for {} change(s) that stars or drafts name and the index"
+                  + " does not hold; they are taken to be deleted: {}",
+              givenUp.size(),
+              givenUp);
+        }
+        writeOutdatedUnindexedLists();
+      } finally {
+        replayLock.unlock();
+      }
+    } finally {
+      namespace.unlock();
+    }
+  }
+
+  /**
+   * Saves the lists that lost a change, so that a process that starts does not index it again.
+   * The caller holds {@link #replayLock}.
+   */
+  private void writeOutdatedUnindexedLists() throws IOException {
+    for (RepositoryId id : List.copyOf(unindexedOutdated)) {
+      // Removed first: a change dropped from the list meanwhile marks the cursor again.
+      unindexedOutdated.remove(id);
+      IndexCursorStore cursorStore =
+          new IndexCursorStore(repositories.storage().manifestStore(id).indexCursorPath());
+      try {
+        if (cursorStore.exists()) {
+          cursorStore.write(
+              cursorStore.read().toBuilder()
+                  .clearUnindexed()
+                  .addAllUnindexed(unindexedListedBy(id))
+                  .build());
+        }
+      } catch (IOException | RuntimeException failure) {
+        unindexedOutdated.add(id);
+        throw failure;
+      }
+    }
   }
 
   /** Whether this node records the merges it makes: it has events, and a journal to carry them. */
@@ -1433,7 +1590,8 @@ final class IndexEventTailer implements LifecycleListener {
 
   private void queueDelivery(RepositoryId id) {
     ExecutorService delivery = owedEventDelivery;
-    if (delivery == null || !queuedDeliveries.add(id)) {
+    // Listeners of an owed event look changes up, so it waits for the startup catch-up.
+    if (delivery == null || catchingUp || !queuedDeliveries.add(id)) {
       return;
     }
     try {
@@ -1703,6 +1861,8 @@ final class IndexEventTailer implements LifecycleListener {
     // A publication of this node that the rebuild deleted from the indexes is replayed like any
     // other from now on; one indexed after this is in indexes the rebuild no longer touches.
     ownSequences.clear();
+    unindexedChanges.clear();
+    unindexedOutdated.clear();
     indexesIncomplete = false;
 
     for (Map.Entry<RepositoryId, IndexCursor> seed : seeds.entrySet()) {
@@ -1728,6 +1888,11 @@ final class IndexEventTailer implements LifecycleListener {
         "WalGerrit rebuilt this node's indexes in {} s and seeded cursors for {} repositories",
         TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started),
         seeds.size());
+  }
+
+  /** Test hook: sets how long a change that the index does not hold is looked for. */
+  void unindexedGiveUp(Duration giveUp) {
+    this.unindexedGiveUp = giveUp;
   }
 
   /** Test hook: sets how long replay and rebuild wait for a lock. */
@@ -1801,13 +1966,33 @@ final class IndexEventTailer implements LifecycleListener {
     }
   }
 
+  /** An executor drops a periodic task that throws, and nothing else would sweep again. */
+  private void scheduledSweep() {
+    try {
+      runBackgroundSweep();
+    } catch (Error logged) {
+      // The next run tries again.
+    }
+  }
+
   void runBackgroundSweep() {
     try {
       runOnce();
+      boolean caughtUp = false;
       synchronized (this) {
         if (participating) {
           readiness.markReady();
+          caughtUp = catchingUp;
+          catchingUp = false;
         }
+      }
+      if (caughtUp) {
+        logger.info(
+            "WalGerrit index-event tailer is ready after its startup catch-up; poll interval {},"
+                + " marker {}",
+            repositories.configuration().indexPollInterval(),
+            readiness.markerPath());
+        startupCatchUp.countDown();
       }
       // Events that could not be fired when they became due.
       owedRepositories.forEach(this::queueDelivery);
@@ -1817,7 +2002,11 @@ final class IndexEventTailer implements LifecycleListener {
           readiness.markNotReady();
         }
       }
-      logger.error("WalGerrit index-event sweep failed", failure);
+      logger.error(
+          catchingUp
+              ? "WalGerrit startup catch-up failed; this node stays not ready and tries again"
+              : "WalGerrit index-event sweep failed",
+          failure);
       if (failure instanceof Error error) {
         throw error;
       }

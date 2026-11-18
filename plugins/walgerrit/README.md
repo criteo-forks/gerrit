@@ -102,8 +102,8 @@ By default, opening a repository and starting a ref transaction each revalidate 
 Long-lived handles also check periodically. All handles adopt newer manifests observed on the
 same node, so a handle is not a fixed snapshot for the duration of a request.
 
-Search catches up through the WAL. Startup completes a full index sweep before opening Gerrit's
-listeners. A clean sweep creates `<indexCursorPath>/READY` and sets
+Search catches up through the WAL. A starting node opens Gerrit's listeners at once and answers
+only `GET /config/server/version` until it has completed a full index sweep. A clean sweep creates `<indexCursorPath>/READY` and sets
 `walgerrit/index_events/ready`; a failed sweep or orderly shutdown revokes both. A readiness probe
 must require both the marker and a successful request to the local listener. See
 [index startup and readiness](docs/index-events.md#startup-and-readiness).

@@ -104,9 +104,31 @@ final class GerritIndexEventApplier implements IndexEventApplier {
 
   @Override
   public void apply(Project.NameKey project, RefTransaction transaction) {
+    applyReporting(project, transaction);
+  }
+
+  @Override
+  public Applied applyReporting(Project.NameKey project, RefTransaction transaction) {
     try (ManualRequestContext ignored = requestContext.open();
         EventReplay.Scope replaying = EventReplay.enter()) {
-      applyInContext(project, transaction);
+      return applyInContext(project, transaction);
+    }
+  }
+
+  @Override
+  public boolean reindexIfIndexed(int change) {
+    try (ManualRequestContext ignored = requestContext.open();
+        EventReplay.Scope replaying = EventReplay.enter()) {
+      return reindexIfIndexedInContext(Change.id(change));
+    }
+  }
+
+  boolean reindexIfIndexedInContext(Change.Id change) {
+    try {
+      changeIndexer.index(changeNotesFactory.createCheckedUsingIndexLookup(change));
+      return true;
+    } catch (NoSuchChangeException missing) {
+      return false;
     }
   }
 
@@ -185,7 +207,9 @@ final class GerritIndexEventApplier implements IndexEventApplier {
     return ids;
   }
 
-  private void applyInContext(Project.NameKey project, RefTransaction transaction) {
+  Applied applyInContext(Project.NameKey project, RefTransaction transaction) {
+    Set<Integer> indexed = new LinkedHashSet<>();
+    Set<Integer> unindexed = new LinkedHashSet<>();
     Set<Change.Id> projectChanges = new LinkedHashSet<>();
     Set<Change.Id> deletedProjectChanges = new LinkedHashSet<>();
     Map<Change.Id, Boolean> allUsersChanges = new LinkedHashMap<>();
@@ -235,20 +259,15 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       } else {
         indexOrDelete(project, change);
       }
+      indexed.add(change.get());
     }
     for (Map.Entry<Change.Id, Boolean> change : allUsersChanges.entrySet()) {
-      try {
-        changeIndexer.index(changeNotesFactory.createCheckedUsingIndexLookup(change.getKey()));
-      } catch (NoSuchChangeException missing) {
-        if (!change.getValue()) {
-          // All-Users and project WAL streams have no global ordering. A newly created change may
-          // not have reached this node's change index yet, so leave the cursor unacknowledged and
-          // retry this transaction on the next sweep.
-          throw missing;
-        }
-        // A draft/star deletion may race with deletion of the owning change in another repository.
-        // There is no document left to update in that case.
+      if (!reindexIfIndexedInContext(change.getKey()) && !change.getValue()) {
+        // The change is not indexed yet, or is deleted: there is no document to update. The
+        // caller is told, and the rest of the transaction is applied.
+        unindexed.add(change.getKey().get());
       }
+      // A draft or star deletion needs no document: one indexed later no longer holds it.
     }
     for (Account.Id account : accounts) {
       accountIndexer.index(account);
@@ -279,6 +298,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
         }
       }
     }
+    return new Applied(indexed, unindexed);
   }
 
   /**

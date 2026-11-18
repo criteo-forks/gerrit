@@ -28,6 +28,33 @@ interface IndexEventApplier {
   void apply(Project.NameKey project, RefTransaction transaction);
 
   /**
+   * What applying a transaction did about the changes it names: those of its own repository that
+   * were indexed as the repository holds them or removed from the index, and those of other
+   * repositories that this node's change index does not hold.
+   */
+  record Applied(Set<Integer> indexed, Set<Integer> unindexed) {}
+
+  /**
+   * Applies {@code transaction} as {@link #apply} does and reports what it did. A star or draft in
+   * the users repository names a change of another repository; the logs of the two have no common
+   * order, and the change may be deleted. Such a change is not a failure: the replay of its own
+   * repository indexes it with its stars and drafts as they are then. An applier that cannot tell
+   * reports none.
+   */
+  default Applied applyReporting(Project.NameKey project, RefTransaction transaction) {
+    apply(project, transaction);
+    return new Applied(Set.of(), Set.of());
+  }
+
+  /**
+   * Indexes {@code change} as its repository holds it now, when the change index holds it. False
+   * when it does not.
+   */
+  default boolean reindexIfIndexed(int change) {
+    return false;
+  }
+
+  /**
    * Reconciles derived state with the catalog for the named projects: caches, the project index
    * and the change index converge to what the names are bound to now, whatever transitions led
    * there. Runs on every node, the one that made the change included.
