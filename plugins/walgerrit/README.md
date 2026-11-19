@@ -9,6 +9,9 @@ local filesystem and S3-compatible storage. It uses JGit's DFS and reftable APIs
 fork. See the [architecture](docs/architecture.md) for the integration boundary and the
 [roadmap](docs/roadmap.md) for remaining work.
 
+The optional HTTP router sends a project's writes to a preferred ready pod. Every pod can accept
+writes. See [preferred HTTP write routing](tools/affinity/README.md).
+
 ## Build
 
 Use Java 21. The runtime is pinned in [.tool-versions](.tool-versions); the Maven wrapper supplies
@@ -102,16 +105,17 @@ By default, opening a repository and starting a ref transaction each revalidate 
 Long-lived handles also check periodically. All handles adopt newer manifests observed on the
 same node, so a handle is not a fixed snapshot for the duration of a request.
 
-Search catches up through the WAL. A starting node opens Gerrit's listeners at once and answers
-only `GET /config/server/version` until it has completed a full index sweep. A clean sweep creates `<indexCursorPath>/READY` and sets
+Search catches up through the WAL. A starting node serves liveness and version probes while it
+waits for a full index sweep. A clean sweep creates `<indexCursorPath>/READY` and sets
 `walgerrit/index_events/ready`; a failed sweep or orderly shutdown revokes both. A readiness probe
 must require both the marker and a successful request to the local listener. See
 [index startup and readiness](docs/index-events.md#startup-and-readiness).
 
-A push looks its Change-Id up in the index, and a whole-topic submission looks the topic's
-members up there. Before either lookup the node replays what other nodes wrote, to the repository
-or to every repository, waiting at most `indexBarrierTimeout`; a request whose node cannot catch
-up is rejected and can be retried. This needs the `ChangeIndexFreshness` hook of the Gerrit fork.
+WalGerrit review pushes and REST creates, moves and cherry-picks use the repository's
+branch/Change-Id directory. The ref transaction checks the membership read by the writer.
+When the directory needs a seed, the first lookup waits up to `indexBarrierTimeout` for it.
+Direct pushes, by-commit lookups and whole-topic
+submissions still use the index barrier.
 See [change lookups](docs/index-events.md#change-lookups-wait-for-other-nodes-writes).
 
 | Setting | Default | Meaning |
@@ -119,8 +123,10 @@ See [change lookups](docs/index-events.md#change-lookups-wait-for-other-nodes-wr
 | `manifestRevalidateOnOpen` | `true` | Revalidate on every repository open. |
 | `manifestRevalidateInterval` | `1 sec` | Interval checked by active handles; `0` disables periodic checks. |
 | `indexPollInterval` | `5 sec` | Delay between index sweeps. |
+| `indexReplayWorkers` | `4` | Maximum concurrent ordinary change-document replacements per pod (1–16). |
+| `reindexOnBranchUpdate` | `false` | Force open reviews on a moved branch to be reindexed for site extensions. Gerrit also requires this work whenever it indexes mergeability. |
 | `indexReplayLimit` | `10000` | Maximum log entries to replay per repository before rebuilding indexes. |
-| `indexBarrierTimeout` | `5 sec` | Longest a push or whole-topic submission waits for the index to hold other nodes' writes before it is rejected; `0` disables the wait and the rejection. |
+| `indexBarrierTimeout` | `5 sec` | Maximum wait for peer index replay or a cold change-key directory. At zero, the index barrier is disabled and a cold guarded lookup returns a retry immediately. |
 
 Setting `manifestRevalidateOnOpen = false` allows an open to reuse a recently validated node
 view. This reduces reads during offline reindexing but gives up freshness at every open. Ref
@@ -209,10 +215,12 @@ Run Gerrit's acceptance tests on the local WalGerrit backend with:
 
 ```bash
 plugins/walgerrit/scripts/acceptance-tests.sh
-plugins/walgerrit/scripts/acceptance-tests.sh //javatests/com/google/gerrit/acceptance/api/change:api_change
+plugins/walgerrit/scripts/acceptance-tests.sh //javatests/com/google/gerrit/acceptance:WalGerritChangeKeyRaceIT
 ```
 
 The script builds the library, passes it as `GERRIT_WALGERRIT_JAR`, and uses a 512 MiB test heap.
+The change-key race target checks concurrent Git and REST requests with the storage module alone
+and with the storage and index modules together.
 `WALGERRIT_ACCEPTANCE_TMP` selects its scratch directory. To exercise aggressive compaction:
 
 ```bash
