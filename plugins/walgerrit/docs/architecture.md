@@ -75,8 +75,8 @@ paths continue to use JGit APIs. Init-only helpers use a switching repository ma
 fallback before the system injector exists, then the configured backend for post-init work.
 
 The fork also supplies the import, cursor-seeding and namespace commands, an acceptance-test
-adapter, optional stateless web sessions, and the SSH and HTTP relays of
-[write forwarding](forwarding.md), for which the library names the node and its peers. Storage
+adapter, optional stateless web sessions, and the private HTTPS connector for
+[write forwarding](forwarding.md). The library supplies the node name and peer addresses. Storage
 integration does not require a JGit fork. The
 [JGit audit](jgit-cas-deep-dive.md) describes that boundary; the [roadmap](roadmap.md) separates
 implemented features from remaining work.

@@ -9,7 +9,7 @@ local filesystem and S3-compatible storage. It uses JGit's DFS and reftable APIs
 fork. See the [architecture](docs/architecture.md) for the integration boundary and the
 [roadmap](docs/roadmap.md) for remaining work.
 
-Every node accepts writes. With peers configured, a node hands a project's writes to the node the
+Every node accepts writes. With trusted peers configured, a node hands a project's writes to the node the
 cluster prefers for that project. See [write forwarding](docs/forwarding.md).
 
 ## Build
@@ -160,19 +160,20 @@ Conditional reads and index sweeps still discover writes after missed hints. Dup
 unsigned forged hints can trigger extra reads and queued work. See
 [Peer wake-ups](docs/gossip.md) for authentication, metrics and failure behavior.
 
-## Each project's writes go to one node
+## Project write placement
 
-With a peer source configured, a node hands pushes over SSH and HTTP, and REST writes that name
-their project, to the node preferred for the project. It executes them itself when it has no
-working link to that node. The peer runs the write as the user who sent it.
+Every pod remains writable. The entry pod authenticates the client and can hand a project's
+write to the preferred pod over mutual TLS. SSH receive-pack, smart HTTP pushes and eligible
+project-qualified REST writes use the same private HTTPS listener.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `forwardWrites` | `true` | Hand writes to the preferred peer; off, execute every write received. |
+| `forwardWrites` | `true` | Enable forwarding when a membership key and a peer source are configured. |
+| `forwardingSecret` | unset | Dedicated cluster key in `secure.config`, Base64 encoding of 32 random bytes. |
+| `forwardingPort` | `9443` | Pod-to-pod HTTPS listener. |
 
-Nodes must reach each other's HTTP and SSH ports. SSH pushes are handed over only between nodes
-that share their SSH host keys or list each other's in `etc/peer_keys`. See
-[Write forwarding](docs/forwarding.md) for the rules, failure behavior and metrics.
+Use a separate SSH host key per pod and set `sshd.enablePeerDaemon = false` for this deployment.
+See the routing rules, compatibility limits and failure outcomes in [Write forwarding](docs/forwarding.md).
 
 ## Cold reads fetch only the needed pack chunks
 
@@ -261,5 +262,5 @@ results for the revision being deployed.
 | Cross-node notifications | [Events in the WAL](docs/events.md) |
 | Forwarding events from a plugin | [Event log](docs/event-log.md) |
 | Peer wake-ups over UDP | [Gossip](docs/gossip.md) |
-| One writer per project | [Write forwarding](docs/forwarding.md) |
+| Preferred writer per project | [Write forwarding](docs/forwarding.md) |
 | Shared login cookies | [Web sessions](docs/web-sessions.md) |

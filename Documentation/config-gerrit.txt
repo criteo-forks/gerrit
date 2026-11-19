@@ -6076,6 +6076,13 @@ namespace. To alias `replication start` to `gerrit replicate`:
 [[sshd]]
 === Section sshd
 
+[[sshd.enablePeerDaemon]]sshd.enablePeerDaemon::
++
+Allow SSH authentication as the peer daemon user with a host key or a
+key listed in `etc/peer_keys`. This identity can run commands as any account.
++
+Defaults to `false` when `walgerrit.forwardingSecret` is set and `true` otherwise.
+
 [[sshd.enableCompression]]sshd.enableCompression::
 +
 In the general case, we want to disable transparent compression, since

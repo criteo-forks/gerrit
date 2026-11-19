@@ -30,10 +30,11 @@ import java.util.function.Supplier;
  * prefers for the project.
  *
  * <p>The hosts are the gossip peers: each {@code gossipPeer} and every address of {@code
- * gossipPeerDnsName}, without their gossip ports. Gerrit reaches each on its own HTTP port, asks it
- * for its name, and ignores the one that is this node. The node's name is {@link
- * ManifestStore#writerHost()}; {@link WalGitIndexModule} binds both. Without a peer source, or with
- * {@code forwardWrites} off, there are no hosts and every write is executed where it arrives.
+ * gossipPeerDnsName}, without their gossip ports. Gerrit reaches each on its configured private
+ * HTTPS port, asks it for its name, and ignores the one that is this node. The node's name is
+ * {@link ManifestStore#writerHost()}; {@link WalGitIndexModule} binds both. Without a peer source,
+ * or with {@code forwardWrites} off, there are no hosts and every write is executed where it
+ * arrives.
  */
 @Singleton
 final class WritePeers implements Supplier<Collection<String>> {

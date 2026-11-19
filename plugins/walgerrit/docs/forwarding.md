@@ -1,137 +1,91 @@
 # Write forwarding
 
-Every node accepts writes and forwards a project's writes to the preferred node when it has a
-working link, executing them locally otherwise. Forwarding reduces index barrier waits and manifest
-conflicts; a write is correct on whichever node executes it.
+Every ready node accepts writes. For each project, rendezvous hashing ranks the node and the
+peers it can reach. Nodes that see the same candidates choose the same executor. The shared
+store's conditional writes, index barrier and change keys handle overlapping writers, including
+periods of partial connectivity. Placement has no lease or election.
 
-## Choosing the node
+## Peer membership
 
-Each node ranks the candidates for a project by rendezvous hashing: the SHA-256 of the project
-name and a node name, highest value first. The candidates are the node itself and the peers it has
-a working link to. Nodes that see the same peers agree without talking to each other, and a node
-that leaves moves only the projects it held.
+The plugin supplies its StatefulSet pod name through `HOSTNAME` and supplies addresses from
+`gossipPeer` and `gossipPeerDnsName`. Every node needs a distinct stable name. The daemon
+probes the addresses over private HTTPS. A ready member answers `GET /peerz` with its name.
+The configured address and peer port determine the destination of subsequent connections.
+Hellos carry no dialing instructions. The serving gate also covers the private listener.
 
-A node's name is its `HOSTNAME`, the pod name in a StatefulSet. Names must differ between nodes and
-stay the same across restarts.
+All members use the same dedicated `forwardingSecret`. Gerrit uses its 32 bytes as an Ed25519
+key and wraps the public key in a self-signed certificate in memory. Both sides authenticate to
+each other on the private TLS 1.3 listener using that cluster identity. Pods keep their own
+public-facing SSH host keys. Membership grants the ability to assert any active Gerrit account
+for an eligible project write. Use a different secret for each cluster and for gossip.
 
-A node always executes what a peer handed it. A write therefore crosses at most one link, however
-the nodes' views of each other differ.
+## Request handling
 
-## Peers and links
+The entry node authenticates the user. An identified user's eligible request takes at most one
+hop. The destination checks its own node name, the account's active state and the permissions
+for the operation. Only its private connector accepts a peer identity. The public connector
+rejects peer headers and `/peerz`.
 
-The peers are the hosts of the gossip peer sources, `gossipPeer` and `gossipPeerDnsName`. Once a
-second, a node asks each host for `/peerz` on its own HTTP port. A serving node answers with its
-name and its SSH port; a node that is still catching up answers `503` like it does to everything
-else. The hosts that answer are the candidates, except the one that gives the node's own name.
-
-| Transport | Link | A peer is a candidate while |
-| --- | --- | --- |
-| HTTP | A new connection for each request, to the peer's HTTP port. | It answered the last hello and no request to it has failed since. |
-| SSH | One session for each peer, opened after its first hello and reopened when closed. | It is an HTTP candidate and the session is open. |
-
-The SSH session logs in as `Gerrit Code Review`, Gerrit's peer daemon user, with the node's own
-host keys. The peer accepts a key that is one of its own host keys or is listed in its
-`etc/peer_keys`, and the node accepts the peer's host key under the same rule. See
-[Deployment](#deployment).
-
-## What is handed over
-
-| Request | Project taken from |
+| Entry request | How it executes |
 | --- | --- |
-| SSH `git-receive-pack` | The command's project argument. |
-| HTTP push: `GET .../info/refs?service=git-receive-pack` and `POST .../git-receive-pack` | The path. |
-| REST requests other than `GET` and `HEAD` under `/projects/NAME` | The path. |
-| REST requests other than `GET` and `HEAD` under `/changes/PROJECT~NUMBER` and `/changes/PROJECT~BRANCH~CHANGE-ID` | The change identifier. |
+| SSH `git-receive-pack PROJECT` | A single private HTTPS POST carries the bidirectional Git stream. The destination runs JGit receive-pack, advertises its refs and capabilities, then processes the client's commands and pack. The response carries stdout, stderr and a final exit status. Git push options, side-band and report-status use their native encoding. |
+| Smart HTTP push | The receive-pack advertisement and POST remain normal Git HTTP requests. Each request is authenticated at entry. |
+| REST POST, PUT and DELETE under `/projects/NAME` or `/changes/PROJECT~…` | Eligible JSON or explicitly empty requests go to the preferred project node. Supported conditional, Git, deadline, trace and representation headers travel with the request. The peer establishes a request-scoped identity. |
 
-Everything else is executed where it arrives: fetches, queries and other reads, REST writes that
-name a change by its number or Change-Id alone, `POST /changes/` whose project is in the body, and
-SSH commands other than a push, such as `gerrit review`.
+The relay constructs the peer request from an allowlist. Client credentials, cookies, CSRF
+tokens and proxy address headers stay at entry. SSH uses the address of its client connection.
+HTTP uses the original TCP address on a proxy listener, which generally identifies the ingress.
+The peer preserves that address for the request and Gerrit's remote-peer provider. A peer
+connection has no authenticated client source port.
 
-## Identity and permissions
+Reads, other SSH commands, SSH command-line reviewer/CC options, run-as requests and anonymous
+requests execute at entry. So do REST requests with a query, form or unrecognized media type,
+browser requests with an Origin header, and requests with site-specific headers outside the
+allowlist. Cookie-authenticated REST writes must pass Gerrit's normal CSRF check at entry.
+A site with a custom `httpd.filterClass` executes every write locally. Such a filter can
+consume a token, establish a principal or alter a request in a way the other pod cannot reproduce.
 
-Over HTTP the request reaches the peer unchanged, before the first node has authenticated it. The
-peer authenticates the credentials and checks permissions as it would for a request of its own.
-The first node adds `X-Gerrit-Forwarded-By` with its name, and `X-Forwarded-For` when the request
-has none. The marker grants nothing: a request that carries it is executed where it arrives.
+## Configuration and deployment
 
-Over SSH the first node authenticates the client and runs
-`suexec --as ACCOUNT --from CLIENT -- git-receive-pack ...` on the peer. The peer runs the push as
-that account and checks its permissions itself. A push from a client that is itself impersonating
-another account is executed where it arrives.
-
-## Failures
-
-A write is executed locally after all only when the peer cannot have acted on it. Once the peer may
-have acted, the failure goes to the client and nothing is retried.
-
-| Transport | What happened | Result |
+| Setting | Default | Effect |
 | --- | --- | --- |
-| HTTP | No connection to the peer could be made. | Executed locally. The peer stops being a candidate until its next hello. |
-| HTTP | The peer gave no answer, or `503`, to a push's ref advertisement. | Executed locally. |
-| HTTP | The connection failed after any other request was sent. | `502` with a message that the write may or may not have been applied. |
-| HTTP | The connection failed while the answer was being relayed. | The client's connection is aborted. |
-| SSH | The channel could not be opened, or closed before the peer sent anything. | Executed locally; nothing of the client's had been sent. |
-| SSH | The link broke after the peer's first byte, before any client data was read. | The push fails: nothing was written, retry. |
-| SSH | The link broke after client data was read. | The push fails: it may or may not have been applied, fetch before pushing again. |
+| `walgerrit.forwardWrites` | `true` in the daemon | `false` disables handoff, probing and the private connector. |
+| `walgerrit.forwardingSecret` | unset | Base64 encoding of 32 cryptographically random bytes in `secure.config`. An absent or malformed key leaves writes local. |
+| `walgerrit.forwardingPort` | `9443` | Private TCP port. Configure the same port and HTTP context path on all nodes. |
+| `sshd.enablePeerDaemon` | `false` with a forwarding key, otherwise `true` | Set to `false` in this deployment to disable SSH daemon-account login with host keys and `etc/peer_keys`. Normal user SSH keys still work. |
 
-A peer's own refusal, such as a missing permission, is relayed to the client as the peer gave it.
+Use the existing secure-config delivery mechanism. Permit peer TCP only between this deployment's
+pods. Restrict the public HTTP port to the trusted ingress and restrict the SSH port to the site's
+approved sources. The ingress must replace client-supplied forwarding headers. A membership key
+change takes effect when a pod restarts. During a staggered change the two key groups execute writes
+independently. A cluster with no reachable members continues to serve local writes.
+Peer discovery uses the configured gossip address sources even when UDP gossip is disabled.
 
-## Threads
+## Admission and outcomes
 
-A handed-over request holds a thread on the first node until the peer has answered, and needs a
-thread on the peer. So that two nodes handing writes to each other always keep threads to execute
-them, at most a third of `httpd.maxThreads` relay HTTP requests at a time, and at most half of an
-SSH command pool, interactive or batch, relays pushes. Further writes are executed where they
-arrive.
+Outgoing HTTP handoffs use at most one third of `httpd.maxThreads`. Outgoing SSH handoffs use
+at most half of the corresponding command executor. An entry at its outbound limit runs the
+write locally. The destination admits at most one third of `httpd.maxThreads` peer writes
+across all senders and both protocols. Admission precedes the account lookup and body read.
+Excess requests receive `503` and `Retry-After`. The private listener has a 30-second idle
+timeout. These limits cover relay work. Ordinary public requests, handshakes and the storage
+and authentication systems still need capacity.
 
-## Configuration
-
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `walgerrit.forwardWrites` | `true` | Hand writes to the preferred peer once a peer source is configured. Off, the node executes every write it receives; it still executes what peers hand it. |
-
-Forwarding uses the peer sources of [gossip](gossip.md) and needs no settings of its own. A node
-without a peer source has no peers. `gossipEnabled` does not affect it.
-
-## Deployment
-
-- Nodes must reach each other's HTTP and SSH ports directly, by the addresses the peer source
-  resolves to.
-- The HTTP listener must be plain HTTP: `http`, `proxy-http` or `proxy-https` in
-  `httpd.listenUrl`. Every node must use the same port and context path. With an `https` listener
-  the nodes find no peers.
-- For SSH pushes, every node must trust its peers' host keys. Either all nodes share one set of
-  host keys, or each node's `etc/peer_keys` lists the public host keys of the others, one base64
-  key per line as in the second field of a `.pub` file, for every key type the daemons hold.
-  Without either, the SSH sessions fail to log in, SSH pushes are executed where they arrive, and
-  HTTP forwarding is unaffected.
-- `/peerz` is answered to anyone who can reach the HTTP listener. It discloses the node's name and
-  SSH port.
-
-## Observing
-
-`write_forwarding/requests` counts writes by `transport`, `ssh` or `http`, and `outcome`:
-
-| Outcome | Meaning |
+| Failure | Client outcome |
 | --- | --- |
-| `forwarded` | The peer answered, whether it accepted or refused the write. |
-| `fallback` | Executed locally because the peer could not be reached. |
-| `busy` | Executed locally because the thread limit was reached. |
-| `failed` | The link broke after the peer may have acted. |
+| Connection or TLS authentication fails before a write can have reached the peer | Execute locally. A failed peer leaves the candidate set until its next successful hello. |
+| A smart HTTP advertisement loses its reply or receives a 503 | Advertise locally. |
+| A submitted HTTP mutation loses its reply | Return 502 with an uncertain-outcome message. A failure partway through a response terminates that response. |
+| A native SSH push loses the peer before any output or receives a 503 before its advertisement | Execute locally. The relay has not read any client data. |
+| A native SSH push loses the peer after output begins | Report a failure. If the relay has consumed client input, the write may have landed. |
+| Gerrit refuses the write | Relay the refusal. |
 
-Writes that the node ranks first for itself, or that name no project, are not counted. The log
-reports each change of the peer set, each SSH link that opens or fails, and each fallback and
-failure. On the first node, `httpd_log` records a relayed request without a user and `sshd_log`
-records the push as usual; the peer logs the request with the user, and the SSH command as
-`suexec`.
+After an uncertain result, fetch the target ref or read the change and its messages before
+resubmitting. A deliberate second REST request can create a second effect. A terminating
+pod can lose its final reply.
 
-## Limits
-
-- A stopping node is dropped by its peers when its HTTP listener closes. Writes it is executing for
-  a peer at that moment fail on the peer's client.
-- A node that returns takes its projects back as soon as it answers a hello, while its indexes may
-  still trail the node that held them; the index barrier covers the gap.
-- All pushes to one peer share one SSH session. A session whose peer stops answering is closed by
-  its heartbeat after about half a minute; until then each push to that peer waits up to five
-  seconds for a channel before it is executed locally.
-- Hellos are sent one peer after another, each with a one-second timeout.
+`write_forwarding/requests` has `http` and `ssh` transport labels. Outcomes are
+`forwarded` (including peer refusals), `fallback`, `busy` (entry),
+`inbound_busy` (destination) and `failed`. Peer-set changes and ambiguous HTTP failures
+appear in the daemon log. Supply a request ID or Gerrit trace ID for correlation across
+the hop.
