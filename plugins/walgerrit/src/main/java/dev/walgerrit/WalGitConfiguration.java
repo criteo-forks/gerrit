@@ -69,6 +69,7 @@ record WalGitConfiguration(
     String gossipListenAddress,
     Duration gossipPeerRefreshInterval,
     String gossipSecret,
+    boolean forwardWrites,
     Project.NameKey allProjects,
     Project.NameKey allUsers) {
   /**
@@ -206,6 +207,7 @@ record WalGitConfiguration(
         null,
         DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL,
         null,
+        true,
         Project.nameKey("All-Projects"),
         Project.nameKey("All-Users"));
   }
@@ -221,6 +223,10 @@ record WalGitConfiguration(
    */
   boolean gossipActive() {
     return gossipEnabled && (!gossipPeers.isEmpty() || gossipPeerDnsName != null);
+  }
+
+  boolean forwardingActive() {
+    return forwardWrites && (!gossipPeers.isEmpty() || gossipPeerDnsName != null);
   }
 
   static WalGitConfiguration from(Config config, Path sitePath) {
@@ -274,6 +280,7 @@ record WalGitConfiguration(
             blankToNull(config.getString(SECTION, null, "gossipListenAddress")),
             duration(config, "gossipPeerRefreshInterval", DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL),
             blankToNull(config.getString(SECTION, null, "gossipSecret")),
+            config.getBoolean(SECTION, null, "forwardWrites", true),
             Project.nameKey(
                 Optional.ofNullable(config.getString("gerrit", null, "allProjects"))
                     .orElse("All-Projects")),

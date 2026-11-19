@@ -25,6 +25,7 @@ import com.google.inject.Key;
 import com.google.inject.TypeLiteral;
 import com.google.inject.multibindings.OptionalBinder;
 import com.google.inject.name.Names;
+import java.util.Collection;
 import java.util.Optional;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -49,6 +50,17 @@ public final class WalGitIndexModule extends LifecycleModule {
   static final Key<Supplier<Optional<String>>> SERVING_GATE =
       Key.get(new TypeLiteral<Supplier<Optional<String>>>() {}, Names.named("servingGate"));
 
+  /**
+   * The bindings Gerrit reads to hand a project's writes to one node. The names and types mirror
+   * {@code com.google.gerrit.server.WriteForwarding} in the WalGerrit fork of Gerrit.
+   */
+  static final Key<Supplier<String>> WRITE_FORWARDING_NODE =
+      Key.get(new TypeLiteral<Supplier<String>>() {}, Names.named("writeForwardingNode"));
+
+  static final Key<Supplier<Collection<String>>> WRITE_FORWARDING_PEERS =
+      Key.get(
+          new TypeLiteral<Supplier<Collection<String>>>() {}, Names.named("writeForwardingPeers"));
+
   static final Key<LongSupplier> SEARCH_FRESHNESS =
       Key.get(LongSupplier.class, Names.named("changeIndexSearchGeneration"));
 
@@ -68,6 +80,12 @@ public final class WalGitIndexModule extends LifecycleModule {
         .setBinding()
         .to(IndexBarrier.class);
     OptionalBinder.newOptionalBinder(binder(), SERVING_GATE).setBinding().to(StartupGate.class);
+    OptionalBinder.newOptionalBinder(binder(), WRITE_FORWARDING_NODE)
+        .setBinding()
+        .toInstance(ManifestStore::writerHost);
+    OptionalBinder.newOptionalBinder(binder(), WRITE_FORWARDING_PEERS)
+        .setBinding()
+        .to(WritePeers.class);
     // What this node does travels in the WAL to the other nodes' tailers: the events it fires and
     // the documents it reindexes with no ref update behind them.
     DynamicSet.bind(binder(), EventListener.class).to(WalJournal.class);

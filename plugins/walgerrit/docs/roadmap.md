@@ -16,6 +16,7 @@ still requires tests against the target storage service and configuration.
 | Import | Bare-repository import; optional staging, repack and connectivity checks; ref verification; offline cursor seeding. | [Import](import.md) |
 | Notifications | Best-effort cross-node event forwarding; reindexed documents journaled so every node's index follows. | [Events](events.md) |
 | Peer wake-ups | One UDP hint per publication to every peer; receivers revalidate and replay ahead of the sweep; optional HMAC. | [Gossip](gossip.md) |
+| Write placement | Pushes over SSH and HTTP, and REST writes that name their project, handed to the node preferred for the project; local execution when it cannot be reached. | [Write forwarding](forwarding.md) |
 | Sessions | Optional signed cookies and a shared signing key. | [Web sessions](web-sessions.md) |
 | Packaging | Matched WAR/JAR bundles, checksums, smoke testing and tagged prereleases. | [Deployment bundle](artifact-bundle.md) |
 
@@ -34,6 +35,8 @@ sources and runnable checks. Use results from the exact revision and environment
 - Explicit bounds or distributed protection for writers and readers that outlive reclamation's
   grace period.
 - An atomic ref-rename implementation before exposing that JGit API as a general guarantee.
+- Forwarding for writes that name a change by number or Change-Id alone and for SSH commands other
+  than a push, and a drain that moves a stopping node's projects before it stops.
 
 ## Optional extensions
 
