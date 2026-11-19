@@ -14,6 +14,8 @@
 
 package dev.walgerrit;
 
+import dev.walgerrit.proto.StorageProto.ChangeKeyCheck;
+import dev.walgerrit.proto.StorageProto.ChangeKeyMutation;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackFile;
 import dev.walgerrit.proto.StorageProto.PackRef;
@@ -33,6 +35,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
@@ -192,6 +195,11 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     GroupPublisher.Result result;
     try {
       result = publisher.publish(request);
+    } catch (ChangeKeyDirectory.DecisionChanged conflict) {
+      if (state != null) {
+        state.changeKeyConflict = true;
+      }
+      throw conflict;
     } catch (ManifestConflictException | StaleCompactionInputException conflict) {
       // Refs changed or a compaction replaced a table this transaction folded while uploading.
       // Nothing committed; re-run validation and build a new table against the current stack.
@@ -337,8 +345,11 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     return manifestStore.writeLock();
   }
 
-  void recordRefTransaction(Collection<ReceiveCommand> commands) {
-    RefTransaction.Builder transaction = RefTransaction.newBuilder();
+  void recordRefTransaction(
+      Collection<ReceiveCommand> commands,
+      Map<String, ChangeKeyMutation> mutations,
+      List<ChangeKeyCheck> checks) {
+    RefTransaction.Builder transaction = RefTransaction.newBuilder().addAllChangeKeyChecks(checks);
     for (ReceiveCommand command : commands) {
       RefUpdate.Builder update =
           RefUpdate.newBuilder()
@@ -347,6 +358,10 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
               .setNewObjectId(command.getNewId().name());
       if (command.getNewSymref() != null) {
         update.setNewSymbolicTarget(command.getNewSymref());
+      }
+      ChangeKeyMutation mutation = mutations.get(command.getRefName());
+      if (mutation != null) {
+        update.setChangeKey(mutation);
       }
       transaction.addUpdates(update);
     }
@@ -407,12 +422,18 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     return state != null && state.conflicted;
   }
 
+  boolean changeKeyConflict() {
+    RefTransactionState state = refTransaction.get();
+    return state != null && state.changeKeyConflict;
+  }
+
   private static final class RefTransactionState {
     final long observedRefRevision;
     final long epoch;
     RefTransaction transaction;
     boolean committed;
     boolean conflicted;
+    boolean changeKeyConflict;
 
     RefTransactionState(long observedRefRevision, long epoch) {
       this.observedRefRevision = observedRefRevision;

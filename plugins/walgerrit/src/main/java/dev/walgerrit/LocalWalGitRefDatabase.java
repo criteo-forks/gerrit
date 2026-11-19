@@ -14,7 +14,10 @@
 
 package dev.walgerrit;
 
+import dev.walgerrit.proto.StorageProto.ChangeKeyCheck;
+import dev.walgerrit.proto.StorageProto.ChangeKeyMutation;
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -53,6 +56,15 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   @Override
   public BatchRefUpdate newBatchUpdate() {
     return new WalGitBatchRefUpdate(this, objectDatabase);
+  }
+
+  void guard(BatchRefUpdate batch, List<ChangeKeyCheck> checks, Runnable onConflict) {
+    if (!(batch instanceof WalGitBatchRefUpdate wal) || wal.refDatabase != this) {
+      throw new IllegalStateException(
+          "Change-key lookup and ref update belong to different repositories");
+    }
+    wal.checks = List.copyOf(checks);
+    wal.onKeyConflict = onConflict;
   }
 
   @Override
@@ -162,6 +174,9 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
 
     private final LocalWalGitRefDatabase refDatabase;
     private final LocalWalGitObjectDatabase objectDatabase;
+    private List<ChangeKeyCheck> checks = List.of();
+    private Runnable onKeyConflict;
+    private final Map<String, ChangeKeyMutation> mutations = new HashMap<>();
 
     WalGitBatchRefUpdate(
         LocalWalGitRefDatabase refDatabase,
@@ -194,7 +209,36 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
           // One conditional manifest read, outside every lock, so expected-value checks run
           // against the current global state.
           objectDatabase.revalidateNow();
-          admission = publisher.admit(refNames(pending));
+          Set<String> names = refNames(pending);
+          if (!checks.isEmpty()
+              || ChangeKeyDirectory.complete(objectDatabase.manifestStore().current())) {
+            // GroupPublisher may combine disjoint refs. Two different numeric meta refs can
+            // still change the same logical key. Reserve those names until publication settles.
+            for (ChangeKeyCheck check : checks) {
+              names.add("\0" + check.getKey());
+            }
+            for (ReceiveCommand command : pending) {
+              if (ChangeKeyDirectory.metaId(command.getRefName()) == null) {
+                continue;
+              }
+              ChangeKeyMutation mutation;
+              try {
+                mutation = ChangeKeyDirectory.classify(walk, command);
+              } catch (ChangeKeyDirectory.Unclassified unclassified) {
+                // Leave the delta absent: publication clears coverage, or rejects a guarded batch.
+                mutations.remove(command.getRefName());
+                continue;
+              }
+              mutations.put(command.getRefName(), mutation);
+              if (!mutation.getBefore().isEmpty()) {
+                names.add("\0" + mutation.getBefore());
+              }
+              if (!mutation.getAfter().isEmpty()) {
+                names.add("\0" + mutation.getAfter());
+              }
+            }
+          }
+          admission = publisher.admit(names);
           nodeLock.lock();
           try {
             objectDatabase.beginRefTransaction();
@@ -219,6 +263,16 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
           abort(pending);
           return;
         } finally {
+          if (onKeyConflict != null && objectDatabase.changeKeyConflict()) {
+            // Gerrit retries any exception caused by a JGit lock failure. This batch's key
+            // precondition failed and the caller must make a new selection.
+            for (ReceiveCommand command : pending) {
+              command.setResult(
+                  ReceiveCommand.Result.REJECTED_OTHER_REASON,
+                  "Change-Id membership changed before ref publication");
+            }
+            onKeyConflict.run();
+          }
           objectDatabase.endRefTransaction();
           if (admission != null) {
             admission.release();
@@ -274,7 +328,7 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
     @Override
     protected void applyUpdates(List<Ref> newRefs, List<ReceiveCommand> pending)
         throws IOException {
-      objectDatabase.recordRefTransaction(pending);
+      objectDatabase.recordRefTransaction(pending, mutations, checks);
       try {
         super.applyUpdates(newRefs, pending);
       } catch (IOException | RuntimeException exception) {

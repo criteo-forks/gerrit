@@ -154,7 +154,7 @@ class ChangeMergedReconstruction {
         || update.newId().equals(update.oldId())) {
       return null;
     }
-    return Change.Id.fromRef(update.name());
+    return ChangeRefIds.fromRef(update.name());
   }
 
   /** Whether a NoteDb commit that {@code update} added sets the change's status to merged. */

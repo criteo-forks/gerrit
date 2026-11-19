@@ -55,6 +55,7 @@ import com.google.gerrit.server.git.GroupCollector;
 import com.google.gerrit.server.git.MergeUtil;
 import com.google.gerrit.server.git.MergeUtilFactory;
 import com.google.gerrit.server.index.change.ChangeIndexFreshness;
+import com.google.gerrit.server.index.change.ChangeKeyLookup;
 import com.google.gerrit.server.notedb.ChangeNotes;
 import com.google.gerrit.server.notedb.ReviewerStateInternal;
 import com.google.gerrit.server.project.InvalidChangeOperationException;
@@ -109,6 +110,7 @@ public class CherryPickChange {
   private final Sequences seq;
   private final Provider<InternalChangeQuery> queryProvider;
   private final ChangeIndexFreshness changeIndexFreshness;
+  private final ChangeKeyLookup changeKeyLookup;
   private final GitRepositoryManager gitManager;
   private final ZoneId serverZoneId;
   private final Provider<IdentifiedUser> user;
@@ -128,6 +130,7 @@ public class CherryPickChange {
       Sequences seq,
       Provider<InternalChangeQuery> queryProvider,
       ChangeIndexFreshness changeIndexFreshness,
+      ChangeKeyLookup changeKeyLookup,
       @GerritServerConfig Config cfg,
       @GerritPersonIdent PersonIdent myIdent,
       GitRepositoryManager gitManager,
@@ -144,6 +147,7 @@ public class CherryPickChange {
     this.seq = seq;
     this.queryProvider = queryProvider;
     this.changeIndexFreshness = changeIndexFreshness;
+    this.changeKeyLookup = changeKeyLookup;
     this.gitManager = gitManager;
     this.serverZoneId = myIdent.getZoneId();
     this.user = user;
@@ -324,6 +328,12 @@ public class CherryPickChange {
             String.format("Branch %s does not exist.", dest.branch()));
       }
 
+      Optional<ChangeKeyLookup.Snapshot> keys = changeKeyLookup.open(git);
+      boolean baseUsesIndex =
+          input.base != null && (verifiedBaseCommit.isEmpty() || baseChange == null);
+      if (baseUsesIndex) {
+        changeIndexFreshness.requireFresh(project);
+      }
       RevCommit baseCommit;
       if (verifiedBaseCommit.isPresent()) {
         baseCommit = verifiedBaseCommit.get();
@@ -351,9 +361,13 @@ public class CherryPickChange {
 
       ChangeData destChange = null;
       if (destChangeId != null) {
+        if (keys.isEmpty() && !baseUsesIndex) {
+          changeIndexFreshness.requireFresh(project);
+        }
         // If "idForNewChange" is not null we must fail, since we are not expecting an already
         // existing change.
-        destChange = getDestChangeWithVerification(destChangeId, dest, idForNewChange != null);
+        destChange =
+            getDestChangeWithVerification(keys, destChangeId, dest, idForNewChange != null);
       }
 
       if (changeIdForNewChange != null) {
@@ -454,6 +468,11 @@ public class CherryPickChange {
                     input,
                     workInProgress);
           } else {
+            if (keys.isPresent()) {
+              keys.get()
+                  .checkInsertedCommit(
+                      dest.branch(), revWalk, cherryPickCommit, Optional.ofNullable(destChangeId));
+            }
             // Change key not found on destination branch. We can create a new
             // change.
             changeId =
@@ -472,7 +491,7 @@ public class CherryPickChange {
                     idForNewChange,
                     workInProgress);
           }
-          bu.execute();
+          ChangeKeyLookup.execute(bu, keys);
           return Result.create(changeId, cherryPickCommit.getFilesWithGitConflicts());
         }
       }
@@ -669,11 +688,16 @@ public class CherryPickChange {
    */
   @Nullable
   private ChangeData getDestChangeWithVerification(
-      String destChangeId, BranchNameKey destBranch, boolean verifyIsMissing)
-      throws InvalidChangeOperationException {
-    changeIndexFreshness.requireFresh(destBranch.project());
+      Optional<ChangeKeyLookup.Snapshot> keys,
+      String destChangeId,
+      BranchNameKey destBranch,
+      boolean verifyIsMissing)
+      throws InvalidChangeOperationException, ChangeKeyLookup.Conflict {
+    Change.Key key = Change.key(destChangeId);
     List<ChangeData> destChanges =
-        queryProvider.get().setLimit(2).byBranchKey(destBranch, Change.key(destChangeId));
+        keys.isPresent()
+            ? keys.get().changes(destBranch, key, 2)
+            : queryProvider.get().setLimit(2).byBranchKey(destBranch, key);
     if (destChanges.size() > 1) {
       throw new InvalidChangeOperationException(
           "Several changes with key "

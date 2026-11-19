@@ -3,7 +3,7 @@
 # backend instead of the in-memory repository manager (see WalGerritTestSupport).
 #
 # Usage: plugins/walgerrit/scripts/acceptance-tests.sh [bazel test targets...]
-#   Defaults to every acceptance test. Results are summarised from bazel-testlogs at the end.
+#   Defaults to every acceptance test. Bazel reports results for the current invocation.
 # Environment:
 #   BAZEL                    bazel or bazelisk launcher (default: bazelisk via npx)
 #   WALGERRIT_ACCEPTANCE_TMP tmpfs-backed scratch directory for the jar and repositories
@@ -31,7 +31,10 @@ mkdir -p "$scratch/store"
 
 targets=("$@")
 if [[ ${#targets[@]} -eq 0 ]]; then
-  targets=("//javatests/com/google/gerrit/acceptance/...")
+  targets=(
+    "//javatests/com/google/gerrit/acceptance/..."
+    "//javatests/com/google/gerrit/acceptance:WalGerritChangeKeyRaceIT"
+  )
 fi
 
 echo "== building the WalGerrit library"
@@ -39,35 +42,11 @@ echo "== building the WalGerrit library"
 cp "$plugin_root"/target/walgerrit-*-SNAPSHOT.jar "$scratch/walgerrit.jar"
 
 echo "== running ${targets[*]} on the WalGerrit backend (store: $scratch/store)"
-set +e
+# The runtime jar is supplied outside the Bazel dependency graph.
 # shellcheck disable=SC2086
-$bazel test --config=java21 --keep_going --test_output=errors \
+exec $bazel test --config=java21 --keep_going --nocache_test_results --test_output=errors \
+  --test_summary=detailed \
   --define=acceptance_heap=large \
   --test_env=GERRIT_WALGERRIT_JAR="$scratch/walgerrit.jar" \
   --test_env=GERRIT_WALGERRIT_STORAGE="$scratch/store" \
   ${BAZEL_TEST_FLAGS:-} "${targets[@]}"
-rc=$?
-set -e
-
-echo
-echo "== per-class results (failures and errors only)"
-python3 - "$repo_root/bazel-testlogs/javatests/com/google/gerrit/acceptance" <<'PY'
-import sys, pathlib, xml.etree.ElementTree as ET
-root = pathlib.Path(sys.argv[1])
-total = failed = 0
-for report in sorted(root.rglob("test.xml")):
-    try:
-        tree = ET.parse(report)
-    except ET.ParseError:
-        continue
-    for suite in tree.iter("testsuite"):
-        for case in suite.iter("testcase"):
-            total += 1
-            problem = case.find("failure") or case.find("error")
-            if problem is not None:
-                failed += 1
-                message = (problem.get("message") or "").splitlines()[0][:160]
-                print(f"  {case.get('classname')}.{case.get('name')}: {message}")
-print(f"== {total} test cases, {failed} failed")
-PY
-exit $rc

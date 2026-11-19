@@ -20,6 +20,7 @@ import com.google.common.base.Strings;
 import com.google.inject.Module;
 import com.google.inject.util.Modules;
 import java.io.IOException;
+import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
@@ -70,7 +71,21 @@ final class WalGerritTestSupport {
     return Modules.override(databaseModule).with(walgerrit);
   }
 
-  private static synchronized Class<? extends Module> moduleClass() throws Exception {
+  /** Loads the production system module with the same class loader as the repository backend. */
+  static Module indexModule() {
+    checkArgument(enabled(), "Run this test with plugins/walgerrit/scripts/acceptance-tests.sh");
+    try {
+      return Class.forName("dev.walgerrit.WalGitIndexModule", true, moduleClass().getClassLoader())
+          .asSubclass(Module.class)
+          .getDeclaredConstructor()
+          .newInstance();
+    } catch (ReflectiveOperationException | MalformedURLException e) {
+      throw new IllegalStateException("Cannot load the WalGerrit index module", e);
+    }
+  }
+
+  private static synchronized Class<? extends Module> moduleClass()
+      throws MalformedURLException, ClassNotFoundException {
     if (moduleClass == null) {
       URLClassLoader loader =
           new URLClassLoader(

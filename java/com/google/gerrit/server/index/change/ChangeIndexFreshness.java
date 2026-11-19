@@ -28,8 +28,9 @@ import java.util.function.Function;
 import java.util.function.LongSupplier;
 
 /**
- * Requires this node's change index to be up to date before a decision that is wrong on a stale
- * one: whether a pushed Change-Id names an existing change, and which changes a topic holds.
+ * Requires this node's change index to be up to date for indexed write decisions, including
+ * by-commit lookups and whole-topic submission. {@link ChangeKeyLookup} handles exact
+ * branch/Change-Id decisions for storage backends that provide a publication guard.
  *
  * <p>On a single server the request that writes a change indexes it before it answers, so the index
  * holds every change a client was told about. Where several nodes share the repositories and each
@@ -64,10 +65,12 @@ public class ChangeIndexFreshness {
   public static final Key<LongSupplier> SEARCH_KEY =
       Key.get(LongSupplier.class, Names.named(SEARCH));
 
-  /** Declares the barrier binding with a default that takes the index to be fresh. */
+  /** Binds the storage-backed lookup and the index freshness checks used by write decisions. */
   public static class ChangeIndexFreshnessModule extends AbstractModule {
     @Override
     protected void configure() {
+      // The server injector can see the storage hook installed in the database injector.
+      bind(ChangeKeyLookup.StorageBackend.class).asEagerSingleton();
       OptionalBinder.newOptionalBinder(binder(), SEARCH_KEY).setDefault().toInstance(() -> 0L);
       OptionalBinder.newOptionalBinder(binder(), BARRIER_KEY)
           .setDefault()

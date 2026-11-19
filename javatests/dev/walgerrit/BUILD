@@ -5,7 +5,10 @@ load("//javatests/com/google/gerrit/acceptance:tests.bzl", "acceptance_tests")
 java_library(
     name = "change_merged_reconstruction",
     testonly = True,
-    srcs = ["//plugins/walgerrit:src/main/java/dev/walgerrit/ChangeMergedReconstruction.java"],
+    srcs = [
+        "//plugins/walgerrit:src/main/java/dev/walgerrit/ChangeMergedReconstruction.java",
+        "//plugins/walgerrit:src/main/java/dev/walgerrit/ChangeRefIds.java",
+    ],
     deps = [
         "//java/com/google/gerrit/common:annotations",
         "//java/com/google/gerrit/entities",

@@ -159,6 +159,7 @@ import com.google.gerrit.server.git.validators.ValidationMessage;
 import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.index.change.ChangeIndexNotFreshException;
 import com.google.gerrit.server.index.change.ChangeIndexer;
+import com.google.gerrit.server.index.change.ChangeKeyLookup;
 import com.google.gerrit.server.logging.Metadata;
 import com.google.gerrit.server.logging.PerformanceLogContext;
 import com.google.gerrit.server.logging.PerformanceLogger;
@@ -400,6 +401,9 @@ class ReceiveCommits {
   private final ChangeEditUtil editUtil;
   private final PluginSetContext<ExceptionHook> exceptionHooks;
   private final ChangeIndexFreshness changeIndexFreshness;
+  private final ChangeKeyLookup changeKeyLookup;
+  private Optional<ChangeKeyLookup.Snapshot> changeKeys = Optional.empty();
+  private boolean projectIndexChecked;
   private final ChangeIndexer indexer;
   private final ChangeInserter.Factory changeInserterFactory;
   private final ChangeNotes.Factory notesFactory;
@@ -472,7 +476,7 @@ class ReceiveCommits {
   private final LinkedHashMap<ReceiveCommand, RejectionReason> rejectionReasons;
 
   private final ListMultimap<String, String> pushOptions;
-  private final ReceivePackRefCache receivePackRefCache;
+  private ReceivePackRefCache receivePackRefCache;
   private final Map<Change.Id, ReplaceRequest> replaceByChange;
 
   // Other settings populated during processing.
@@ -504,6 +508,7 @@ class ReceiveCommits {
       ChangeEditUtil editUtil,
       PluginSetContext<ExceptionHook> exceptionHooks,
       ChangeIndexFreshness changeIndexFreshness,
+      ChangeKeyLookup changeKeyLookup,
       ChangeIndexer indexer,
       ChangeInserter.Factory changeInserterFactory,
       ChangeNotes.Factory notesFactory,
@@ -579,6 +584,7 @@ class ReceiveCommits {
     this.setTopicFactory = setTopicFactory;
     this.serviceUserClassifier = serviceUserClassifier;
     this.changeIndexFreshness = changeIndexFreshness;
+    this.changeKeyLookup = changeKeyLookup;
     this.indexer = indexer;
     this.initializers = initializers;
     this.mergeOpProvider = mergeOpProvider;
@@ -657,6 +663,31 @@ class ReceiveCommits {
             : ReceivePackRefCache.noCache(receivePack.getRepository().getRefDatabase());
     this.transitionalPluginOptions =
         ImmutableList.copyOf(config.getStringList("plugins", null, "transitionalPushOptions"));
+  }
+
+  private void requireProjectIndex() {
+    if (!projectIndexChecked) {
+      changeIndexFreshness.requireFresh(project.getNameKey());
+      projectIndexChecked = true;
+    }
+  }
+
+  private void openChangeKeySnapshot() {
+    changeKeys = changeKeyLookup.open(repo);
+    if (changeKeys.isPresent()) {
+      // Peer publication can postdate ref advertisement. Use the same permission-aware
+      // delegate as receive.enableInMemoryRefCache=false for the remaining ref lookups.
+      receivePackRefCache =
+          ReceivePackRefCache.noCache(receivePack.getRepository().getRefDatabase());
+    }
+  }
+
+  private static final class RetryChangeSelection extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+
+    RetryChangeSelection(ChangeKeyLookup.Conflict conflict) {
+      super(conflict);
+    }
   }
 
   void init() {
@@ -871,11 +902,33 @@ class ReceiveCommits {
       return;
     }
 
-    // Whether a commit is a new change or a new patch set, and which changes a direct push closes,
-    // is decided on the change index. Nothing has been written yet, so a push that cannot have an
-    // up-to-date index is rejected whole and can be repeated.
+    List<ReceiveCommand> magicCommands = new ArrayList<>();
+    List<ReceiveCommand> regularCommands = new ArrayList<>();
+    for (ReceiveCommand cmd : commands) {
+      if (MagicBranch.isMagicBranch(cmd.getRefName())) {
+        magicCommands.add(cmd);
+      } else {
+        regularCommands.add(cmd);
+      }
+    }
+    if (!magicCommands.isEmpty() && !regularCommands.isEmpty()) {
+      rejectRemaining(
+          commands,
+          RejectionReason.create(
+              MetricBucket.CANNOT_COMBINE_NORMAL_AND_MAGIC_PUSHES,
+              "cannot combine normal pushes and magic pushes"));
+      return;
+    }
+
+    // Direct pushes look up changes to close in Lucene. Review pushes open the storage
+    // snapshot before selecting changes. A commit without a key still needs Lucene.
     try {
-      changeIndexFreshness.requireFresh(project.getNameKey());
+      if (!magicCommands.isEmpty()) {
+        openChangeKeySnapshot();
+      }
+      if (changeKeys.isEmpty()) {
+        requireProjectIndex();
+      }
     } catch (ChangeIndexNotFreshException e) {
       logger.atWarning().log("Rejecting push to %s: %s", project.getName(), e.getMessage());
       rejectRemaining(
@@ -887,26 +940,6 @@ class ReceiveCommits {
         ObjectReader reader = ins.newReader();
         RevWalk globalRevWalk = new RevWalk(reader)) {
       globalRevWalk.setRetainBody(false);
-
-      List<ReceiveCommand> magicCommands = new ArrayList<>();
-      List<ReceiveCommand> regularCommands = new ArrayList<>();
-
-      for (ReceiveCommand cmd : commands) {
-        if (MagicBranch.isMagicBranch(cmd.getRefName())) {
-          magicCommands.add(cmd);
-        } else {
-          regularCommands.add(cmd);
-        }
-      }
-
-      if (!magicCommands.isEmpty() && !regularCommands.isEmpty()) {
-        rejectRemaining(
-            commands,
-            RejectionReason.create(
-                MetricBucket.CANNOT_COMBINE_NORMAL_AND_MAGIC_PUSHES,
-                "cannot combine normal pushes and magic pushes"));
-        return;
-      }
 
       try {
         if (!magicCommands.isEmpty()) {
@@ -949,22 +982,49 @@ class ReceiveCommits {
       Task newProgress = progress.beginSubTask("new", UNKNOWN);
       Task replaceProgress = progress.beginSubTask("updated", UNKNOWN);
 
-      ImmutableList<CreateRequest> newChanges = ImmutableList.of();
+      ImmutableList<CreateRequest> newChanges;
       try {
-        if (magicBranch != null && magicBranch.cmd.getResult() == NOT_ATTEMPTED) {
+        List<ValidationMessage> beforeSelection =
+            changeKeys.isPresent() ? List.copyOf(messages) : List.of();
+        for (int attempt = 0; ; attempt++) {
           try {
             newChanges =
-                selectNewAndReplacedChangesFromMagicBranch(globalRevWalk, ins, newProgress);
-          } catch (IOException e) {
-            throw new StorageException("Failed to select new changes in " + project.getName(), e);
+                magicBranch != null && magicBranch.cmd.getResult() == NOT_ATTEMPTED
+                    ? selectNewAndReplacedChangesFromMagicBranch(globalRevWalk, ins, newProgress)
+                    : ImmutableList.of();
+            warnAboutMissingChangeId(globalRevWalk, newChanges);
+            preparePatchSetsForReplace(globalRevWalk, newChanges);
+            insertChangesAndPatchSets(globalRevWalk, ins, newChanges, replaceProgress);
+            break;
+          } catch (RetryChangeSelection changed) {
+            logger.atFine().withCause(changed).log("Change-Id membership changed in %s", project);
+            if (attempt != 0) {
+              rejectRemaining(
+                  commands,
+                  RejectionReason.create(
+                      MetricBucket.CONFLICT, "Change-Id changed during the push. Please retry."));
+              return;
+            }
+            // The guarded ref transaction never published. Allocated numeric IDs may have gaps.
+            replaceByChange.clear();
+            validationInfosByCommit.clear();
+            messages.clear();
+            messages.addAll(beforeSelection);
+            projectIndexChecked = false;
+            openChangeKeySnapshot();
+            if (changeKeys.isEmpty()) {
+              requireProjectIndex();
+            }
           }
         }
-
-        // Commit validation has already happened, so any changes without Change-Id are for the
-        // deprecated feature.
-        warnAboutMissingChangeId(globalRevWalk, newChanges);
-        preparePatchSetsForReplace(globalRevWalk, newChanges);
-        insertChangesAndPatchSets(globalRevWalk, ins, newChanges, replaceProgress);
+      } catch (ChangeIndexNotFreshException e) {
+        logger.atWarning().withCause(e).log(
+            "Rejecting push to %s: %s", project.getName(), e.getMessage());
+        rejectRemaining(
+            commands, RejectionReason.create(MetricBucket.CHANGE_INDEX_NOT_FRESH, e.getMessage()));
+        return;
+      } catch (IOException e) {
+        throw new StorageException("Failed to select new changes in " + project.getName(), e);
       } finally {
         newProgress.end();
         replaceProgress.end();
@@ -1337,7 +1397,9 @@ class ReceiveCommits {
 
       logger.atFine().log("Executing batch");
       try {
-        bu.execute();
+        ChangeKeyLookup.execute(bu, changeKeys);
+      } catch (ChangeKeyLookup.Conflict conflict) {
+        throw new RetryChangeSelection(conflict);
       } catch (UpdateException e) {
         throw asRestApiException(e);
       }
@@ -3092,6 +3154,14 @@ class ReceiveCommits {
 
   private ChangeLookup lookupByChangeKey(RevCommit c, Change.Key key) {
     try (TraceTimer traceTimer = newTimer("lookupByChangeKey")) {
+      if (changeKeys.isPresent()) {
+        try {
+          return new ChangeLookup(
+              c, key, changeKeys.get().changes(magicBranch.dest, key, Integer.MAX_VALUE));
+        } catch (ChangeKeyLookup.Conflict moved) {
+          throw new RetryChangeSelection(moved);
+        }
+      }
       List<ChangeData> byBranchKey =
           retryHelper
               .changeIndexQuery(
@@ -3107,6 +3177,7 @@ class ReceiveCommits {
 
   private ChangeLookup lookupByCommit(RevCommit c) {
     try (TraceTimer traceTimer = newTimer("lookupByCommit")) {
+      requireProjectIndex();
       List<ChangeData> byBranchCommit =
           retryHelper
               .changeIndexQuery(

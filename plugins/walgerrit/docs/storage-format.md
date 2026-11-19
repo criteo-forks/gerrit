@@ -51,6 +51,27 @@ Manifests have a dedicated prefix. A paginated listing discovers repository ids 
 versions without enumerating packs or logs. On S3, the listed version is the ETag. An unchanged
 version lets the index tailer skip an already indexed repository.
 
+## Branch and Change-Id directory
+
+The `change_keys` manifest field records a covered `ref_revision` and up to 256
+pointers to immutable pages in the committed WAL. Each page maps a full destination branch and
+exact Change-Id to sorted numeric change IDs. A missing field requires a seed before a writer can
+use the directory. An absent key is authoritative only when the directory covers the current
+ref revision. A missing referenced page fails the lookup.
+
+On a classified meta-ref update, the WAL entry carries its membership change and the full
+contents of each modified page. The manifest CAS publishes the page pointers together with the
+new ref inventory. Compaction preserves memberships. A replay of an unchanged identity, such
+as a comment or vote, leaves the pages in place. WalGerrit retains a bounded per-node cache of
+immutable pages. Logical checks and changes are part of the same-site group publisher's
+admission, so two batches touching one key cannot enter the same group independently.
+
+Seeding reads a snapshot of all meta refs, reconciles intervening WAL entries and publishes
+the directory conditional on that ref revision. A raw reftable import, unclassified meta write or
+legacy ref revision without corresponding directory coverage requires a new scan. One node
+builds at most one project directory at a time. The initial WAL record contains every populated
+page, and loading a cold page reads its containing log entry.
+
 ## The log chain
 
 Each entry names its sequence, unique transaction ID and predecessor's transaction ID. Starting

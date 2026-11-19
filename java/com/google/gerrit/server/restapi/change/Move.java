@@ -50,6 +50,7 @@ import com.google.gerrit.server.change.ChangeResource;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.index.change.ChangeIndexFreshness;
+import com.google.gerrit.server.index.change.ChangeKeyLookup;
 import com.google.gerrit.server.notedb.ChangeUpdate;
 import com.google.gerrit.server.permissions.GlobalPermission;
 import com.google.gerrit.server.permissions.PermissionBackend;
@@ -82,6 +83,7 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
   private final GitRepositoryManager repoManager;
   private final Provider<InternalChangeQuery> queryProvider;
   private final ChangeIndexFreshness changeIndexFreshness;
+  private final ChangeKeyLookup changeKeyLookup;
   private final ChangeMessagesUtil cmUtil;
   private final PatchSetUtil psUtil;
   private final ApprovalsUtil approvalsUtil;
@@ -96,6 +98,7 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
       GitRepositoryManager repoManager,
       Provider<InternalChangeQuery> queryProvider,
       ChangeIndexFreshness changeIndexFreshness,
+      ChangeKeyLookup changeKeyLookup,
       ChangeMessagesUtil cmUtil,
       PatchSetUtil psUtil,
       ApprovalsUtil approvalsUtil,
@@ -107,6 +110,7 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
     this.repoManager = repoManager;
     this.queryProvider = queryProvider;
     this.changeIndexFreshness = changeIndexFreshness;
+    this.changeKeyLookup = changeKeyLookup;
     this.cmUtil = cmUtil;
     this.psUtil = psUtil;
     this.approvalsUtil = approvalsUtil;
@@ -161,28 +165,34 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
     }
     projectCache.get(project).orElseThrow(illegalState(project)).checkStatePermitsWrite();
 
-    // The update below refuses a destination that already has a change with this Change-Id; it
-    // looks that up in the change index.
-    changeIndexFreshness.requireFresh(project);
-
-    Op op = new Op(input);
-    try (RefUpdateContext ctx = RefUpdateContext.open(CHANGE_MODIFICATION)) {
-      try (BatchUpdate u = updateFactory.create(project, caller, TimeUtil.now())) {
-        u.addOp(change.getId(), op);
-        u.execute();
+    try (RefUpdateContext ctx = RefUpdateContext.open(CHANGE_MODIFICATION);
+        Repository repo = repoManager.openRepository(project);
+        var inserter = repo.newObjectInserter();
+        var reader = inserter.newReader();
+        RevWalk rw = new RevWalk(reader);
+        BatchUpdate u = updateFactory.create(project, caller, TimeUtil.now())) {
+      u.setRepository(repo, rw, inserter);
+      var keys = changeKeyLookup.open(repo);
+      if (keys.isEmpty()) {
+        changeIndexFreshness.requireFresh(project);
       }
+      Op op = new Op(input, keys);
+      u.addOp(change.getId(), op);
+      ChangeKeyLookup.execute(u, keys);
+      return Response.ok(json.noOptions().format(op.getChange()));
     }
-    return Response.ok(json.noOptions().format(op.getChange()));
   }
 
   private class Op implements BatchUpdateOp {
     private final MoveInput input;
+    private final Optional<ChangeKeyLookup.Snapshot> keys;
 
     private Change change;
     private BranchNameKey newDestKey;
 
-    Op(MoveInput input) {
+    Op(MoveInput input, Optional<ChangeKeyLookup.Snapshot> keys) {
       this.input = input;
+      this.keys = keys;
     }
 
     @Nullable
@@ -205,27 +215,23 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
       }
 
       final PatchSet.Id patchSetId = change.currentPatchSetId();
-      try (Repository repo = repoManager.openRepository(projectKey);
-          RevWalk revWalk = new RevWalk(repo)) {
-        RevCommit currPatchsetRevCommit =
-            revWalk.parseCommit(psUtil.current(ctx.getNotes()).commitId());
-
-        ObjectId refId = repo.resolve(input.destinationBranch);
-        // Check if destination ref exists in project repo
-        if (refId == null) {
-          throw new ResourceConflictException(
-              "Destination " + input.destinationBranch + " not found in the project");
-        }
-        RevCommit refCommit = revWalk.parseCommit(refId);
-        if (revWalk.isMergedInto(currPatchsetRevCommit, refCommit)) {
-          throw new ResourceConflictException(
-              "Current patchset revision is reachable from tip of " + input.destinationBranch);
-        }
+      RevWalk revWalk = ctx.getRevWalk();
+      RevCommit currPatchsetRevCommit =
+          revWalk.parseCommit(psUtil.current(ctx.getNotes()).commitId());
+      ObjectId refId =
+          ctx.getRepoView()
+              .getRef(input.destinationBranch)
+              .orElseThrow(
+                  () ->
+                      new ResourceConflictException(
+                          "Destination " + input.destinationBranch + " not found in the project"));
+      if (revWalk.isMergedInto(currPatchsetRevCommit, revWalk.parseCommit(refId))) {
+        throw new ResourceConflictException(
+            "Current patchset revision is reachable from tip of " + input.destinationBranch);
       }
 
       Change.Key changeKey = change.getKey();
-      if (!asChanges(queryProvider.get().setLimit(1).byBranchKey(newDestKey, changeKey))
-          .isEmpty()) {
+      if (destinationHasKey(newDestKey, changeKey)) {
         throw new ResourceConflictException(
             "Destination "
                 + newDestKey.shortName()
@@ -258,6 +264,21 @@ public class Move implements RestModifyView<ChangeResource, MoveInput>, UiAction
       cmUtil.setChangeMessage(ctx, msgBuf.toString(), ChangeMessagesUtil.TAG_MOVE);
 
       return true;
+    }
+
+    private boolean destinationHasKey(BranchNameKey branch, Change.Key key) {
+      if (keys.isPresent()) {
+        String id = key.get();
+        if (!keys.get().members(branch.branch(), id).isEmpty()) {
+          return true;
+        }
+        if (id.startsWith("I") && ObjectId.isId(id.substring(1))) {
+          return false;
+        }
+        // Short keys are prefixes in Gerrit's byBranchKey query.
+        changeIndexFreshness.requireFresh(branch.project());
+      }
+      return !asChanges(queryProvider.get().setLimit(1).byBranchKey(branch, key)).isEmpty();
     }
 
     /**

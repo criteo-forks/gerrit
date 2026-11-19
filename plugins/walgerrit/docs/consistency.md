@@ -164,11 +164,12 @@ index writes. Replaying an entry after a crash is safe because index replacement
 are idempotent. This requires Lucene and `commitWithin = 0` for accounts, both change sub-indexes,
 groups and projects.
 
-A request that looks a change up by Change-Id first waits, within a bound, until the index holds
-what other nodes published to its repository before the request arrived, and a submission that
-reaches a topic waits likewise for every repository. A request whose node cannot get there is
-rejected rather than served from the index as it is. Requests that overlap in time are not
-ordered. See [Index events](index-events.md#change-lookups-wait-for-other-nodes-writes).
+Review pushes, REST creates, moves and cherry-picks look up the branch and Change-Id in the
+repository manifest. The same publication that updates the refs validates the membership read by
+the request. A request that cannot obtain a covered snapshot within its timeout fails before
+publishing refs. Writes that need an indexed project lookup still wait for that node to replay
+earlier peer writes to the project. Whole-topic submission waits for replay across repositories.
+Search results on each node follow its own replay. See [Index events](index-events.md#change-lookups-wait-for-other-nodes-writes).
 
 A malformed payload, log gap or index failure stops progress for that repository. A stale or
 divergent cursor can trigger a full index rebuild. A starting node answers no request until it

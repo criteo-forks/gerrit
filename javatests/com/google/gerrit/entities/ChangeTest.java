@@ -32,6 +32,19 @@ public class ChangeTest {
   }
 
   @Test
+  public void refIdsMustFitInAnInteger() {
+    assertRef(Integer.MAX_VALUE, "refs/changes/47/2147483647/2147483647");
+    assertRef(Integer.MAX_VALUE, "refs/changes/47/2147483647/meta");
+    assertNotRef("refs/changes/48/2147483648/meta");
+    assertNotRef("refs/changes/48/2147483648/1");
+    assertNotRef("refs/changes/01/1/2147483648");
+    assertNotRef("refs/users/34/1234/edit-2147483648/1");
+    assertAllUsersRef(Integer.MAX_VALUE, "refs/draft-comments/47/2147483647/1");
+    assertNotAllUsersRef("refs/draft-comments/48/2147483648/1");
+    assertNotAllUsersRef("refs/starred-changes/48/2147483648/1");
+  }
+
+  @Test
   public void parsePatchSetRefNames() {
     assertRef(1, "refs/changes/01/1/1");
     assertRef(1234, "refs/changes/34/1234/56");

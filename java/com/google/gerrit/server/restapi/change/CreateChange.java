@@ -74,6 +74,7 @@ import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.git.MergeUtil;
 import com.google.gerrit.server.git.MergeUtilFactory;
 import com.google.gerrit.server.index.change.ChangeIndexFreshness;
+import com.google.gerrit.server.index.change.ChangeKeyLookup;
 import com.google.gerrit.server.notedb.ChangeNotes;
 import com.google.gerrit.server.patch.ApplyPatchUtil;
 import com.google.gerrit.server.permissions.ChangePermission;
@@ -142,6 +143,7 @@ public class CreateChange
   private final ChangeFinder changeFinder;
   private final Provider<InternalChangeQuery> queryProvider;
   private final ChangeIndexFreshness changeIndexFreshness;
+  private final ChangeKeyLookup changeKeyLookup;
   private final PatchSetUtil psUtil;
   private final MergeUtilFactory mergeUtilFactory;
   private final SubmitType submitType;
@@ -166,6 +168,7 @@ public class CreateChange
       ChangeFinder changeFinder,
       Provider<InternalChangeQuery> queryProvider,
       ChangeIndexFreshness changeIndexFreshness,
+      ChangeKeyLookup changeKeyLookup,
       PatchSetUtil psUtil,
       @GerritServerConfig Config config,
       MergeUtilFactory mergeUtilFactory,
@@ -185,6 +188,7 @@ public class CreateChange
     this.changeFinder = changeFinder;
     this.queryProvider = queryProvider;
     this.changeIndexFreshness = changeIndexFreshness;
+    this.changeKeyLookup = changeKeyLookup;
     this.psUtil = psUtil;
     this.submitType = config.getEnum("project", null, "submitType", SubmitType.MERGE_IF_NECESSARY);
     this.disablePrivateChanges = config.getBoolean("change", null, "disablePrivateChanges", false);
@@ -317,21 +321,6 @@ public class CreateChange
     }
     input.subject = subject;
 
-    Optional<String> changeId = CommitMessageUtil.getChangeIdFromCommitMessageFooter(input.subject);
-    if (changeId.isPresent()) {
-      changeIndexFreshness.requireFresh(Project.nameKey(input.project));
-      if (!queryProvider
-          .get()
-          .setLimit(1)
-          .byBranchKey(
-              BranchNameKey.create(input.project, input.branch), Change.key(changeId.get()))
-          .isEmpty()) {
-        throw new ResourceConflictException(
-            String.format(
-                "A change with Change-Id %s already exists for this branch.", changeId.get()));
-      }
-    }
-
     if (input.topic != null) {
       input.topic = Strings.emptyToNull(input.topic.trim());
     }
@@ -431,6 +420,32 @@ public class CreateChange
           ObjectInserter oi = git.newObjectInserter();
           ObjectReader reader = oi.newReader();
           CodeReviewRevWalk rw = CodeReviewCommit.newRevWalk(reader)) {
+        Optional<ChangeKeyLookup.Snapshot> keys = changeKeyLookup.open(git);
+        Optional<String> requestedId =
+            CommitMessageUtil.getChangeIdFromCommitMessageFooter(input.subject);
+        // Base-change resolution and merge-source visibility can also use the change index.
+        if ((requestedId.isPresent() && keys.isEmpty())
+            || input.baseChange != null
+            || input.merge != null) {
+          changeIndexFreshness.requireFresh(projectState.getNameKey());
+        }
+        if (requestedId.isPresent()) {
+          String key = requestedId.get();
+          boolean exists =
+              keys.isPresent()
+                  ? !keys.get().members(input.branch, key).isEmpty()
+                  : !queryProvider
+                      .get()
+                      .setLimit(1)
+                      .byBranchKey(
+                          BranchNameKey.create(projectState.getNameKey(), input.branch),
+                          Change.key(key))
+                      .isEmpty();
+          if (exists) {
+            throw new ResourceConflictException(
+                "A change with Change-Id " + key + " already exists for this branch.");
+          }
+        }
         PatchSet basePatchSet = null;
         List<String> groups = Collections.emptyList();
 
@@ -536,6 +551,9 @@ public class CreateChange
         logger.atFine().log("flushing inserter %s", oi);
         oi.flush();
 
+        if (keys.isPresent()) {
+          keys.get().checkInsertedCommit(input.branch, rw, c, requestedId);
+        }
         Change.Id changeId = Change.id(seq.nextChangeId());
         ChangeInserter ins = changeInserterFactory.create(changeId, c, input.branch);
         ins.setMessage(messageForNewChange(ins.getPatchSetId(), c));
@@ -570,7 +588,7 @@ public class CreateChange
               notifyResolver.resolve(
                   firstNonNull(input.notify, NotifyHandling.ALL), input.notifyDetails));
           bu.insertChange(ins);
-          bu.execute();
+          ChangeKeyLookup.execute(bu, keys);
         }
         List<ListChangesOption> opts = input.responseFormatOptions;
         if (opts == null) {

@@ -14,6 +14,10 @@
 
 package dev.walgerrit;
 
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import dev.walgerrit.proto.StorageProto.ChangeKeyPage;
+import dev.walgerrit.proto.StorageProto.LogPosition;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -31,6 +35,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * is current.
  */
 final class ManifestCache {
+  record Page(String repo, LogPosition position, int shard) {}
+
+  // Immutable WAL pages, shared by repository handles on this node.
+  final Cache<Page, ChangeKeyPage> keyPages =
+      CacheBuilder.newBuilder()
+          .maximumWeight(16L << 20)
+          .weigher((Page key, ChangeKeyPage page) -> 128 + page.getSerializedSize())
+          .build();
+
   record VersionedManifest(Manifest manifest, String version) {}
 
   /** A manifest a peer announced and this node has not observed yet. */

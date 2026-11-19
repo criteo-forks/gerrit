@@ -552,6 +552,7 @@ final class GroupPublisher {
         if (member.isRefTransaction()) {
           refUpdate = true;
           transaction.addAllUpdates(member.refTransaction.getUpdatesList());
+          transaction.addAllChangeKeyChecks(member.refTransaction.getChangeKeyChecksList());
           // Which updates were one transaction is what tells a submit's branch update from the
           // branch update of another request that happened to be published with it.
           transaction.addMembers(member.refTransaction.getUpdatesCount());

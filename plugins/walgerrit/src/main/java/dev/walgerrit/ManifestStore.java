@@ -17,8 +17,10 @@ package dev.walgerrit;
 import com.google.gerrit.common.Nullable;
 import dev.walgerrit.ManifestCache.VersionedManifest;
 import dev.walgerrit.ObjectStore.ConditionalRead;
+import dev.walgerrit.proto.StorageProto.ChangeKeyPage;
 import dev.walgerrit.proto.StorageProto.IndexUpdate;
 import dev.walgerrit.proto.StorageProto.LogEntry;
+import dev.walgerrit.proto.StorageProto.LogPosition;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
@@ -349,6 +351,36 @@ final class ManifestStore {
     return entry;
   }
 
+  ChangeKeyPage keyPage(LogPosition position, int shard) throws IOException {
+    ManifestCache.Page key = new ManifestCache.Page(cacheKey, position, shard);
+    ChangeKeyPage page = cache.keyPages.getIfPresent(key);
+    if (page == null) {
+      LogEntry entry = readEntry(position.getSequence(), position.getTransactionId());
+      page = entry.getChangeKeyPagesMap().get(shard);
+      if (page == null) {
+        throw new IOException("Missing committed change-key page " + shard + " at " + position);
+      }
+      cache.keyPages.put(key, page);
+    }
+    return page;
+  }
+
+  Manifest installChangeKeys(long refRevision, ChangeKeyDirectory seed) throws IOException {
+    return publish(
+        refRevision,
+        List.of(),
+        List.of(),
+        true,
+        null,
+        List.of(),
+        null,
+        false,
+        null,
+        seed,
+        UNFENCED,
+        Attempts.UNOBSERVED);
+  }
+
   /**
    * Follows the compare-and-swaps one publication tries, so that local read snapshots can tell
    * whether the packs it carries are in the manifest's history.
@@ -416,6 +448,7 @@ final class ManifestStore {
         null,
         false,
         null,
+        null,
         expectedWriteEpoch,
         attempts);
   }
@@ -445,6 +478,7 @@ final class ManifestStore {
         null,
         false,
         new NamespaceFence(operation, delete),
+        null,
         expectedWriteEpoch,
         Attempts.UNOBSERVED);
   }
@@ -477,6 +511,7 @@ final class ManifestStore {
         indexUpdate,
         false,
         null,
+        null,
         UNFENCED,
         Attempts.UNOBSERVED);
   }
@@ -491,6 +526,7 @@ final class ManifestStore {
       @Nullable IndexUpdate indexUpdate,
       boolean recoveryFence,
       @Nullable NamespaceFence namespaceFence,
+      @Nullable ChangeKeyDirectory keySeed,
       long expectedWriteEpoch,
       Attempts attempts)
       throws IOException {
@@ -530,7 +566,11 @@ final class ManifestStore {
         }
       }
 
-      if (!recoveryFence
+      if (keySeed != null && ChangeKeyDirectory.complete(current)) {
+        return current;
+      }
+      if (keySeed == null
+          && !recoveryFence
           && namespaceFence == null
           && additions.isEmpty()
           && supersedes.isEmpty()
@@ -546,7 +586,11 @@ final class ManifestStore {
               .setKind(
                   namespaceFence != null
                       ? LogEntry.Kind.FENCE
-                      : entryKind(supersedes, requireExactRefRevision, eventJson, indexUpdate))
+                      : entryKind(
+                          supersedes,
+                          requireExactRefRevision && keySeed == null,
+                          eventJson,
+                          indexUpdate))
               .addAllSupersedes(supersedes)
               .addAllEventJson(eventJson)
               .setCreatedAtEpochMillis(now)
@@ -572,8 +616,6 @@ final class ManifestStore {
         entry.addAdditions(published);
       }
 
-      objectStore.putIfAbsent(logKey(sequence, transactionId), entry.build().toByteArray());
-
       Manifest.Builder next =
           current.toBuilder()
               .setHeadSeq(sequence)
@@ -589,6 +631,34 @@ final class ManifestStore {
             .setFenceOperation(namespaceFence.operation())
             .setDeleted(namespaceFence.delete());
       }
+      if (keySeed != null) {
+        keySeed.publish(entry, next);
+      } else if (changesRefs
+          || (refTransaction != null && refTransaction.getChangeKeyChecksCount() > 0)) {
+        boolean classified =
+            refTransaction != null
+                && refTransaction.getUpdatesList().stream()
+                    .allMatch(
+                        update ->
+                            ChangeKeyDirectory.metaId(update.getName()) == null
+                                || update.hasChangeKey());
+        boolean compaction = refTransaction == null && entry.getKind() == LogEntry.Kind.COMPACT;
+        if (ChangeKeyDirectory.complete(current) && (classified || compaction)) {
+          ChangeKeyDirectory directory = new ChangeKeyDirectory(this, current);
+          if (classified) {
+            directory.apply(refTransaction);
+          }
+          directory.publish(entry, next);
+        } else {
+          if (refTransaction != null && refTransaction.getChangeKeyChecksCount() != 0) {
+            throw new ChangeKeyDirectory.DecisionChanged(
+                "Change-key coverage changed before ref publication");
+          }
+          // Raw ref imports and old/incomplete metadata must never certify absence.
+          next.clearChangeKeys();
+        }
+      }
+      objectStore.putIfAbsent(logKey(sequence, transactionId), entry.build().toByteArray());
       Manifest updated = next.build();
 
       attempts.attempting(sequence, transactionId);
@@ -673,6 +743,7 @@ final class ManifestStore {
               List.of(),
               null,
               true,
+              null,
               null,
               UNFENCED,
               Attempts.UNOBSERVED);
@@ -1014,7 +1085,7 @@ final class ManifestStore {
         .anyMatch(pack -> supersedes.contains(pack.getName()) && hasReftable(pack));
   }
 
-  private static boolean hasReftable(PackRef pack) {
+  static boolean hasReftable(PackRef pack) {
     return pack.getFilesList().stream().anyMatch(file -> file.getExtension().equals("ref"));
   }
 

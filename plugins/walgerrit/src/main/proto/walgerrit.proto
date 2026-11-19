@@ -36,7 +36,22 @@ message Manifest {
   string fence_operation = 14;
   // Terminal: set by the fence of a deletion. Nothing is published afterwards.
   bool deleted = 15;
+  // Complete only at this exact ref_revision. A writer predating this field
+  // cannot silently keep the directory current after it changes refs.
+  ChangeKeys change_keys = 16;
 }
+
+// Each pointer identifies an immutable page in the committed WAL. An absent
+// page in a complete directory means every key in that page is absent.
+message ChangeKeys {
+  uint64 ref_revision = 1;
+  map<uint32, LogPosition> pages = 2;
+}
+
+message ChangeMembers { repeated int32 numbers = 1; }
+message ChangeKeyPage { map<string, ChangeMembers> keys = 1; }
+message ChangeKeyCheck { string key = 1; ChangeMembers expected = 2; }
+message ChangeKeyMutation { string before = 1; string after = 2; }
 
 message PackRef {
   // JGit's stable DFS pack name. Pack and index data beneath wal/ are
@@ -110,6 +125,7 @@ message LogEntry {
   // entries of the process it is from those of a process that ended. Empty
   // on entries written before this field existed: no running process's.
   string writer_process = 14;
+  map<uint32, ChangeKeyPage> change_key_pages = 15;
 }
 
 // Documents one node reindexed with no ref update behind them: an explicit
@@ -131,6 +147,8 @@ message RefUpdate {
   string new_object_id = 3;
   // Set when the new value is symbolic (for example HEAD -> refs/heads/main).
   string new_symbolic_target = 4;
+  // Present on a classified change meta update, empty when membership is unchanged.
+  ChangeKeyMutation change_key = 5;
 }
 
 message RefTransaction {
@@ -140,6 +158,7 @@ message RefTransaction {
   // written before this field existed: their updates cannot be told apart, so
   // nothing can be concluded from two of them being in one entry.
   repeated uint32 members = 2;
+  repeated ChangeKeyCheck change_key_checks = 3;
 }
 
 // Node-local acknowledgement of secondary-index replay. It is stored beside

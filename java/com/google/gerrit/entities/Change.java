@@ -115,8 +115,13 @@ public final class Change {
      *     represent a valid Change.Id.
      */
     public static Optional<Id> tryParse(String str) {
+      return Optional.ofNullable(tryParseNullable(str));
+    }
+
+    @Nullable
+    static Id tryParseNullable(String str) {
       Integer id = Ints.tryParse(str);
-      return id != null ? Optional.of(Change.id(id)) : Optional.empty();
+      return id != null ? Change.id(id) : null;
     }
 
     @Nullable
@@ -132,7 +137,7 @@ public final class Change {
       if (ref.substring(ce).equals(RefNames.META_SUFFIX)
           || ref.substring(ce).equals(RefNames.ROBOT_COMMENTS_SUFFIX)
           || PatchSet.Id.fromRef(ref, ce) >= 0) {
-        return Change.id(Integer.parseInt(ref.substring(cs, ce)));
+        return tryParseNullable(ref.substring(cs, ce));
       }
       return null;
     }
@@ -156,7 +161,7 @@ public final class Change {
       }
       int ce = nextNonDigit(ref, cs);
       if (ce < ref.length() && ref.charAt(ce) == '/' && isNumeric(ref, ce + 1)) {
-        return Change.id(Integer.parseInt(ref.substring(cs, ce)));
+        return tryParseNullable(ref.substring(cs, ce));
       }
       return null;
     }
@@ -177,11 +182,7 @@ public final class Change {
     public static Id fromEditRefPart(String ref) {
       int startChangeId = ref.indexOf(RefNames.EDIT_PREFIX) + RefNames.EDIT_PREFIX.length();
       int endChangeId = nextNonDigit(ref, startChangeId);
-      String id = ref.substring(startChangeId, endChangeId);
-      if (id != null && !id.isEmpty()) {
-        return Change.id(Integer.parseInt(id));
-      }
-      return null;
+      return tryParseNullable(ref.substring(startChangeId, endChangeId));
     }
 
     @Nullable

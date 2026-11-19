@@ -14,7 +14,9 @@
 
 package com.google.gerrit.acceptance.server.index;
 
+import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.gerrit.acceptance.GitUtil.assertPushRejected;
 import static com.google.gerrit.testing.GerritJUnit.assertThrows;
 
 import com.google.gerrit.acceptance.AbstractDaemonTest;
@@ -25,6 +27,7 @@ import com.google.gerrit.acceptance.testsuite.change.IndexOperations;
 import com.google.gerrit.acceptance.testsuite.project.ProjectOperations;
 import com.google.gerrit.entities.BranchNameKey;
 import com.google.gerrit.entities.Change;
+import com.google.gerrit.entities.PatchSet;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.extensions.api.changes.CherryPickInput;
@@ -33,23 +36,34 @@ import com.google.gerrit.extensions.client.ChangeStatus;
 import com.google.gerrit.extensions.common.ChangeInfo;
 import com.google.gerrit.extensions.common.ChangeInput;
 import com.google.gerrit.extensions.restapi.ResourceConflictException;
+import com.google.gerrit.server.ChangeUtil;
 import com.google.gerrit.server.index.change.ChangeIndexFreshness;
 import com.google.gerrit.server.index.change.ChangeIndexNotFreshException;
 import com.google.gerrit.server.index.change.ChangeIndexer;
+import com.google.gerrit.server.index.change.ChangeKeyLookup;
+import com.google.gerrit.server.notedb.ChangeNotes;
+import com.google.gerrit.server.query.change.ChangeData;
+import com.google.gerrit.server.update.BatchUpdateListener;
 import com.google.inject.AbstractModule;
 import com.google.inject.Inject;
 import com.google.inject.Module;
+import com.google.inject.Provides;
+import com.google.inject.Singleton;
 import com.google.inject.multibindings.OptionalBinder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import org.eclipse.jgit.internal.storage.dfs.InMemoryRepository;
 import org.eclipse.jgit.junit.TestRepository;
+import org.eclipse.jgit.lib.BatchRefUpdate;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.transport.RefSpec;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -67,6 +81,8 @@ public class ChangeIndexFreshnessIT extends AbstractDaemonTest {
 
   /** What the bound barrier does when Gerrit asks; set by each test. */
   private static volatile Function<Optional<String>, Optional<String>> barrier;
+
+  private static volatile ChangeKeyLookup.Backend keyLookup = (r, guard) -> Optional.empty();
 
   /** The scopes Gerrit asked for, in order: a project name, or empty for every project. */
   private static final List<Optional<String>> asked = new CopyOnWriteArrayList<>();
@@ -88,13 +104,71 @@ public class ChangeIndexFreshnessIT extends AbstractDaemonTest {
                   return barrier.apply(scope);
                 });
       }
+
+      @Provides
+      @Singleton
+      ChangeKeyLookup changeKeyLookup(
+          ChangeNotes.Factory notes, ChangeData.Factory data, ChangeUtil changeUtil) {
+        return new ChangeKeyLookup(
+            notes, data, changeUtil, (repo, guard) -> keyLookup.open(repo, guard));
+      }
     };
   }
 
   @Before
   public void resetBarrier() {
     barrier = scope -> Optional.empty();
+    keyLookup = (r, guard) -> Optional.empty();
     asked.clear();
+  }
+
+  @Test
+  public void guardedPushReselectsAndAmendsWhenTheIndexCannotSeeTheWinningChange()
+      throws Exception {
+    PushOneCommit.Result original =
+        pushUnindexed(project, testRepo, "refs/for/master", "original", null);
+    Change.Id number = changesInRepository(project).get(0);
+    AtomicInteger opened = new AtomicInteger();
+    AtomicInteger guarded = new AtomicInteger();
+    asked.clear();
+    barrier = scope -> Optional.of(CANNOT);
+    keyLookup =
+        (r, guard) -> {
+          int attempt = opened.incrementAndGet();
+          AtomicBoolean lost = new AtomicBoolean();
+          guard.accept(
+              new BatchUpdateListener() {
+                @Override
+                public BatchRefUpdate beforeUpdateRefs(BatchRefUpdate batch) {
+                  guarded.incrementAndGet();
+                  if (attempt == 1) {
+                    // Model an exact-key conflict before any refs in this batch become visible.
+                    lost.set(true);
+                    throw new IllegalStateException("branch/Change-Id membership changed");
+                  }
+                  return batch;
+                }
+              },
+              lost::get);
+          return Optional.of(
+              (branch, key) ->
+                  attempt > 1
+                          && branch.equals("refs/heads/master")
+                          && key.equals(original.getChangeId())
+                      ? List.of(number.get())
+                      : List.of());
+        };
+    pushFactory
+        .create(admin.newIdent(), testRepo, "amended", "a.txt", "2", original.getChangeId())
+        .to("refs/for/master")
+        .assertOkStatus();
+    assertThat(opened.get()).isEqualTo(2);
+    assertThat(guarded.get()).isEqualTo(2);
+    assertThat(asked).isEmpty();
+    assertThat(changesInRepository(project)).containsExactly(number);
+    try (Repository r = repoManager.openRepository(project)) {
+      assertThat(r.exactRef(RefNames.patchSetRef(PatchSet.id(number, 2)))).isNotNull();
+    }
   }
 
   @Test
@@ -159,6 +233,29 @@ public class ChangeIndexFreshnessIT extends AbstractDaemonTest {
         .create(admin.newIdent(), testRepo)
         .to("refs/heads/master")
         .assertErrorStatus(CANNOT);
+  }
+
+  @Test
+  public void multipleReviewRefsUseTheStorageGuard() throws Exception {
+    createBranch(BranchNameKey.create(project, "stable"));
+    asked.clear();
+    String reason = "Cannot obtain certified change keys";
+    keyLookup =
+        (repo, guard) -> {
+          throw new ChangeIndexNotFreshException(reason);
+        };
+    var result =
+        getOnlyElement(
+            testRepo
+                .git()
+                .push()
+                .setRefSpecs(
+                    new RefSpec("HEAD:refs/for/master"), new RefSpec("HEAD:refs/for/stable"))
+                .call());
+    assertPushRejected(result, "refs/for/master", reason);
+    assertPushRejected(result, "refs/for/stable", reason);
+    assertThat(asked).isEmpty();
+    assertThat(changesInRepository(project)).isEmpty();
   }
 
   @Test
@@ -264,6 +361,120 @@ public class ChangeIndexFreshnessIT extends AbstractDaemonTest {
     gApi.changes().id(inTopic.getChangeId()).current().submit();
 
     assertThat(asked).isEmpty();
+  }
+
+  @Test
+  public void restCreateUsesStorageForAnExistingUnindexedKeyAndForAnEmptyOne() throws Exception {
+    PushOneCommit.Result existing =
+        pushUnindexed(project, testRepo, "refs/for/master", "peer-review", null);
+    Change.Id id = changesInRepository(project).get(0);
+    AtomicInteger published = new AtomicInteger();
+    keyLookup =
+        (repo, register) -> {
+          register.accept(
+              new BatchUpdateListener() {
+                @Override
+                public BatchRefUpdate beforeUpdateRefs(BatchRefUpdate batch) {
+                  published.incrementAndGet();
+                  return batch;
+                }
+              },
+              () -> false);
+          return Optional.of(
+              (branch, key) ->
+                  branch.equals("refs/heads/master") && key.equals(existing.getChangeId())
+                      ? List.of(id.get())
+                      : List.of());
+        };
+    asked.clear();
+    barrier = scope -> Optional.of(CANNOT);
+    ChangeInput create =
+        new ChangeInput(project.get(), "master", "Same\n\nChange-Id: " + existing.getChangeId());
+    adminRestSession.post("/changes/", create).assertStatus(409);
+    create.subject = "Different\n\nChange-Id: I0123456789012345678901234567890123456789";
+    adminRestSession.post("/changes/", create).assertStatus(201);
+    assertThat(changesInRepository(project)).hasSize(2);
+    assertThat(published.get()).isEqualTo(1);
+    assertThat(asked).isEmpty();
+  }
+
+  @Test
+  public void guardedRestMutationsReturnConflictBeforePublishingAnyChange() throws Exception {
+    PushOneCommit.Result source = push(testRepo, "refs/for/master", "source", null);
+    Change.Id number = source.getChange().getId();
+    createBranch(BranchNameKey.create(project, "stable"));
+    ObjectId oldMeta;
+    try (Repository repo = repoManager.openRepository(project)) {
+      oldMeta = repo.exactRef(RefNames.changeMetaRef(number)).getObjectId();
+    }
+    AtomicInteger guards = new AtomicInteger();
+    List<String> checked = new CopyOnWriteArrayList<>();
+    keyLookup =
+        (r, register) -> {
+          AtomicBoolean rejected = new AtomicBoolean();
+          register.accept(
+              new BatchUpdateListener() {
+                @Override
+                public BatchRefUpdate beforeUpdateRefs(BatchRefUpdate batch) {
+                  guards.incrementAndGet();
+                  rejected.set(true);
+                  throw new IllegalStateException(
+                      "injected membership conflict before publication");
+                }
+              },
+              rejected::get);
+          return Optional.of(
+              (branch, key) -> {
+                checked.add(branch + " " + key);
+                return List.of();
+              });
+        };
+    asked.clear();
+    barrier = scope -> Optional.of(CANNOT);
+    String key = "I0123456789012345678901234567890123456789";
+    ChangeInput create =
+        new ChangeInput(project.get(), "master", "New review\n\nChange-Id: " + key);
+    RestResponse creation = adminRestSession.post("/changes/", create);
+    creation.assertStatus(409);
+    assertThat(creation.getEntityContent()).contains("Please retry");
+    CherryPickInput cherry = new CherryPickInput();
+    cherry.destination = "stable";
+    adminRestSession
+        .post("/changes/" + number.get() + "/revisions/current/cherrypick", cherry)
+        .assertStatus(409);
+    MoveInput move = new MoveInput();
+    move.destinationBranch = "stable";
+    adminRestSession.post("/changes/" + number.get() + "/move", move).assertStatus(409);
+    assertThat(checked)
+        .containsExactly(
+            "refs/heads/master " + key,
+            "refs/heads/stable " + source.getChangeId(),
+            "refs/heads/stable " + source.getChangeId());
+    assertThat(guards.get()).isEqualTo(3);
+    assertThat(asked).isEmpty();
+    assertThat(changesInRepository(project)).containsExactly(number);
+    try (Repository repo = repoManager.openRepository(project)) {
+      assertThat(repo.exactRef(RefNames.changeMetaRef(number)).getObjectId()).isEqualTo(oldMeta);
+    }
+  }
+
+  @Test
+  public void coveredCreateStillWaitsWhenItNeedsTheIndexToResolveItsBase() throws Exception {
+    PushOneCommit.Result source = push(testRepo, "refs/for/master", "base", null);
+    keyLookup =
+        (repo, guard) -> {
+          guard.accept(BatchUpdateListener.NONE, () -> false);
+          return Optional.of((branch, key) -> List.of());
+        };
+    barrier = scope -> Optional.of(CANNOT);
+    ChangeInput create =
+        new ChangeInput(
+            project.get(),
+            "master",
+            "Based review\n\nChange-Id: I0123456789012345678901234567890123456789");
+    create.baseChange = source.getChangeId();
+    adminRestSession.post("/changes/", create).assertStatus(503);
+    assertThat(changesInRepository(project)).hasSize(1);
   }
 
   @Test

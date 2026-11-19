@@ -99,8 +99,8 @@ public abstract class PatchSet {
       if (patchSetId < 0) {
         return null;
       }
-      int changeId = Integer.parseInt(ref.substring(cs, ce));
-      return PatchSet.id(Change.id(changeId), patchSetId);
+      Change.Id changeId = Change.Id.tryParseNullable(ref.substring(cs, ce));
+      return changeId != null ? PatchSet.id(changeId, patchSetId) : null;
     }
 
     /** Parse a PatchSet.Id from an edit ref. */
@@ -115,12 +115,8 @@ public abstract class PatchSet {
       if (ps >= ref.length() || ref.charAt(ps) == '0') {
         return -1;
       }
-      for (int i = ps; i < ref.length(); i++) {
-        if (ref.charAt(i) < '0' || ref.charAt(i) > '9') {
-          return -1;
-        }
-      }
-      return Integer.parseInt(ref.substring(ps));
+      Integer id = Ints.tryParse(ref.substring(ps));
+      return id != null && id > 0 ? id : -1;
     }
 
     public static String toId(int number) {

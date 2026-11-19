@@ -1,3 +1,4 @@
+load("//javatests/com/google/gerrit/acceptance:tests.bzl", "acceptance_tests")
 load("//tools/bzl:junit.bzl", "junit_tests")
 
 config_setting(
@@ -8,7 +9,7 @@ config_setting(
 
 junit_tests(
     name = "acceptance_framework_tests",
-    srcs = glob(["**/*.java"]),
+    srcs = glob(["**/*.java"], exclude = ["WalGerritChangeKeyRaceIT.java"]),
     deps = [
         "//java/com/google/gerrit/acceptance:lib",
         "//java/com/google/gerrit/acceptance/testsuite/group",
@@ -19,4 +20,11 @@ junit_tests(
         "//lib:jgit",
         "//lib/truth",
     ],
+)
+
+# The local-backend acceptance runner supplies the Maven-built storage library.
+acceptance_tests(
+    srcs = ["WalGerritChangeKeyRaceIT.java"],
+    group = "WalGerritChangeKeyRaceIT",
+    labels = ["manual"],
 )

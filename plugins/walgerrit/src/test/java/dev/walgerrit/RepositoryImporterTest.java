@@ -50,11 +50,34 @@ class RepositoryImporterTest {
   @TempDir Path root;
 
   @Test
+  void seedsAnImportedRepositoryContainingOutOfRangeNumericRefs() throws Exception {
+    String key = "I" + "4".repeat(40);
+    Path source = root.resolve("legacy.git");
+    try (Repository bare = createBare(source)) {
+      commitAndRef(bare, "refs/heads/main", "main");
+      commitAndRef(bare, "refs/changes/01/1/2147483648", "raw patch-set ref");
+      commitAndRef(bare, "refs/changes/48/2147483648/meta", "raw metadata ref");
+      commitAndRef(
+          bare, "refs/changes/47/2147483647/meta", "Review\n\nBranch: main\nChange-id: " + key);
+      repack(bare);
+    }
+    var manager = manager("writer");
+    var importer = new RepositoryImporter(manager, System.out, true);
+    assertEquals(Outcome.IMPORTED, importer.importOne("legacy", source));
+    try (var repo = (LocalWalGitRepository) manager.openRepository(Project.nameKey("legacy"))) {
+      var keys = ReviewChangeKeys.open(repo).orElseThrow();
+      assertEquals(List.of(Integer.MAX_VALUE), keys.apply("refs/heads/main", key));
+      assertTrue(ChangeKeyDirectory.complete(repo.manifestStore().refresh()));
+    }
+  }
+
+  @Test
   void importsPacksAndEveryRefAndIsIdempotent() throws Exception {
     Path source = root.resolve("basePath");
     Map<String, ObjectId> expected = new TreeMap<>();
     try (Repository bare = createBare(source.resolve("platform/tools.git"))) {
-      expected.put(Constants.R_HEADS + "main", commitAndRef(bare, Constants.R_HEADS + "main", "one"));
+      expected.put(
+          Constants.R_HEADS + "main", commitAndRef(bare, Constants.R_HEADS + "main", "one"));
       expected.put(Constants.R_HEADS + "dev", commitAndRef(bare, Constants.R_HEADS + "dev", "two"));
       expected.put("refs/changes/01/1/1", commitAndRef(bare, "refs/changes/01/1/1", "patch set"));
       expected.put("refs/changes/01/1/meta", commitAndRef(bare, "refs/changes/01/1/meta", "meta"));
@@ -158,7 +181,8 @@ class RepositoryImporterTest {
     Path source = root.resolve("basePath");
     Map<String, ObjectId> expected = new TreeMap<>();
     try (Repository bare = createBare(source.resolve("staged.git"))) {
-      expected.put(Constants.R_HEADS + "main", commitAndRef(bare, Constants.R_HEADS + "main", "loose"));
+      expected.put(
+          Constants.R_HEADS + "main", commitAndRef(bare, Constants.R_HEADS + "main", "loose"));
       expected.put("refs/changes/02/2/1", commitAndRef(bare, "refs/changes/02/2/1", "also loose"));
       // Not repacked: loose objects and loose refs, as a backup of a serving repository has.
     }
@@ -184,7 +208,10 @@ class RepositoryImporterTest {
       }
     }
     Manifest manifest = manager.manifestStore(Project.nameKey("staged")).refresh();
-    assertEquals(1, manifest.getPacksList().stream().filter(CompactionPolicy::isObjectPack).count(), "git repack -a produced one pack");
+    assertEquals(
+        1,
+        manifest.getPacksList().stream().filter(CompactionPolicy::isObjectPack).count(),
+        "git repack -a produced one pack");
   }
 
   @Test
@@ -295,7 +322,8 @@ class RepositoryImporterTest {
   }
 
   private static void git(Path repository, String... arguments) throws Exception {
-    java.util.List<String> command = new java.util.ArrayList<>(List.of("git", "-C", repository.toString()));
+    java.util.List<String> command =
+        new java.util.ArrayList<>(List.of("git", "-C", repository.toString()));
     command.addAll(List.of(arguments));
     Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
     String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -304,7 +332,8 @@ class RepositoryImporterTest {
 
   private static boolean gitAvailable() {
     try {
-      return new ProcessBuilder("git", "--version").redirectErrorStream(true).start().waitFor() == 0;
+      return new ProcessBuilder("git", "--version").redirectErrorStream(true).start().waitFor()
+          == 0;
     } catch (IOException | InterruptedException exception) {
       return false;
     }
@@ -368,7 +397,8 @@ class RepositoryImporterTest {
   private WalGitRepositoryManager manager(String name) {
     Config config = new Config();
     config.setString("walgerrit", null, "storagePath", root.resolve("store").toString());
-    config.setString("walgerrit", null, "indexCursorPath", root.resolve(name + "-cursors").toString());
+    config.setString(
+        "walgerrit", null, "indexCursorPath", root.resolve(name + "-cursors").toString());
     config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
     WalGitConfiguration configuration = WalGitConfiguration.from(config, root.resolve(name));
     StorageLayout layout =

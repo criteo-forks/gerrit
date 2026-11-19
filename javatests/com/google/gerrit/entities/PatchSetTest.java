@@ -27,6 +27,9 @@ public class PatchSetTest {
   public void parseRefNames() {
     assertRef(1, 1, "refs/changes/01/1/1");
     assertRef(1234, 56, "refs/changes/34/1234/56");
+    assertRef(Integer.MAX_VALUE, Integer.MAX_VALUE, "refs/changes/47/2147483647/2147483647");
+    assertNotRef("refs/changes/48/2147483648/1");
+    assertNotRef("refs/changes/01/1/2147483648");
 
     // Not even close.
     assertNotRef(null);
