@@ -14,7 +14,6 @@
 package com.google.gerrit.acceptance.forwarding;
 
 import static com.google.common.truth.Truth.assertThat;
-import static com.google.common.truth.Truth.assertWithMessage;
 import static com.google.common.truth.TruthJUnit.assume;
 import static com.google.gerrit.acceptance.testsuite.project.TestProjectUpdate.block;
 import static com.google.gerrit.server.group.SystemGroupBackend.REGISTERED_USERS;
@@ -38,57 +37,48 @@ import com.google.gerrit.extensions.restapi.Url;
 import com.google.gerrit.server.WriteForwarding;
 import com.google.gerrit.server.WriteRouter;
 import com.google.gerrit.server.util.SocketUtil;
-import com.google.gerrit.sshd.PeerRelay;
+import com.google.gerrit.testing.ConfigSuite;
 import com.google.gerrit.util.http.testutil.FakePeer;
 import com.google.inject.AbstractModule;
 import com.google.inject.Inject;
 import com.google.inject.Module;
 import com.google.inject.multibindings.OptionalBinder;
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import org.apache.sshd.client.SshClient;
 import org.apache.sshd.client.channel.ChannelExec;
 import org.apache.sshd.client.channel.ClientChannelEvent;
 import org.apache.sshd.client.config.hosts.HostConfigEntryResolver;
 import org.apache.sshd.client.keyverifier.AcceptAllServerKeyVerifier;
 import org.apache.sshd.client.session.ClientSession;
-import org.apache.sshd.common.keyprovider.KeyPairProvider;
-import org.apache.sshd.server.Environment;
-import org.apache.sshd.server.ExitCallback;
-import org.apache.sshd.server.SshServer;
-import org.apache.sshd.server.auth.pubkey.AcceptAllPublickeyAuthenticator;
-import org.apache.sshd.server.channel.ChannelSession;
-import org.apache.sshd.server.command.Command;
 import org.eclipse.jgit.api.errors.TransportException;
 import org.eclipse.jgit.internal.storage.dfs.InMemoryRepository;
 import org.eclipse.jgit.junit.TestRepository;
-import org.eclipse.jgit.lib.ObjectId;
-import org.eclipse.jgit.transport.PacketLineOut;
+import org.eclipse.jgit.lib.Config;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-/**
- * Writes that one daemon hands to a peer over real SSH and HTTP links.
- *
- * <p>The daemon is its own peer: a {@link FakePeer} answers the hello under another name and passes
- * HTTP connections back to the daemon, and the hello announces the daemon's own SSH port. A write
- * to a project that ranks the other name first therefore leaves the daemon, comes back marked as
- * handed over, and must be executed. The peers that fail are stand-ins.
- *
- * <p>The test describes the cluster itself, so it is skipped with a backend that describes one.
- */
+/** Authenticated HTTPS hops to a real Gerrit daemon through a recording cluster member. */
 @UseSsh
 public class WriteForwardingIT extends AbstractDaemonTest {
   private static final String SELF = "gerrit-self";
@@ -96,28 +86,22 @@ public class WriteForwardingIT extends AbstractDaemonTest {
   private static final String COUNTER = "write_forwarding/requests";
 
   private static final AtomicReference<Collection<String>> PEERS = new AtomicReference<>(List.of());
-  private static final SshSide SSH_SIDE = new SshSide();
 
-  /** What the test needs from the daemon's SSH injector. */
-  private static final class SshSide {
-    @Inject PeerRelay relay;
-    @Inject KeyPairProvider hostKeys;
-  }
-
-  /** What a stand-in for a peer's SSH daemon does with a command. */
-  private enum Behavior {
-    HANG_UP,
-    ADVERTISE_THEN_HANG_UP,
-    ADVERTISE_AND_HANG_UP_ON_INPUT
+  @ConfigSuite.Default
+  public static Config peerConfig() throws IOException {
+    Config cfg = FakePeer.config();
+    cfg.setInt("httpd", null, "maxThreads", 12);
+    try (ServerSocket free = new ServerSocket(0)) {
+      cfg.setInt("walgerrit", null, "forwardingPort", free.getLocalPort());
+    }
+    return cfg;
   }
 
   @Inject private WriteForwarding forwarding;
   @Inject private ProjectOperations projectOperations;
 
   private final TestMetricMaker metrics = TestMetricMaker.getInstance();
-  private final List<String> commandsAtFakeSsh = new CopyOnWriteArrayList<>();
   private FakePeer peer;
-  private SshServer fakeSsh;
   private Project.NameKey peerProject;
   private Project.NameKey ownProject;
 
@@ -143,22 +127,12 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     };
   }
 
-  @Override
-  public Module createSshModule() {
-    return new AbstractModule() {
-      @Override
-      protected void configure() {
-        requestInjection(SSH_SIDE);
-      }
-    };
-  }
-
   @Before
   public void setUp() throws Exception {
     assume().that(backendDescribesTheCluster()).isFalse();
     peerProject = newProject(true);
     ownProject = newProject(false);
-    peer = new FakePeer(PEER).relayTo(httpAddress());
+    peer = new FakePeer(PEER).relayTo(new InetSocketAddress("127.0.0.1", forwarding.port()), SELF);
     // A test daemon has one thread for interactive users and two for batch users; a push that
     // goes out and comes back needs two.
     gApi.groups().id("Service Users").addMembers(user.username());
@@ -174,20 +148,18 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     if (peer != null) {
       peer.close();
     }
-    if (fakeSsh != null) {
-      fakeSsh.stop(true);
-    }
   }
 
   @Test
   public void sshPushIsHandedToThePeerAndRunsAsThePushingUser() throws Exception {
-    join(peer.sshPort(sshPort()), true);
+    join();
 
     PushOneCommit.Result pushed = pushOverSshAsUser(peerProject);
 
     pushed.assertOkStatus();
     ChangeInfo change = gApi.changes().id(pushed.getChangeId()).get();
     assertThat(change.project).isEqualTo(peerProject.get());
+    assertThat(change.topic).isEqualTo("forwarded-topic");
     assertThat(change.owner._accountId).isEqualTo(user.id().get());
     assertThat(metrics.getCount(COUNTER, "ssh", "forwarded")).isEqualTo(1);
     assertThat(metrics.getCount(COUNTER, "ssh", "fallback")).isEqualTo(0);
@@ -200,7 +172,7 @@ public class WriteForwardingIT extends AbstractDaemonTest {
         .forUpdate()
         .add(block(Permission.PUSH).ref("refs/for/*").group(REGISTERED_USERS))
         .update();
-    join(peer.sshPort(sshPort()), true);
+    join();
 
     TransportException refused =
         assertThrows(TransportException.class, () -> pushOverSshAsUser(peerProject));
@@ -213,7 +185,7 @@ public class WriteForwardingIT extends AbstractDaemonTest {
 
   @Test
   public void sshPushToAProjectThisDaemonRanksFirstRunsHere() throws Exception {
-    join(peer.sshPort(sshPort()), true);
+    join();
 
     pushOverSshAsUser(ownProject).assertOkStatus();
 
@@ -223,7 +195,7 @@ public class WriteForwardingIT extends AbstractDaemonTest {
 
   @Test
   public void sshPushRunsHereWhenItsPoolHasNoThreadToSpare() throws Exception {
-    join(peer.sshPort(sshPort()), true);
+    join();
 
     // The admin is an interactive user, and a test daemon has one thread for those.
     pushOverSsh(adminSshSession, admin, peerProject).assertOkStatus();
@@ -233,66 +205,120 @@ public class WriteForwardingIT extends AbstractDaemonTest {
   }
 
   @Test
-  public void sshPushRunsHereWhileThePeerHasNoSshLink() throws Exception {
-    int closedPort;
-    try (java.net.ServerSocket unused = new java.net.ServerSocket(0)) {
-      closedPort = unused.getLocalPort();
-    }
-    join(peer.sshPort(closedPort), false);
-
+  public void sshPushRunsHereWhenThePrivateConnectionClosesBeforeTheAdvertisement()
+      throws Exception {
+    peer.hangUp();
+    join();
     pushOverSshAsUser(peerProject).assertOkStatus();
-
-    assertThat(SSH_SIDE.relay.isLinked(PEER)).isFalse();
-    assertThat(metrics.getCount(COUNTER, "ssh", "forwarded")).isEqualTo(0);
-  }
-
-  @Test
-  public void sshPushRunsHereWhenThePeerHangsUpBeforeItAnswers() throws Exception {
-    join(peer.sshPort(startFakeSsh(Behavior.HANG_UP)), true);
-
-    PushOneCommit.Result pushed = pushOverSshAsUser(peerProject);
-
-    pushed.assertOkStatus();
-    assertThat(commandsAtFakeSsh).hasSize(1);
-    assertThat(commandsAtFakeSsh.get(0)).startsWith("suexec --as " + user.id().get() + " --from ");
-    assertThat(commandsAtFakeSsh.get(0)).contains(" -- git-receive-pack ");
     assertThat(metrics.getCount(COUNTER, "ssh", "fallback")).isEqualTo(1);
-    assertThat(gApi.changes().query("project:" + peerProject.get()).get()).hasSize(1);
+    assertThat(peer.requests()).hasSize(1);
   }
 
   @Test
-  public void sshPushFailsOnceWhenThePeerHangsUpAfterItReceivedInput() throws Exception {
-    join(peer.sshPort(startFakeSsh(Behavior.ADVERTISE_AND_HANG_UP_ON_INPUT)), true);
-
-    assertThrows(TransportException.class, () -> pushOverSshAsUser(peerProject));
-
-    assertThat(commandsAtFakeSsh).hasSize(1);
-    assertThat(metrics.getCount(COUNTER, "ssh", "failed")).isEqualTo(1);
-    assertThat(metrics.getCount(COUNTER, "ssh", "fallback")).isEqualTo(0);
-    assertThat(gApi.changes().query("project:" + peerProject.get()).get()).isEmpty();
-  }
-
-  @Test
-  public void theClientLearnsWhetherThePeerReceivedAnythingBeforeItHungUp() throws Exception {
-    join(peer.sshPort(startFakeSsh(Behavior.ADVERTISE_THEN_HANG_UP)), true);
+  public void aLostStatusNeverRetriesAndTheClientCanReconcile() throws Exception {
+    peer.breakDuringReceive(false);
+    join();
     Exit silent = receivePackAsUser(peerProject, null);
-    assertThat(silent.status).isEqualTo(1);
-    assertThat(silent.stderr).contains("Nothing was written");
-    assertThat(silent.stderr).doesNotContain("may or may not");
-
-    fakeSsh.stop(true);
-    join(peer.sshPort(startFakeSsh(Behavior.ADVERTISE_AND_HANG_UP_ON_INPUT)), true);
+    assertThat(silent.status()).isEqualTo(1);
+    assertThat(silent.stderr()).contains("Nothing was written");
+    peer.breakDuringReceive(true);
+    join();
     Exit sending = receivePackAsUser(peerProject, "0000");
-    assertThat(sending.status).isEqualTo(1);
-    assertThat(sending.stderr).contains("may or may not have been applied");
-
+    assertThat(sending.status()).isEqualTo(1);
+    assertThat(sending.stderr()).contains("may or may not have been applied");
+    assertThat(peer.requests()).hasSize(2);
     assertThat(metrics.getCount(COUNTER, "ssh", "failed")).isEqualTo(2);
     assertThat(metrics.getCount(COUNTER, "ssh", "fallback")).isEqualTo(0);
   }
 
   @Test
+  public void fourWaitingReceivesLeaveCapacityForPublicRequests() throws Exception {
+    List<Socket> held = new ArrayList<>();
+    try {
+      for (int i = 0; i <= 4; i++) {
+        var socket =
+            forwarding.tls().getSocketFactory().createSocket("127.0.0.1", forwarding.port());
+        held.add(socket);
+        socket.setSoTimeout(5000);
+        String headers =
+            "POST /a/"
+                + peerProject.get()
+                + "/git-receive-pack HTTP/1.1\r\n"
+                + "Host: localhost\r\nTransfer-Encoding: chunked\r\n"
+                + "Content-Type: application/x-git-receive-pack-request\r\n"
+                + WriteForwarding.FORWARDED_HEADER
+                + ": "
+                + SELF
+                + "\r\n"
+                + WriteForwarding.ACCOUNT_HEADER
+                + ": "
+                + user.id().get()
+                + "\r\n"
+                + WriteForwarding.ADDRESS_HEADER
+                + ": 127.0.0.1\r\n"
+                + WriteForwarding.NATIVE_HEADER
+                + ": 1\r\n\r\n";
+        socket.getOutputStream().write(headers.getBytes(UTF_8));
+        socket.getOutputStream().flush();
+        String status =
+            new BufferedReader(new InputStreamReader(socket.getInputStream(), UTF_8)).readLine();
+        assertThat(status).startsWith("HTTP/1.1 " + (i < 4 ? "200" : "503"));
+      }
+      adminRestSession.get("/config/server/info").assertOK();
+      assertThat(metrics.getCount(COUNTER, "ssh", "inbound_busy")).isEqualTo(1);
+    } finally {
+      for (var socket : held) {
+        socket.close();
+      }
+    }
+  }
+
+  @Test
+  public void peerWithoutAClientKeyCannotReadHelloOrSubmitAWrite() throws Exception {
+    for (String path : List.of("/peerz", "/a/" + peerProject.get() + "/git-receive-pack")) {
+      var tls = SSLContext.getInstance("TLSv1.3");
+      // Trust the server for this test while presenting no client key.
+      tls.init(
+          new KeyManager[0],
+          new TrustManager[] {
+            new X509TrustManager() {
+              @Override
+              public void checkClientTrusted(X509Certificate[] chain, String type) {}
+
+              @Override
+              public void checkServerTrusted(X509Certificate[] chain, String type) {}
+
+              @Override
+              public X509Certificate[] getAcceptedIssuers() {
+                return new X509Certificate[0];
+              }
+            }
+          },
+          null);
+      var conn =
+          (HttpsURLConnection)
+              URI.create("https://127.0.0.1:" + forwarding.port() + path)
+                  .toURL()
+                  .openConnection(Proxy.NO_PROXY);
+      conn.setSSLSocketFactory(tls.getSocketFactory());
+      conn.setHostnameVerifier((host, session) -> true);
+      conn.setReadTimeout(5000);
+      if (!path.equals("/peerz")) {
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty(WriteForwarding.ACCOUNT_HEADER, Integer.toString(admin.id().get()));
+      }
+      try {
+        assertThrows(IOException.class, conn::getResponseCode);
+      } finally {
+        conn.disconnect();
+      }
+    }
+    assertThat(gApi.changes().query("project:" + peerProject.get()).get()).isEmpty();
+  }
+
+  @Test
   public void httpPushIsHandedToThePeerAndRunsAsThePushingUser() throws Exception {
-    join(peer, false);
+    join();
     TestRepository<InMemoryRepository> repo =
         GitUtil.cloneProject(peerProject, user.getHttpUrl(server) + "/" + peerProject.get());
 
@@ -303,7 +329,9 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     assertThat(change.owner._accountId).isEqualTo(user.id().get());
     List<String> handed = new ArrayList<>();
     for (FakePeer.Request request : peer.requests()) {
-      assertThat(request.header(WriteForwarding.FORWARDED_HEADER)).isEqualTo(SELF);
+      assertThat(request.header(WriteForwarding.FORWARDED_HEADER)).isEqualTo(PEER);
+      assertThat(request.header("Authorization")).isNull();
+      assertThat(request.header("Cookie")).isNull();
       handed.add(request.method() + " " + request.target());
     }
     assertThat(handed)
@@ -321,7 +349,7 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     pushed.assertOkStatus();
     String id =
         Url.encode(peerProject.get()) + "~" + gApi.changes().id(pushed.getChangeId()).get()._number;
-    join(peer, false);
+    join();
 
     userRestSession.get("/changes/" + id + "/detail").assertOK();
     assertThat(peer.requests()).isEmpty();
@@ -334,14 +362,37 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     assertThat(peer.requests().get(0).method()).isEqualTo("POST");
     assertThat(peer.requests().get(0).target())
         .isEqualTo("/a/changes/" + id + "/revisions/current/review");
-    assertThat(peer.requests().get(0).header(WriteForwarding.FORWARDED_HEADER)).isEqualTo(SELF);
+    assertThat(peer.requests().get(0).header(WriteForwarding.FORWARDED_HEADER)).isEqualTo(PEER);
     ChangeInfo change = gApi.changes().id(pushed.getChangeId()).get();
     assertThat(change.labels.get("Code-Review").recommended._accountId).isEqualTo(user.id().get());
   }
 
   @Test
+  public void aCommittedReviewWithALostReplyIsNotRepeated() throws Exception {
+    var push =
+        pushFactory.create(admin.newIdent(), cloneProject(peerProject)).to("refs/for/master");
+    push.assertOkStatus();
+    var change = gApi.changes().id(push.getChangeId());
+    String id = Url.encode(peerProject.get()) + "~" + change.get()._number;
+    peer.dropReply();
+    join();
+    String message = "review with a lost acknowledgement";
+    userRestSession
+        .post("/changes/" + id + "/revisions/current/review", new ReviewInput().message(message))
+        .assertStatus(502);
+    assertThat(peer.discardedStatus()).isEqualTo(200);
+    assertThat(
+            gApi.changes().id(push.getChangeId()).messages().stream()
+                .filter(m -> m.message.contains(message))
+                .count())
+        .isEqualTo(1);
+    assertThat(peer.requests()).hasSize(1);
+    assertThat(metrics.getCount(COUNTER, "http", "failed")).isEqualTo(1);
+  }
+
+  @Test
   public void httpPushToAProjectThisDaemonRanksFirstRunsHere() throws Exception {
-    join(peer, false);
+    join();
     TestRepository<InMemoryRepository> repo =
         GitUtil.cloneProject(ownProject, user.getHttpUrl(server) + "/" + ownProject.get());
 
@@ -350,18 +401,10 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     assertThat(peer.requests()).isEmpty();
   }
 
-  /** Makes {@code fake} this daemon's only peer and, if asked, waits for the SSH link to it. */
-  private void join(FakePeer fake, boolean awaitSshLink) throws Exception {
-    PEERS.set(List.of(fake.address()));
+  private void join() {
+    PEERS.set(List.of(peer.address()));
     forwarding.probe();
     assertThat(forwarding.peers()).hasSize(1);
-    if (awaitSshLink) {
-      long deadline = System.nanoTime() + 20_000_000_000L;
-      while (!SSH_SIDE.relay.isLinked(PEER)) {
-        assertWithMessage("no SSH link to the peer").that(System.nanoTime()).isLessThan(deadline);
-        Thread.sleep(20);
-      }
-    }
   }
 
   private PushOneCommit.Result pushOverSshAsUser(Project.NameKey project) throws Exception {
@@ -375,7 +418,9 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     session.open();
     TestRepository<InMemoryRepository> repo =
         GitUtil.cloneProject(project, session.getUrl() + "/" + project.get());
-    return pushFactory.create(account.newIdent(), repo).to("refs/for/master");
+    PushOneCommit push = pushFactory.create(account.newIdent(), repo);
+    push.setPushOptions(List.of("topic=forwarded-topic"));
+    return push.to("refs/for/master");
   }
 
   /** How a command run over a plain SSH channel ended. */
@@ -408,102 +453,16 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     }
   }
 
+  private int sshPort() {
+    return SocketUtil.resolve(cfg.getString("sshd", null, "listenAddress"), 0).getPort();
+  }
+
   private Project.NameKey newProject(boolean peerRanksFirst) {
     for (int i = 0; ; i++) {
       String candidate = name("forwarded-" + i);
       if (WriteRouter.outranks(candidate, PEER, SELF) == peerRanksFirst) {
         return projectOperations.newProject().name(candidate).create();
       }
-    }
-  }
-
-  private InetSocketAddress httpAddress() {
-    URI url = URI.create(canonicalWebUrl.get());
-    return new InetSocketAddress(url.getHost(), url.getPort());
-  }
-
-  private int sshPort() {
-    return SocketUtil.resolve(cfg.getString("sshd", null, "listenAddress"), 0).getPort();
-  }
-
-  /** Starts a stand-in SSH daemon that presents this daemon's host key; returns its port. */
-  private int startFakeSsh(Behavior behavior) throws IOException {
-    fakeSsh = SshServer.setUpDefaultServer();
-    fakeSsh.setHost("127.0.0.1");
-    fakeSsh.setPort(0);
-    fakeSsh.setKeyPairProvider(SSH_SIDE.hostKeys);
-    fakeSsh.setPublickeyAuthenticator(AcceptAllPublickeyAuthenticator.INSTANCE);
-    fakeSsh.setCommandFactory(
-        (channel, command) -> {
-          commandsAtFakeSsh.add(command);
-          return new FakeCommand(behavior);
-        });
-    fakeSsh.start();
-    return fakeSsh.getPort();
-  }
-
-  private static final class FakeCommand implements Command {
-    private final Behavior behavior;
-    private InputStream in;
-    private OutputStream out;
-
-    FakeCommand(Behavior behavior) {
-      this.behavior = behavior;
-    }
-
-    @Override
-    public void setInputStream(InputStream in) {
-      this.in = in;
-    }
-
-    @Override
-    public void setOutputStream(OutputStream out) {
-      this.out = out;
-    }
-
-    @Override
-    public void setErrorStream(OutputStream err) {}
-
-    @Override
-    public void setExitCallback(ExitCallback callback) {}
-
-    @Override
-    public void start(ChannelSession channel, Environment env) {
-      Thread command =
-          new Thread(
-              () -> {
-                try {
-                  if (behavior != Behavior.HANG_UP) {
-                    out.write(emptyAdvertisement());
-                    out.flush();
-                  }
-                  if (behavior == Behavior.ADVERTISE_AND_HANG_UP_ON_INPUT) {
-                    @SuppressWarnings("unused")
-                    int first = in.read();
-                  } else if (behavior == Behavior.ADVERTISE_THEN_HANG_UP) {
-                    // Let the advertisement leave before the session goes.
-                    Thread.sleep(200);
-                  }
-                } catch (IOException | InterruptedException ended) {
-                  // Hang up all the same.
-                }
-                channel.getSession().close(true);
-              },
-              "FakeSshPeer");
-      command.setDaemon(true);
-      command.start();
-    }
-
-    @Override
-    public void destroy(ChannelSession channel) {}
-
-    private static byte[] emptyAdvertisement() throws IOException {
-      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-      PacketLineOut lines = new PacketLineOut(bytes);
-      lines.writeString(
-          ObjectId.zeroId().name() + " capabilities^{}\0report-status delete-refs ofs-delta\n");
-      lines.end();
-      return bytes.toByteArray();
     }
   }
 }

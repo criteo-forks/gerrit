@@ -77,15 +77,16 @@ final class Receive extends AbstractGitCommand {
   @Override
   protected boolean handedToPeer() throws IOException, Failure {
     CurrentUser currentUser = session.getUser();
-    if (session.isFromPeer() || !currentUser.isIdentifiedUser() || currentUser.isImpersonating()) {
+    if (getArguments().length != 1
+        || !currentUser.isIdentifiedUser()
+        || currentUser.isImpersonated()
+        || user.isImpersonated()) {
       return false;
     }
     return peerRelay.receivePack(
         projectName.get(),
         currentUser.getAccountId(),
         session.getRemoteAddress(),
-        getArguments(),
-        extraParameters,
         commandExecutor,
         in,
         out,

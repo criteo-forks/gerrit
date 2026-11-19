@@ -20,6 +20,7 @@ import static javax.servlet.http.HttpServletResponse.SC_SERVICE_UNAVAILABLE;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.gerrit.server.CurrentUser;
+import com.google.gerrit.server.WriteForwarding;
 import com.google.gerrit.server.account.AccountLimits;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.git.QueueProvider;
@@ -157,6 +158,13 @@ public class ProjectQoSFilter implements Filter {
       throws IOException, ServletException {
     final HttpServletRequest req = (HttpServletRequest) request;
     final HttpServletResponse rsp = (HttpServletResponse) response;
+
+    // The private connector admits a bounded number of writes across all source pods.
+    // A forwarded push must not wait for a public SSH queue occupied by its senders.
+    if (Boolean.TRUE.equals(req.getAttribute(WriteForwarding.PEER_CONNECTOR))) {
+      chain.doFilter(req, rsp);
+      return;
+    }
 
     final TaskThunk task;
 

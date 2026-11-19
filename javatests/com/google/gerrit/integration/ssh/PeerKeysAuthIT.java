@@ -26,6 +26,7 @@ import com.google.gerrit.acceptance.GerritServer.TestSshServerAddress;
 import com.google.gerrit.acceptance.NoHttpd;
 import com.google.gerrit.acceptance.StandaloneSiteTest;
 import com.google.gerrit.acceptance.UseSsh;
+import com.google.gerrit.acceptance.config.GerritConfig;
 import com.google.gerrit.common.Version;
 import com.google.gerrit.server.PeerDaemonUser;
 import com.google.inject.Inject;
@@ -78,6 +79,30 @@ public class PeerKeysAuthIT extends StandaloneSiteTest {
 
       // Wipe out the content of the peer keys file
       Files.delete(sitePaths.peer_keys);
+      assertThrows(IOException.class, () -> execGerritVersionCommand());
+    }
+  }
+
+  @Test
+  @GerritConfig(name = "sshd.enablePeerDaemon", value = "false")
+  public void disablingPeerLoginsRejectsAListedKey() throws Exception {
+    assertListedKeyDenied();
+  }
+
+  @Test
+  @GerritConfig(
+      name = "walgerrit.forwardingSecret",
+      value = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+  public void aForwardingKeyDisablesPeerDaemonLoginByDefault() throws Exception {
+    assertListedKeyDenied();
+  }
+
+  private void assertListedKeyDenied() throws Exception {
+    try (ServerContext ctx = startServer()) {
+      ctx.getInjector().injectMembers(this);
+      execute(ImmutableList.<String>builder().add(SSH_KEYGEN_CMD).build());
+      String key = Files.readString(sitePaths.data_dir.resolve("id_rsa.pub")).split(" ", -1)[1];
+      Files.writeString(sitePaths.peer_keys, key);
       assertThrows(IOException.class, () -> execGerritVersionCommand());
     }
   }

@@ -105,6 +105,10 @@ class ProjectBasicAuthFilter implements Filter {
   @Override
   public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
       throws IOException, ServletException {
+    if (PeerWriteFilter.isPeer(request)) {
+      chain.doFilter(request, response);
+      return;
+    }
     HttpServletRequest req = (HttpServletRequest) request;
     Response rsp = new Response((HttpServletResponse) response);
 

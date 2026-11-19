@@ -20,6 +20,7 @@ import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.gerrit.common.Nullable;
+import com.google.gerrit.server.WritePeerTls;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -33,15 +34,21 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLServerSocket;
+import org.eclipse.jgit.lib.Config;
 
-/**
- * A stand-in for another node of a cluster, listening for HTTP on a loopback port.
- *
- * <p>It answers the hello that names a node and its SSH port. What it does with any other request
- * is chosen by the test: answer it, pass the connection through to a real server, hang up after
- * reading the request's head, or refuse as not serving. It records the requests it received.
- */
+/** A loopback mutual TLS peer that records decrypted application requests. */
 public final class FakePeer implements AutoCloseable {
+  public static final String SECRET = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  private static final SSLContext TLS = WritePeerTls.fromSecret(SECRET);
+
+  public static Config config() {
+    Config config = new Config();
+    config.setString("walgerrit", null, "forwardingSecret", SECRET);
+    return config;
+  }
+
   private static final String HELLO = "/peerz";
 
   /** One request other than a hello; {@code body} is null when the connection was passed on. */
@@ -57,7 +64,10 @@ public final class FakePeer implements AutoCloseable {
   private enum Mode {
     ANSWER,
     RELAY,
-    HANG_UP
+    DROP_REPLY,
+    HANG_UP,
+    BREAK_BEFORE_INPUT,
+    BREAK_AFTER_INPUT
   }
 
   private final String name;
@@ -65,7 +75,10 @@ public final class FakePeer implements AutoCloseable {
   private final List<Request> requests = new ArrayList<>();
   private final Thread acceptor;
 
-  private volatile int sshPort;
+  private volatile String helloBody;
+  private volatile int helloStatus = 200;
+  private volatile String targetName;
+  private volatile int discardedStatus;
   private volatile Mode mode = Mode.ANSWER;
   private volatile int status = 200;
   private volatile ImmutableMap<String, String> answerHeaders = ImmutableMap.of();
@@ -73,8 +86,19 @@ public final class FakePeer implements AutoCloseable {
   private volatile InetSocketAddress relayTo;
 
   public FakePeer(String name) throws IOException {
+    this(name, TLS);
+  }
+
+  public FakePeer(String name, SSLContext tls) throws IOException {
     this.name = name;
-    this.listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+    this.helloBody = name;
+    SSLServerSocket socket =
+        (SSLServerSocket)
+            tls.getServerSocketFactory()
+                .createServerSocket(0, 50, InetAddress.getLoopbackAddress());
+    socket.setEnabledProtocols(new String[] {"TLSv1.3"});
+    socket.setNeedClientAuth(true);
+    this.listener = socket;
     this.acceptor = new Thread(this::accept, "FakePeer-" + name);
     acceptor.setDaemon(true);
     acceptor.start();
@@ -82,17 +106,20 @@ public final class FakePeer implements AutoCloseable {
 
   /** {@code host:port}, as a node's peer list names it. */
   public String address() {
-    return listener.getInetAddress().getHostAddress() + ":" + listener.getLocalPort();
+    return "127.0.0.1:" + listener.getLocalPort();
   }
 
   public String name() {
     return name;
   }
 
-  /** The SSH port the hello announces; 0, the default, for none. */
-  public FakePeer sshPort(int port) {
-    sshPort = port;
-    return this;
+  public int port() {
+    return listener.getLocalPort();
+  }
+
+  public void hello(int status, String body) {
+    helloStatus = status;
+    helloBody = body;
   }
 
   /** Answers every request with this status, these headers and this body. */
@@ -104,9 +131,10 @@ public final class FakePeer implements AutoCloseable {
     return this;
   }
 
-  /** Passes every connection through to the server at {@code target}, byte for byte. */
-  public FakePeer relayTo(InetSocketAddress target) {
+  /** Relays requests to the daemon at {@code target} using its expected destination name. */
+  public FakePeer relayTo(InetSocketAddress target, String destinationName) {
     relayTo = target;
+    targetName = destinationName;
     mode = Mode.RELAY;
     return this;
   }
@@ -115,6 +143,18 @@ public final class FakePeer implements AutoCloseable {
   public FakePeer hangUp() {
     mode = Mode.HANG_UP;
     return this;
+  }
+
+  public int discardedStatus() {
+    return discardedStatus;
+  }
+
+  public void dropReply() {
+    mode = Mode.DROP_REPLY;
+  }
+
+  public void breakDuringReceive(boolean afterInput) {
+    mode = afterInput ? Mode.BREAK_AFTER_INPUT : Mode.BREAK_BEFORE_INPUT;
   }
 
   public synchronized ImmutableList<Request> requests() {
@@ -160,17 +200,41 @@ public final class FakePeer implements AutoCloseable {
             line.substring(0, colon).toLowerCase(Locale.US), line.substring(colon + 1).trim());
       }
       if (target.equals(HELLO)) {
-        respond(out, 200, ImmutableMap.of(), (name + "\n" + sshPort + "\n").getBytes(UTF_8));
+        respond(out, helloStatus, ImmutableMap.of(), helloBody.getBytes(UTF_8));
         return;
       }
       Mode now = mode;
-      if (now == Mode.RELAY) {
+      if (now == Mode.RELAY || now == Mode.DROP_REPLY) {
         record(method, target, headers, null);
-        relay(socket, head);
+        relay(socket, head, now == Mode.DROP_REPLY);
         return;
       }
       if (now == Mode.HANG_UP) {
         record(method, target, headers, null);
+        return;
+      }
+      if (now == Mode.BREAK_BEFORE_INPUT || now == Mode.BREAK_AFTER_INPUT) {
+        record(method, target, headers, null);
+        out.write(
+            ("HTTP/1.1 200 OK\r\nContent-Type: "
+                    + com.google.gerrit.server.WriteForwarding.NATIVE_TYPE
+                    + "\r\nConnection: close\r\n\r\n")
+                .getBytes(ISO_8859_1));
+        var bytes = new ByteArrayOutputStream();
+        var linesOut = new org.eclipse.jgit.transport.PacketLineOut(bytes);
+        linesOut.writeString(
+            org.eclipse.jgit.lib.ObjectId.zeroId().name()
+                + " capabilities^{}\0report-status delete-refs ofs-delta\n");
+        linesOut.end();
+        var frames = new com.google.gerrit.server.PeerGitStream(out);
+        frames.stream(false).write(bytes.toByteArray());
+        out.flush();
+        if (now == Mode.BREAK_AFTER_INPUT) {
+          int size = Integer.parseInt(readLine(in), 16);
+          if (size > 0) {
+            in.readNBytes(size);
+          }
+        }
         return;
       }
       record(method, target, headers, readBody(in, headers));
@@ -239,9 +303,22 @@ public final class FakePeer implements AutoCloseable {
     out.flush();
   }
 
-  private void relay(Socket client, byte[] head) throws IOException {
-    try (Socket server = new Socket(relayTo.getAddress(), relayTo.getPort())) {
-      server.getOutputStream().write(head);
+  private void relay(Socket client, byte[] head, boolean dropReply) throws IOException {
+    try (Socket server =
+        TLS.getSocketFactory().createSocket(relayTo.getAddress(), relayTo.getPort())) {
+      // A loopback daemon sees its own name as the destination of the private hop.
+      String headers =
+          new String(head, ISO_8859_1)
+              .replace(
+                  "X-Gerrit-Forwarded-By: " + name + "\r\n",
+                  "X-Gerrit-Forwarded-By: " + targetName + "\r\n");
+      if (dropReply) {
+        headers =
+            headers
+                .replaceAll("(?im)^Connection: [^\r\n]*\r\n", "")
+                .replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n");
+      }
+      server.getOutputStream().write(headers.getBytes(ISO_8859_1));
       server.getOutputStream().flush();
       Thread upstream =
           new Thread(
@@ -257,7 +334,17 @@ public final class FakePeer implements AutoCloseable {
       upstream.setDaemon(true);
       upstream.start();
       try {
-        server.getInputStream().transferTo(client.getOutputStream());
+        if (dropReply) {
+          InputStream answer = server.getInputStream();
+          byte[] responseHead = readHead(answer);
+          if (responseHead != null) {
+            discardedStatus =
+                Integer.parseInt(new String(responseHead, ISO_8859_1).split(" ", 3)[1]);
+            answer.transferTo(OutputStream.nullOutputStream());
+          }
+        } else {
+          server.getInputStream().transferTo(client.getOutputStream());
+        }
       } finally {
         client.shutdownOutput();
       }

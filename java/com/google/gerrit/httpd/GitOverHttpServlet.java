@@ -29,8 +29,10 @@ import com.google.gerrit.extensions.restapi.AuthException;
 import com.google.gerrit.server.AccessPath;
 import com.google.gerrit.server.AnonymousUser;
 import com.google.gerrit.server.CurrentUser;
+import com.google.gerrit.server.PeerGitStream;
 import com.google.gerrit.server.RequestInfo;
 import com.google.gerrit.server.RequestListener;
+import com.google.gerrit.server.WriteForwarding;
 import com.google.gerrit.server.audit.HttpAuditEvent;
 import com.google.gerrit.server.cache.CacheModule;
 import com.google.gerrit.server.git.GitRepositoryManager;
@@ -593,6 +595,9 @@ public class GitOverHttpServlet extends GitServlet {
       HttpServletResponseWithStatusWrapper responseWrapper =
           new HttpServletResponseWithStatusWrapper((HttpServletResponse) response);
       HttpServletRequest httpRequest = (HttpServletRequest) request;
+      boolean nativeReceive =
+          PeerWriteFilter.isPeer(request)
+              && httpRequest.getHeader(WriteForwarding.NATIVE_HEADER) != null;
       Capable canUpload;
       try {
         try {
@@ -600,10 +605,10 @@ public class GitOverHttpServlet extends GitServlet {
               .currentUser()
               .project(state.getNameKey())
               .test(ProjectPermission.RUN_RECEIVE_PACK)) {
-            GitSmartHttpTools.sendError(
+            refuseReceive(
                 httpRequest,
                 responseWrapper,
-                HttpServletResponse.SC_FORBIDDEN,
+                nativeReceive,
                 "receive-pack not permitted on this server");
             return;
           }
@@ -626,11 +631,17 @@ public class GitOverHttpServlet extends GitServlet {
       }
 
       if (canUpload != Capable.OK) {
-        GitSmartHttpTools.sendError(
-            httpRequest,
-            responseWrapper,
-            HttpServletResponse.SC_FORBIDDEN,
-            "\n" + canUpload.getMessage());
+        refuseReceive(httpRequest, responseWrapper, nativeReceive, "\n" + canUpload.getMessage());
+        return;
+      }
+
+      if (nativeReceive) {
+        responseWrapper.setContentType(WriteForwarding.NATIVE_TYPE);
+        PeerGitStream reply = new PeerGitStream(responseWrapper.getOutputStream());
+        // SSH clients can wait for report-status before closing their input stream.
+        rp.setBiDirectionalPipe(true);
+        rp.receive(httpRequest.getInputStream(), reply.stream(false), reply.stream(true));
+        reply.finish(0);
         return;
       }
 
@@ -661,6 +672,19 @@ public class GitOverHttpServlet extends GitServlet {
 
       if (isGet) {
         cache.put(cacheKey, Collections.unmodifiableSet(new HashSet<>(rp.getAdvertisedObjects())));
+      }
+    }
+
+    private static void refuseReceive(
+        HttpServletRequest req, HttpServletResponse rsp, boolean nativeReceive, String reason)
+        throws IOException {
+      if (nativeReceive) {
+        // The native client waits for an advertisement before sending any request body.
+        rsp.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        rsp.setContentLength(0);
+        rsp.flushBuffer();
+      } else {
+        GitSmartHttpTools.sendError(req, rsp, HttpServletResponse.SC_FORBIDDEN, reason);
       }
     }
 

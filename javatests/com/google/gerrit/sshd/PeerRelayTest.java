@@ -15,58 +15,29 @@ package com.google.gerrit.sshd;
 
 import static com.google.common.truth.Truth.assertThat;
 
-import com.google.gerrit.entities.Account;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
+import com.google.gerrit.server.PeerGitStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import org.junit.Test;
 
 public class PeerRelayTest {
   @Test
-  public void theCommandKeepsTheClientsArguments() throws Exception {
-    String[] arguments = {
-      "--reviewer", "a b@example.com", "--cc", "o'neil", "/team \"x\"/it's\\here.git"
-    };
-    String command =
-        PeerRelay.command(
-            Account.id(1000042),
-            new InetSocketAddress(InetAddress.getByName("192.0.2.7"), 50123),
-            arguments);
-    assertThat(CommandFactoryProvider.split(command))
-        .asList()
-        .containsExactly(
-            "suexec",
-            "--as",
-            "1000042",
-            "--from",
-            "192.0.2.7:50123",
-            "--",
-            "git-receive-pack",
-            "--reviewer",
-            "a b@example.com",
-            "--cc",
-            "o'neil",
-            "/team \"x\"/it's\\here.git")
-        .inOrder();
-  }
-
-  @Test
-  public void anIpv6ClientIsBracketed() throws Exception {
-    String command =
-        PeerRelay.command(
-            Account.id(7),
-            new InetSocketAddress(InetAddress.getByName("2001:db8::1"), 22),
-            new String[] {"/p"});
-    assertThat(CommandFactoryProvider.split(command))
-        .asList()
-        .containsExactly(
-            "suexec",
-            "--as",
-            "7",
-            "--from",
-            "[2001:db8:0:0:0:0:0:1]:22",
-            "--",
-            "git-receive-pack",
-            "/p")
-        .inOrder();
+  public void stdoutStderrAndExitSurviveFraming() throws Exception {
+    var wire = new ByteArrayOutputStream();
+    var stream = new PeerGitStream(wire);
+    stream.stream(false).write(new byte[PeerGitStream.MAX_FRAME + 1]);
+    stream.stream(true).write(42);
+    stream.finish(128);
+    var in = new DataInputStream(new ByteArrayInputStream(wire.toByteArray()));
+    assertThat(in.readInt()).isEqualTo(PeerGitStream.MAX_FRAME);
+    in.skipNBytes(PeerGitStream.MAX_FRAME);
+    assertThat(in.readInt()).isEqualTo(1);
+    assertThat(in.readUnsignedByte()).isEqualTo(0);
+    assertThat(in.readInt()).isEqualTo(-1);
+    assertThat(in.readUnsignedByte()).isEqualTo(42);
+    assertThat(in.readInt()).isEqualTo(0);
+    assertThat(in.readUnsignedByte()).isEqualTo(128);
+    assertThat(in.read()).isEqualTo(-1);
   }
 }

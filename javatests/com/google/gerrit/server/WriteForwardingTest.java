@@ -15,22 +15,18 @@ package com.google.gerrit.server;
 
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.google.gerrit.metrics.DisabledMetricMaker;
 import com.google.gerrit.server.WriteForwarding.Peer;
 import com.google.gerrit.server.config.GerritRuntime;
-import com.sun.net.httpserver.HttpServer;
+import com.google.gerrit.util.http.testutil.FakePeer;
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import org.eclipse.jgit.lib.Config;
 import org.junit.After;
@@ -41,48 +37,23 @@ public class WriteForwardingTest {
   private static final List<String> NAMES = List.of("gerrit-0", "gerrit-1", "gerrit-2", "gerrit-3");
   private static final List<String> PROJECTS = List.of("a", "platform/monorepo", "tools/build");
 
-  /** Answers the hello of one node; {@code status} is what it answers with. */
-  private static final class Hello {
-    final HttpServer server;
-    final AtomicInteger status = new AtomicInteger(200);
-
-    Hello(String name, int sshPort) throws IOException {
-      server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
-      server.createContext(
-          WriteForwarding.HELLO_PATH,
-          exchange -> {
-            byte[] body = (name + "\n" + sshPort + "\n").getBytes(UTF_8);
-            if (status.get() == 200) {
-              exchange.sendResponseHeaders(200, body.length);
-              exchange.getResponseBody().write(body);
-            } else {
-              exchange.sendResponseHeaders(status.get(), -1);
-            }
-            exchange.close();
-          });
-      server.start();
-    }
-
-    String address() {
-      return "127.0.0.1:" + server.getAddress().getPort();
-    }
-  }
-
-  private final List<Hello> hellos = new ArrayList<>();
+  private final List<FakePeer> hellos = new ArrayList<>();
   private final List<String> addresses = new ArrayList<>();
 
   @Before
   public void startNodes() throws Exception {
     for (int i = 0; i < NAMES.size(); i++) {
-      Hello hello = new Hello(NAMES.get(i), 29418 + i);
+      FakePeer hello = new FakePeer(NAMES.get(i));
       hellos.add(hello);
       addresses.add(hello.address());
     }
   }
 
   @After
-  public void stopNodes() {
-    hellos.forEach(hello -> hello.server.stop(0));
+  public void stopNodes() throws IOException {
+    for (FakePeer peer : hellos) {
+      peer.close();
+    }
   }
 
   @Test
@@ -142,18 +113,18 @@ public class WriteForwardingTest {
     WriteForwarding node = probed("gerrit-0");
     assertThat(names(node.peers())).containsExactly("gerrit-1", "gerrit-2", "gerrit-3");
     Peer peer = node.peers().iterator().next();
-    assertThat(peer.sshPort()).isEqualTo(29419);
+    assertThat(peer.httpPort()).isEqualTo(hellos.get(1).port());
     assertThat(peer.httpAuthority()).isEqualTo(addresses.get(1));
   }
 
   @Test
-  public void aPeerThatDoesNotAnswerIsNoCandidate() {
+  public void aPeerThatDoesNotAnswerIsNoCandidate() throws Exception {
     WriteForwarding node = probed("gerrit-0");
-    hellos.get(1).status.set(503);
-    hellos.get(2).server.stop(0);
+    hellos.get(1).hello(503, "");
+    hellos.get(2).close();
     node.probe();
     assertThat(names(node.peers())).containsExactly("gerrit-3");
-    hellos.get(1).status.set(200);
+    hellos.get(1).hello(200, NAMES.get(1));
     node.probe();
     assertThat(names(node.peers())).containsExactly("gerrit-1", "gerrit-3");
   }
@@ -189,9 +160,8 @@ public class WriteForwardingTest {
 
   @Test
   public void aPeerWithoutAPortTakesThisNodesPort() throws Exception {
-    Config config = new Config();
-    int port = hellos.get(1).server.getAddress().getPort();
-    config.setString("httpd", null, "listenUrl", "proxy-https://*:" + port + "/");
+    Config config = FakePeer.config();
+    config.setInt("walgerrit", null, "forwardingPort", hellos.get(1).port());
     WriteForwarding node =
         new WriteForwarding(
             () -> "gerrit-0",
@@ -204,28 +174,33 @@ public class WriteForwardingTest {
   }
 
   @Test
-  public void aListenerThatTerminatesTlsHasNoPeers() {
-    Config config = new Config();
-    config.setString("httpd", null, "listenUrl", "https://*:8443/");
-    WriteForwarding node =
-        new WriteForwarding(
-            () -> "gerrit-0",
-            () -> addresses,
-            config,
-            GerritRuntime.DAEMON,
-            new DisabledMetricMaker());
-    node.probe();
-    assertThat(node.peers()).isEmpty();
+  public void aPeerCannotAdvertiseADialPort() {
+    hellos.get(1).hello(200, "gerrit-1\n22\n");
+    assertThat(names(probed("gerrit-0").peers())).doesNotContain("gerrit-1");
   }
 
   @Test
-  public void probeListenersSeeThePeers() {
-    WriteForwarding node = node("gerrit-0", addresses);
-    List<Collection<Peer>> seen = new ArrayList<>();
-    node.onProbe(seen::add);
-    node.probe();
-    assertThat(seen).hasSize(1);
-    assertThat(names(seen.get(0))).containsExactly("gerrit-1", "gerrit-2", "gerrit-3");
+  public void absentSecretWrongClusterOffSwitchAndCustomFiltersKeepWritesLocal() {
+    Config wrong = FakePeer.config();
+    wrong.setString(
+        "walgerrit", null, "forwardingSecret", "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    Config invalid = FakePeer.config();
+    invalid.setString("walgerrit", null, "forwardingSecret", "short");
+    Config off = FakePeer.config();
+    off.setBoolean("walgerrit", null, "forwardWrites", false);
+    Config custom = FakePeer.config();
+    custom.setString("httpd", null, "filterClass", "example.Authentication");
+    for (Config config : List.of(new Config(), wrong, invalid, off, custom)) {
+      WriteForwarding node =
+          new WriteForwarding(
+              () -> NAMES.get(0),
+              () -> addresses,
+              config,
+              GerritRuntime.DAEMON,
+              new DisabledMetricMaker());
+      node.probe();
+      assertThat(node.peers()).isEmpty();
+    }
   }
 
   private WriteForwarding probed(String name) {
@@ -236,7 +211,11 @@ public class WriteForwardingTest {
 
   private static WriteForwarding node(String name, List<String> addresses) {
     return new WriteForwarding(
-        () -> name, () -> addresses, new Config(), GerritRuntime.DAEMON, new DisabledMetricMaker());
+        () -> name,
+        () -> addresses,
+        FakePeer.config(),
+        GerritRuntime.DAEMON,
+        new DisabledMetricMaker());
   }
 
   private static String executor(

@@ -29,6 +29,7 @@ import com.google.gerrit.httpd.GitOverHttpModule;
 import com.google.gerrit.httpd.H2CacheBasedWebSession;
 import com.google.gerrit.httpd.HttpCanonicalWebUrlProvider;
 import com.google.gerrit.httpd.HttpdModule;
+import com.google.gerrit.httpd.PeerWriteFilter;
 import com.google.gerrit.httpd.RequestCleanupFilter;
 import com.google.gerrit.httpd.RequestContextFilter;
 import com.google.gerrit.httpd.RequestMetricsFilter;
@@ -439,7 +440,7 @@ public class WebAppInitializer extends GuiceServletContextListener implements Fi
   private Injector createWebInjector() {
     final List<Module> modules = new ArrayList<>();
     modules.add(ServingGateFilter.module());
-    modules.add(WriteForwardingFilter.module());
+    modules.add(PeerWriteFilter.module());
     modules.add(RequestContextFilter.module());
     modules.add(RequestMetricsFilter.module());
     modules.add(sysInjector.getInstance(GerritAuthModule.class));
@@ -467,6 +468,8 @@ public class WebAppInitializer extends GuiceServletContextListener implements Fi
     modules.add(new AuthModule(authConfig));
 
     modules.add(sysInjector.getInstance(GetUserFilter.GetUserFilterModule.class));
+
+    modules.add(WriteForwardingFilter.module());
 
     // StaticModule contains a "/*" wildcard, place it last.
     GerritOptions opts = sysInjector.getInstance(GerritOptions.class);

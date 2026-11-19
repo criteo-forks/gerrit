@@ -143,19 +143,13 @@ public final class SuExec extends BaseCommand {
     } else {
       peer = peerAddress;
     }
-    boolean fromPeer = caller instanceof PeerDaemonUser;
-    if (fromPeer) {
+    if (caller instanceof PeerDaemonUser) {
       caller = null;
     }
-    SshSession as =
-        new SshSession(
-            session,
-            peer,
-            userFactory.runAs(peer, accountId, caller, ImpersonationPermissionMode.THIS_USER));
-    if (fromPeer) {
-      as.setFromPeer();
-    }
-    return as;
+    return new SshSession(
+        session,
+        peer,
+        userFactory.runAs(peer, accountId, caller, ImpersonationPermissionMode.THIS_USER));
   }
 
   private static String join(List<String> args) {

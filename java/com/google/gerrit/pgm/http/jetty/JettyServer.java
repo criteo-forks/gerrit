@@ -25,6 +25,7 @@ import com.google.gerrit.extensions.client.AuthType;
 import com.google.gerrit.extensions.events.LifecycleListener;
 import com.google.gerrit.httpd.RemoteUserUtil;
 import com.google.gerrit.pgm.http.jetty.HttpLog.HttpLogFactory;
+import com.google.gerrit.server.WriteForwarding;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.config.SitePaths;
 import com.google.gerrit.server.config.ThreadSettingsConfig;
@@ -258,6 +259,42 @@ public class JettyServer {
     QueuedThreadPool pool = threadPool(cfg, threadSettingsConfig);
     httpd = new Server(pool);
     httpd.setConnectors(listen(httpd, cfg));
+    WriteForwarding forwarding = env.webInjector.getInstance(WriteForwarding.class);
+    if (forwarding.tls() != null && !forwarding.name().isEmpty()) {
+      SslContextFactory.Server ssl = new SslContextFactory.Server();
+      ssl.setSslContext(forwarding.tls());
+      ssl.setIncludeProtocols("TLSv1.3");
+      ssl.setNeedClientAuth(true);
+      var config = defaultConfig(cfg.getInt("httpd", "requestheadersize", 16386));
+      config.setUriCompliance(
+          UriCompliance.from(
+              EnumSet.of(
+                  UriCompliance.Violation.AMBIGUOUS_PATH_SEPARATOR,
+                  UriCompliance.Violation.AMBIGUOUS_PATH_ENCODING)));
+      // A native receive-pack advertises refs before the client sends any commands.
+      config.setDelayDispatchUntilContent(false);
+      // This connector authenticates the cluster key. It never interprets proxy headers.
+      config.addCustomizer(new SecureRequestCustomizer(false));
+      config.addCustomizer(
+          (request, headers) -> {
+            request.setAttribute(WriteForwarding.PEER_CONNECTOR, Boolean.TRUE);
+            return request;
+          });
+      var connector =
+          new ServerConnector(
+              httpd,
+              null,
+              null,
+              null,
+              0,
+              1,
+              new SslConnectionFactory(ssl, "http/1.1"),
+              new HttpConnectionFactory(config));
+      connector.setHost(((ServerConnector) httpd.getConnectors()[0]).getHost());
+      connector.setPort(forwarding.port());
+      connector.setIdleTimeout(30000);
+      httpd.addConnector(connector);
+    }
     connStats = new ConnectionStatistics();
     for (Connector connector : httpd.getConnectors()) {
       connector.addBean(connStats);

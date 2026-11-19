@@ -33,6 +33,7 @@ import com.google.gerrit.httpd.GitOverHttpModule;
 import com.google.gerrit.httpd.H2CacheBasedWebSession;
 import com.google.gerrit.httpd.HttpCanonicalWebUrlProvider;
 import com.google.gerrit.httpd.HttpdModule;
+import com.google.gerrit.httpd.PeerWriteFilter;
 import com.google.gerrit.httpd.RequestCleanupFilter;
 import com.google.gerrit.httpd.RequestContextFilter;
 import com.google.gerrit.httpd.RequestMetricsFilter;
@@ -681,7 +682,7 @@ public class Daemon extends SiteProgram {
   private Injector createWebInjector() {
     final List<Module> modules = new ArrayList<>();
     modules.add(ServingGateFilter.module());
-    modules.add(WriteForwardingFilter.module());
+    modules.add(PeerWriteFilter.module());
     modules.add(RequestContextFilter.module());
     modules.add(RequestMetricsFilter.module());
     modules.add(H2CacheBasedWebSession.module());
@@ -712,6 +713,7 @@ public class Daemon extends SiteProgram {
     }
 
     modules.add(sysInjector.getInstance(GetUserFilterModule.class));
+    modules.add(WriteForwardingFilter.module());
 
     // StaticModule contains a "/*" wildcard, place it last.
     GerritOptions opts = sysInjector.getInstance(GerritOptions.class);

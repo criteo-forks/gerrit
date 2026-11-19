@@ -111,7 +111,6 @@ public class SshModule extends LifecycleModule {
     listener().toInstance(registerInParentInjectors());
     listener().to(SshLog.class);
     listener().to(SshDaemon.class);
-    listener().to(PeerRelay.class);
     listener().to(CommandFactoryProvider.class);
   }
 

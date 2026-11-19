@@ -35,8 +35,9 @@ class HttpRemotePeerProvider implements Provider<SocketAddress> {
 
   @Override
   public SocketAddress get() {
-    final String addr = req.getRemoteAddr();
-    final int port = req.getRemotePort();
+    String peerClient = (String) req.getAttribute(PeerWriteFilter.CLIENT_ADDRESS);
+    String addr = peerClient != null ? peerClient : req.getRemoteAddr();
+    int port = peerClient != null ? 0 : req.getRemotePort();
     try {
       return new InetSocketAddress(InetAddress.getByName(addr), port);
     } catch (UnknownHostException e) {

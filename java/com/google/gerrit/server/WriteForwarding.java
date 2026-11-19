@@ -15,7 +15,6 @@ package com.google.gerrit.server;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
-import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.flogger.FluentLogger;
 import com.google.common.net.HostAndPort;
@@ -46,16 +45,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
-import java.util.function.IntSupplier;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
 import org.eclipse.jgit.lib.Config;
 
 /**
@@ -67,26 +64,8 @@ import org.eclipse.jgit.lib.Config;
  * link to that node, and executes it itself otherwise. A node always executes what a peer handed
  * it, so a write crosses at most one link however the nodes' views of each other differ.
  *
- * <p>The cluster is described by two JDK-typed bindings, so a library built against the plugin API
- * can provide them:
- *
- * <pre>{@code
- * OptionalBinder.newOptionalBinder(binder(), WriteForwarding.NODE_KEY)
- *     .setBinding()
- *     .toInstance(() -> "gerrit-0");
- * OptionalBinder.newOptionalBinder(binder(), WriteForwarding.PEERS_KEY)
- *     .setBinding()
- *     .to(MyPeers.class);
- * }</pre>
- *
- * The first is this node's name, which must be the same each time the node starts and differ from
- * every other node's. The second lists where the other nodes listen for HTTP, as {@code host} or
- * {@code host:port}; a host without a port takes this node's own HTTP port. It may include this
- * node. {@link WriteForwardingModule} supplies the defaults, no name and no peers, with which every
- * write is executed where it arrives.
- *
- * <p>A peer is a candidate while it answers {@link #HELLO_PATH}, which it does while it serves
- * requests. The answer carries its name and its SSH port.
+ * <p>The plugin supplies a stable node name and peer addresses. A peer joins the candidate set when
+ * its private TLS listener answers a hello while the serving gate is open.
  */
 @Singleton
 public class WriteForwarding implements LifecycleListener {
@@ -101,20 +80,25 @@ public class WriteForwarding implements LifecycleListener {
   public static final Key<Supplier<Collection<String>>> PEERS_KEY =
       Key.get(new TypeLiteral<Supplier<Collection<String>>>() {}, Names.named(PEERS));
 
-  /** Answered with this node's name and SSH port, one per line. */
+  /** Private readiness and node identity endpoint. */
   public static final String HELLO_PATH = "/peerz";
 
-  /** Set, to the sender's name, on an HTTP request that a peer hands to this node. */
+  /** Set by Jetty on requests from the mutually authenticated peer connector. */
+  public static final String PEER_CONNECTOR = WriteForwarding.class.getName() + ".connector";
+
+  public static final String ACCOUNT_HEADER = "X-Gerrit-Peer-Account";
+  public static final String ADDRESS_HEADER = "X-Gerrit-Peer-Address";
+  public static final String NATIVE_HEADER = "X-Gerrit-Peer-Receive";
+  public static final String NATIVE_TYPE = "application/x-walgerrit-duplex-receive-pack";
+
   public static final String FORWARDED_HEADER = "X-Gerrit-Forwarded-By";
 
   private static final int PROBE_INTERVAL_MILLIS = 1000;
   private static final int PROBE_TIMEOUT_MILLIS = 1000;
   private static final int MAX_HELLO_BYTES = 512;
-  private static final Pattern LISTEN_URL =
-      Pattern.compile("^(?:proxy-)?https?://[^/]*?(?::([0-9]+))?(/.*)?$");
+  private static final Pattern NODE_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,252}");
 
-  /** A node that answered {@link #HELLO_PATH}; {@code sshPort} is 0 when it has no SSH daemon. */
-  public record Peer(String name, String host, int httpPort, int sshPort) {
+  public record Peer(String name, String host, int httpPort) {
     /** The peer's address for a URL or a log line. */
     public String httpAuthority() {
       return (host.indexOf(':') >= 0 ? "[" + host + "]" : host) + ":" + httpPort;
@@ -132,13 +116,13 @@ public class WriteForwarding implements LifecycleListener {
 
   private final Supplier<String> node;
   private final Supplier<Collection<String>> addresses;
-  private final Config config;
+  private final String contextPath;
+  private final int port;
+  @Nullable private final SSLContext tls;
   private final GerritRuntime runtime;
   private final Counter2<String, String> requests;
-  private final List<Consumer<Collection<Peer>>> listeners = new CopyOnWriteArrayList<>();
 
   private volatile ImmutableMap<String, Peer> peers = ImmutableMap.of();
-  private volatile IntSupplier sshPort = () -> 0;
   private ScheduledExecutorService prober;
 
   @Inject
@@ -150,7 +134,11 @@ public class WriteForwarding implements LifecycleListener {
       MetricMaker metrics) {
     this.node = node;
     this.addresses = addresses;
-    this.config = config;
+    this.tls = configuredTls(config);
+    port = config.getIntInRange("walgerrit", null, "forwardingPort", 1, 65535, 9443);
+    String[] urls = config.getStringList("httpd", null, "listenUrl");
+    String path = urls.length == 0 ? "" : URI.create(urls[0]).getRawPath();
+    contextPath = path == null ? "" : path.replaceFirst("/+$", "");
     this.runtime = runtime;
     this.requests =
         metrics.newCounter(
@@ -161,7 +149,26 @@ public class WriteForwarding implements LifecycleListener {
                 "outcome",
                 "forwarded: the peer answered; fallback: executed here because the peer could not"
                     + " be reached; busy: executed here because too many threads were handing"
-                    + " writes over; failed: the link broke after the peer may have acted"));
+                    + " writes over; inbound_busy: destination admission limit reached; failed: the"
+                    + " link broke after the peer may have acted"));
+  }
+
+  @Nullable
+  private static SSLContext configuredTls(Config config) {
+    String secret = config.getString("walgerrit", null, "forwardingSecret");
+    if (secret == null
+        || secret.isBlank()
+        || !config.getBoolean("walgerrit", "forwardWrites", true)
+        || config.getStringList("httpd", null, "filterClass").length > 0) {
+      return null;
+    }
+    try {
+      return WritePeerTls.fromSecret(secret);
+    } catch (IllegalArgumentException malformed) {
+      logger.atWarning().log(
+          "Invalid walgerrit.forwardingSecret encoding. Executing writes locally.");
+      return null;
+    }
   }
 
   private static Field<String> field(String name, String description) {
@@ -174,7 +181,7 @@ public class WriteForwarding implements LifecycleListener {
 
   @Override
   public synchronized void start() {
-    if (runtime != GerritRuntime.DAEMON || prober != null) {
+    if (tls == null || runtime != GerritRuntime.DAEMON || prober != null) {
       return;
     }
     prober =
@@ -212,23 +219,22 @@ public class WriteForwarding implements LifecycleListener {
     }
   }
 
-  /** The port peers reach this node's SSH daemon on; 0 when it has none. */
-  public int sshPort() {
-    return sshPort.getAsInt();
+  @Nullable
+  public SSLContext tls() {
+    return tls;
   }
 
-  public void sshPort(IntSupplier port) {
-    sshPort = port;
+  public int port() {
+    return port;
+  }
+
+  public String contextPath() {
+    return contextPath;
   }
 
   /** The peers that answered the last probe and have not failed a hand-over since. */
   public Collection<Peer> peers() {
     return peers.values();
-  }
-
-  /** Calls {@code listener} after each probe with the peers that answered it. */
-  public void onProbe(Consumer<Collection<Peer>> listener) {
-    listeners.add(listener);
   }
 
   /**
@@ -289,16 +295,13 @@ public class WriteForwarding implements LifecycleListener {
   /** Asks every configured peer for its name and replaces the candidates with those that answer. */
   public synchronized void probe() {
     String self = name();
-    Collection<String> configured = self.isEmpty() ? List.of() : addresses.get();
+    Collection<String> configured = tls == null || self.isEmpty() ? List.of() : addresses.get();
     Map<String, Peer> answered = new LinkedHashMap<>();
     if (configured != null && !configured.isEmpty()) {
-      Listen listen = Listen.of(config);
-      if (listen != null) {
-        for (String address : configured) {
-          Peer peer = hello(address, listen);
-          if (peer != null && !peer.name().equals(self)) {
-            answered.putIfAbsent(peer.name(), peer);
-          }
+      for (String address : configured) {
+        Peer peer = hello(address);
+        if (peer != null && !peer.name().equals(self)) {
+          answered.putIfAbsent(peer.name(), peer);
         }
       }
     }
@@ -308,28 +311,24 @@ public class WriteForwarding implements LifecycleListener {
     if (!before.equals(now)) {
       logger.atInfo().log("Write forwarding: node %s has peers %s", self, now.values());
     }
-    for (Consumer<Collection<Peer>> listener : listeners) {
-      try {
-        listener.accept(now.values());
-      } catch (RuntimeException failure) {
-        logger.atWarning().withCause(failure).log("Write forwarding: a probe listener failed");
-      }
-    }
   }
 
   @Nullable
-  private static Peer hello(String address, Listen listen) {
-    HttpURLConnection connection = null;
+  private Peer hello(String address) {
+    HttpsURLConnection connection = null;
     try {
-      HostAndPort parsed = HostAndPort.fromString(address.trim()).withDefaultPort(listen.port);
+      HostAndPort parsed = HostAndPort.fromString(address.trim()).withDefaultPort(port);
       String host = parsed.getHost();
       int port = parsed.getPort();
       String authority = (host.indexOf(':') >= 0 ? "[" + host + "]" : host) + ":" + port;
       connection =
-          (HttpURLConnection)
-              URI.create("http://" + authority + listen.contextPath + HELLO_PATH)
+          (HttpsURLConnection)
+              URI.create("https://" + authority + contextPath + HELLO_PATH)
                   .toURL()
                   .openConnection(Proxy.NO_PROXY);
+      connection.setSSLSocketFactory(tls.getSocketFactory());
+      // Membership is the private trust anchor. Discovery addresses are pod IPs.
+      connection.setHostnameVerifier((ignored, session) -> true);
       connection.setConnectTimeout(PROBE_TIMEOUT_MILLIS);
       connection.setReadTimeout(PROBE_TIMEOUT_MILLIS);
       connection.setUseCaches(false);
@@ -341,11 +340,10 @@ public class WriteForwarding implements LifecycleListener {
       try (InputStream in = connection.getInputStream()) {
         body = new String(in.readNBytes(MAX_HELLO_BYTES), UTF_8);
       }
-      List<String> lines = Splitter.on('\n').trimResults().splitToList(body);
-      if (lines.size() < 2 || lines.get(0).isEmpty()) {
+      if (!NODE_NAME.matcher(body).matches()) {
         return null;
       }
-      return new Peer(lines.get(0), host, port, Integer.parseInt(lines.get(1)));
+      return new Peer(body, host, port);
     } catch (IOException | RuntimeException unreachable) {
       logger.atFine().withCause(unreachable).log("Write forwarding: no hello from %s", address);
       return null;
@@ -353,29 +351,6 @@ public class WriteForwarding implements LifecycleListener {
       if (connection != null) {
         connection.disconnect();
       }
-    }
-  }
-
-  /** Where this node, and so each peer, listens for plain HTTP. */
-  private record Listen(int port, String contextPath) {
-    @Nullable
-    static Listen of(Config config) {
-      String[] urls = config.getStringList("httpd", null, "listenUrl");
-      String url = urls.length == 0 ? "http://*:8080/" : urls[0];
-      Matcher matcher = LISTEN_URL.matcher(url);
-      // A listener that terminates TLS itself is not reachable by address alone.
-      if (!matcher.matches() || url.startsWith("https:")) {
-        return null;
-      }
-      int port =
-          matcher.group(1) != null
-              ? Integer.parseInt(matcher.group(1))
-              : url.startsWith("proxy-") ? 8080 : 80;
-      String path = matcher.group(2) == null ? "" : matcher.group(2);
-      while (path.endsWith("/")) {
-        path = path.substring(0, path.length() - 1);
-      }
-      return new Listen(port, path);
     }
   }
 }

@@ -16,25 +16,39 @@ package com.google.gerrit.httpd;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.gerrit.entities.Account;
 import com.google.gerrit.metrics.DisabledMetricMaker;
+import com.google.gerrit.server.AccessPath;
+import com.google.gerrit.server.CurrentUser;
+import com.google.gerrit.server.IdentifiedUser;
 import com.google.gerrit.server.WriteForwarding;
+import com.google.gerrit.server.WritePeerTls;
 import com.google.gerrit.server.WriteRouter;
+import com.google.gerrit.server.account.AccountCache;
+import com.google.gerrit.server.account.AccountState;
 import com.google.gerrit.server.config.GerritRuntime;
+import com.google.gerrit.server.config.ThreadSettingsConfig;
 import com.google.gerrit.util.http.testutil.FakeHttpServletRequest;
 import com.google.gerrit.util.http.testutil.FakeHttpServletResponse;
 import com.google.gerrit.util.http.testutil.FakePeer;
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.servlet.FilterChain;
 import javax.servlet.ReadListener;
 import javax.servlet.ServletInputStream;
-import org.eclipse.jgit.lib.Config;
 import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.ArgumentMatchers;
 
 public class WriteForwardingFilterTest {
   private static final String SELF = "gerrit-0";
@@ -56,6 +70,13 @@ public class WriteForwardingFilterTest {
       }
       this.body = body.getBytes(UTF_8);
       addHeader("Host", "gerrit.example.com");
+      if (!body.isEmpty()) {
+        addHeader(
+            "Content-Type",
+            path.endsWith("/git-receive-pack")
+                ? "application/x-git-receive-pack-request"
+                : "application/json");
+      }
     }
 
     @Override
@@ -95,6 +116,8 @@ public class WriteForwardingFilterTest {
     }
   }
 
+  private final WebSession session = mock(WebSession.class);
+  private final IdentifiedUser user = mock(IdentifiedUser.class);
   private FakePeer peer;
   private WriteForwarding forwarding;
   private WriteForwardingFilter filter;
@@ -105,16 +128,20 @@ public class WriteForwardingFilterTest {
 
   @Before
   public void setUp() throws Exception {
-    peer = new FakePeer(PEER).sshPort(29418);
+    when(session.getUser()).thenReturn(user);
+    when(session.isAccessPathOk(AccessPath.REST_API)).thenReturn(true);
+    when(user.isIdentifiedUser()).thenReturn(true);
+    when(user.getAccountId()).thenReturn(Account.id(42));
+    peer = new FakePeer(PEER);
     forwarding =
         new WriteForwarding(
             () -> SELF,
             () -> List.of(peer.address()),
-            new Config(),
+            FakePeer.config(),
             GerritRuntime.DAEMON,
             new DisabledMetricMaker());
     forwarding.probe();
-    filter = new WriteForwardingFilter(forwarding, 2);
+    filter = new WriteForwardingFilter(forwarding, 2, () -> session);
     for (int i = 0; peerProject == null || ownProject == null; i++) {
       String project = "team/repo-" + i;
       if (WriteRouter.outranks(project, PEER, SELF)) {
@@ -136,8 +163,9 @@ public class WriteForwardingFilterTest {
     peer.answer(
         200, ImmutableMap.of("Content-Type", "application/x-git-receive-pack-result"), "ok");
     Request req = new Request("POST", "/a/" + peerProject + ".git/git-receive-pack", "PACK-DATA");
+    req.addHeader("Cookie", "GerritAccount=private");
+    req.addHeader("X-Gerrit-Auth", "private");
     req.addHeader("Authorization", "Basic dXNlcjpzZWNyZXQ=");
-    req.addHeader("Content-Type", "application/x-git-receive-pack-request");
     req.addHeader("X-Forwarded-For", "203.0.113.9");
     FakeHttpServletResponse rsp = new FakeHttpServletResponse();
 
@@ -152,32 +180,36 @@ public class WriteForwardingFilterTest {
     assertThat(seen.method()).isEqualTo("POST");
     assertThat(seen.target()).isEqualTo("/a/" + peerProject + ".git/git-receive-pack");
     assertThat(new String(seen.body(), UTF_8)).isEqualTo("PACK-DATA");
-    assertThat(seen.header("Authorization")).isEqualTo("Basic dXNlcjpzZWNyZXQ=");
-    assertThat(seen.header("Host")).isEqualTo("gerrit.example.com");
+    for (String name :
+        List.of("Authorization", "Cookie", "X-Gerrit-Auth", "X-Site-Identity", "X-Forwarded-For")) {
+      assertThat(seen.header(name)).isNull();
+    }
+    assertThat(seen.header("Host")).isEqualTo(peer.address());
     assertThat(seen.header("Content-Type")).isEqualTo("application/x-git-receive-pack-request");
-    assertThat(seen.header("X-Forwarded-For")).isEqualTo("203.0.113.9");
-    assertThat(seen.header(WriteForwarding.FORWARDED_HEADER)).isEqualTo(SELF);
+    assertThat(seen.header(WriteForwarding.ADDRESS_HEADER)).isEqualTo(req.getRemoteAddr());
+    assertThat(seen.header(WriteForwarding.ACCOUNT_HEADER)).isEqualTo("42");
+    assertThat(seen.header(WriteForwarding.FORWARDED_HEADER)).isEqualTo(PEER);
   }
 
   @Test
   public void keepsTheEncodedAddressOfARestWrite() throws Exception {
     String encoded = peerProject.replace("/", "%2F");
     Request req =
-        new Request("POST", "/a/changes/" + encoded + "~42/revisions/current/review?x=%2F", "{}");
+        new Request("POST", "/a/changes/" + encoded + "~42/revisions/current/review", "{}");
     FakeHttpServletResponse rsp = new FakeHttpServletResponse();
 
     filter.doFilter(req, rsp, chain);
 
     assertThat(executedHere.get()).isEqualTo(0);
     assertThat(peer.requests().get(0).target())
-        .isEqualTo("/a/changes/" + encoded + "~42/revisions/current/review?x=%2F");
-    assertThat(peer.requests().get(0).header("X-Forwarded-For")).isNotNull();
+        .isEqualTo("/a/changes/" + encoded + "~42/revisions/current/review");
+    assertThat(peer.requests().get(0).header("X-Forwarded-For")).isNull();
   }
 
   @Test
   public void executesWhatAPeerHandedOver() throws Exception {
     Request req = new Request("POST", "/a/" + peerProject + "/git-receive-pack", "PACK-DATA");
-    req.addHeader(WriteForwarding.FORWARDED_HEADER, "gerrit-2");
+    req.setAttribute(WriteForwarding.PEER_CONNECTOR, Boolean.TRUE);
 
     filter.doFilter(req, new FakeHttpServletResponse(), chain);
 
@@ -298,31 +330,173 @@ public class WriteForwardingFilterTest {
   }
 
   @Test
-  public void answersAPeersHello() throws Exception {
-    forwarding.sshPort(() -> 29418);
-    FakeHttpServletResponse rsp = new FakeHttpServletResponse();
-
-    filter.doFilter(new Request("GET", WriteForwarding.HELLO_PATH, ""), rsp, chain);
-
-    assertThat(rsp.getStatus()).isEqualTo(200);
-    assertThat(rsp.getActualBodyString()).isEqualTo(SELF + "\n29418\n");
+  public void publicHelloAndIdentityHeadersAreRejectedBeforeDispatch() throws Exception {
+    ThreadSettingsConfig threads = mock(ThreadSettingsConfig.class);
+    when(threads.getHttpdMaxThreads()).thenReturn(6);
+    PeerWriteFilter inbound =
+        new PeerWriteFilter(forwarding, mock(AccountCache.class), () -> session, threads);
+    Request forged = new Request("POST", "/a/" + peerProject + "/git-receive-pack", "body");
+    forged.addHeader(WriteForwarding.FORWARDED_HEADER, SELF);
+    for (Request req : List.of(forged, new Request("GET", "/peerz", ""))) {
+      FakeHttpServletResponse rsp = new FakeHttpServletResponse();
+      inbound.doFilter(req, rsp, chain);
+      assertThat(rsp.getStatus()).isEqualTo(404);
+      assertThat(req.bodyReads.get()).isEqualTo(0);
+    }
     assertThat(executedHere.get()).isEqualTo(0);
   }
 
   @Test
-  public void aNodeWithoutANameLeavesTheHelloToGerrit() throws Exception {
-    WriteForwarding unnamed =
-        new WriteForwarding(
-            () -> "", List::of, new Config(), GerritRuntime.DAEMON, new DisabledMetricMaker());
-    WriteForwardingFilter plain = new WriteForwardingFilter(unnamed, 2);
-    try {
-      plain.doFilter(
-          new Request("GET", WriteForwarding.HELLO_PATH, ""), new FakeHttpServletResponse(), chain);
-    } finally {
-      plain.destroy();
-    }
+  public void credentialsInQueriesAnonymousUsersAndMissingCsrfStayAtEntry() throws Exception {
+    Request token =
+        new Request("POST", "/a/projects/" + peerProject + "?access_token=private", "{}");
+    filter.doFilter(token, new FakeHttpServletResponse(), chain);
+    when(session.isAccessPathOk(AccessPath.REST_API)).thenReturn(false);
+    filter.doFilter(
+        new Request("POST", "/a/projects/" + peerProject, "{}"),
+        new FakeHttpServletResponse(),
+        chain);
+    when(session.getUser()).thenReturn(mock(CurrentUser.class));
+    Request anon = new Request("POST", "/a/" + peerProject + "/git-receive-pack", "slow");
+    filter.doFilter(anon, new FakeHttpServletResponse(), chain);
+    assertThat(anon.bodyReads.get()).isEqualTo(0);
+    assertThat(executedHere.get()).isEqualTo(3);
+    assertThat(peer.requests()).isEmpty();
+  }
 
+  @Test
+  public void aReplacedDestinationGetsNoIdentityOrBody() throws Exception {
+    // The route was selected before the destination changed to a different cluster key.
+    var other = WritePeerTls.fromSecret("AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    try (FakePeer replacement = new FakePeer(PEER, other)) {
+      var selected = mock(WriteForwarding.class);
+      when(selected.tls()).thenReturn(forwarding.tls());
+      when(selected.preferredPeer(ArgumentMatchers.eq(peerProject), ArgumentMatchers.any()))
+          .thenReturn(Optional.of(new WriteForwarding.Peer(PEER, "127.0.0.1", replacement.port())));
+      var relay = new WriteForwardingFilter(selected, 1, () -> session);
+      try {
+        var req = new Request("POST", "/a/" + peerProject + "/git-receive-pack", "pack");
+        relay.doFilter(req, new FakeHttpServletResponse(), chain);
+        assertThat(req.bodyReads.get()).isEqualTo(0);
+        assertThat(replacement.requests()).isEmpty();
+        assertThat(executedHere.get()).isEqualTo(1);
+      } finally {
+        relay.destroy();
+      }
+    }
+  }
+
+  @Test
+  public void onlyAnActiveAccountAndTheNamedDestinationCanExecuteAnEligibleWrite()
+      throws Exception {
+    ThreadSettingsConfig threads = mock(ThreadSettingsConfig.class);
+    when(threads.getHttpdMaxThreads()).thenReturn(3);
+    AccountCache accounts = mock(AccountCache.class);
+    var inbound = new PeerWriteFilter(forwarding, accounts, () -> session, threads);
+    var wrongAddress = incoming("client.example");
+    var inactive = incoming("192.0.2.1");
+    var state = mock(AccountState.class);
+    when(accounts.get(Account.id(42))).thenReturn(Optional.of(state));
+    when(state.account()).thenReturn(mock(Account.class));
+    var cookie = incoming("192.0.2.1");
+    cookie.addHeader("Cookie", "unexpected");
+    var wrongNode = new Request("POST", "/a/" + peerProject + "/git-receive-pack", "body");
+    wrongNode.setAttribute(WriteForwarding.PEER_CONNECTOR, true);
+    wrongNode.addHeader(WriteForwarding.FORWARDED_HEADER, PEER);
+    wrongNode.addHeader(WriteForwarding.ACCOUNT_HEADER, "42");
+    wrongNode.addHeader(WriteForwarding.ADDRESS_HEADER, "192.0.2.1");
+    var wrongPath = incoming("192.0.2.1");
+    wrongPath.setPathInfo("/a/accounts/self/password.http");
+    for (var req : List.of(wrongAddress, wrongNode, wrongPath, cookie, inactive)) {
+      var rsp = new FakeHttpServletResponse();
+      inbound.doFilter(req, rsp, chain);
+      assertThat(rsp.getStatus()).isEqualTo(403);
+      assertThat(req.bodyReads.get()).isEqualTo(0);
+    }
+    assertThat(executedHere.get()).isEqualTo(0);
+  }
+
+  @Test
+  public void formBodiesNeverEnterThePeerChannelEvenOnAGitUrl() throws Exception {
+    for (String path :
+        List.of("/a/" + peerProject + "/git-receive-pack", "/a/projects/" + peerProject)) {
+      var req = new Request("POST", path, "");
+      req.addHeader("Content-Type", "application/x-www-form-urlencoded");
+      filter.doFilter(req, new FakeHttpServletResponse(), chain);
+      assertThat(req.bodyReads.get()).isEqualTo(0);
+    }
+    assertThat(executedHere.get()).isEqualTo(2);
+    assertThat(peer.requests()).isEmpty();
+  }
+
+  @Test
+  public void anExtensionHeaderKeepsTheWholeRequestOnItsOriginalPod() throws Exception {
+    Request req = new Request("POST", "/a/" + peerProject + "/git-receive-pack", "data");
+    req.addHeader("X-Site-Identity", "private");
+    filter.doFilter(req, new FakeHttpServletResponse(), chain);
     assertThat(executedHere.get()).isEqualTo(1);
+    assertThat(peer.requests()).isEmpty();
+  }
+
+  @Test
+  public void inboundSlotIsSharedAcrossSourcesAndReleasedOnFailure() throws Exception {
+    ThreadSettingsConfig threads = mock(ThreadSettingsConfig.class);
+    when(threads.getHttpdMaxThreads()).thenReturn(3);
+    var accounts = mock(AccountCache.class);
+    var state = mock(AccountState.class);
+    var account = mock(Account.class);
+    when(accounts.get(Account.id(42))).thenReturn(Optional.of(state));
+    when(state.account()).thenReturn(account);
+    when(account.isActive()).thenReturn(true);
+    var inbound = new PeerWriteFilter(forwarding, accounts, () -> session, threads);
+    Request first = incoming("192.0.2.1");
+    Request second = incoming("192.0.2.2");
+    FakeHttpServletResponse busy = new FakeHttpServletResponse();
+    Assert.assertThrows(
+        IOException.class,
+        () ->
+            inbound.doFilter(
+                first,
+                new FakeHttpServletResponse(),
+                (req, rsp) -> {
+                  assertThat(req.getRemoteAddr()).isEqualTo("192.0.2.1");
+                  assertThat(new HttpRemotePeerProvider(first).get())
+                      .isEqualTo(new InetSocketAddress("192.0.2.1", 0));
+                  inbound.doFilter(second, busy, chain);
+                  throw new IOException("client disconnected");
+                }));
+    assertThat(busy.getStatus()).isEqualTo(503);
+    assertThat(second.bodyReads.get()).isEqualTo(0);
+    assertThat(executedHere.get()).isEqualTo(0);
+    inbound.doFilter(incoming("192.0.2.3"), new FakeHttpServletResponse(), chain);
+    assertThat(executedHere.get()).isEqualTo(1);
+  }
+
+  private Request incoming(String address) {
+    Request req = new Request("POST", "/a/" + peerProject + "/git-receive-pack", "slow");
+    req.setAttribute(WriteForwarding.PEER_CONNECTOR, Boolean.TRUE);
+    req.addHeader(WriteForwarding.FORWARDED_HEADER, SELF);
+    req.addHeader(WriteForwarding.ADDRESS_HEADER, address);
+    req.addHeader(WriteForwarding.ACCOUNT_HEADER, "42");
+    return req;
+  }
+
+  @Test
+  public void inboundLimitRejectsBeforeReadingBodyOrLoadingTheUser() throws Exception {
+    ThreadSettingsConfig threads = mock(ThreadSettingsConfig.class);
+    when(threads.getHttpdMaxThreads()).thenReturn(2);
+    PeerWriteFilter inbound =
+        new PeerWriteFilter(forwarding, mock(AccountCache.class), () -> session, threads);
+    Request req = new Request("POST", "/a/" + peerProject + "/git-receive-pack", "slow");
+    req.setAttribute(WriteForwarding.PEER_CONNECTOR, Boolean.TRUE);
+    req.addHeader(WriteForwarding.FORWARDED_HEADER, SELF);
+    req.addHeader(WriteForwarding.ADDRESS_HEADER, "::1");
+    req.addHeader(WriteForwarding.ACCOUNT_HEADER, "42");
+    FakeHttpServletResponse rsp = new FakeHttpServletResponse();
+    inbound.doFilter(req, rsp, chain);
+    assertThat(rsp.getStatus()).isEqualTo(503);
+    assertThat(req.bodyReads.get()).isEqualTo(0);
+    assertThat(executedHere.get()).isEqualTo(0);
   }
 
   @Test
@@ -339,7 +513,7 @@ public class WriteForwardingFilterTest {
 
   @Test
   public void executesAWriteHereWhenNoThreadMayHandItOver() throws Exception {
-    WriteForwardingFilter saturated = new WriteForwardingFilter(forwarding, 0);
+    WriteForwardingFilter saturated = new WriteForwardingFilter(forwarding, 0, () -> session);
     try {
       saturated.doFilter(
           new Request("POST", "/a/" + peerProject + "/git-receive-pack", "PACK-DATA"),

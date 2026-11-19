@@ -58,6 +58,7 @@ class DatabasePubKeyAuth implements PublickeyAuthenticator {
   private final SshLog sshLog;
   private final IdentifiedUser.GenericFactory userFactory;
   private final PeerDaemonUser.Factory peerFactory;
+  private final boolean enablePeerDaemon;
   private final Config config;
   private final SshScope sshScope;
   private final Set<PublicKey> myHostKeys;
@@ -78,6 +79,11 @@ class DatabasePubKeyAuth implements PublickeyAuthenticator {
     userFactory = uf;
     peerFactory = pf;
     config = cfg;
+    enablePeerDaemon =
+        cfg.getBoolean(
+            "sshd",
+            "enablePeerDaemon",
+            cfg.getString("walgerrit", null, "forwardingSecret") == null);
     sshScope = s;
     myHostKeys = myHostKeys(hostKeyProvider);
     peerKeyCache = new PeerKeyCache(site.peer_keys);
@@ -112,7 +118,8 @@ class DatabasePubKeyAuth implements PublickeyAuthenticator {
     SshSession sd = session.getAttribute(SshSession.KEY);
     checkState(sd.getUser() == null);
     if (PeerDaemonUser.USER_NAME.equals(username)) {
-      if (isPeerKey(suppliedKey)) {
+      if (enablePeerDaemon
+          && (myHostKeys.contains(suppliedKey) || getPeerKeys().contains(suppliedKey))) {
         PeerDaemonUser user = peerFactory.create(sd.getRemoteAddress());
         return SshUtil.success(username, session, sshScope, sshLog, sd, user);
       }
@@ -159,11 +166,6 @@ class DatabasePubKeyAuth implements PublickeyAuthenticator {
     }
 
     return SshUtil.success(username, session, sshScope, sshLog, sd, cu);
-  }
-
-  /** Whether {@code key} identifies this daemon or one of the peers it trusts. */
-  boolean isPeerKey(PublicKey key) {
-    return myHostKeys.contains(key) || getPeerKeys().contains(key);
   }
 
   private Set<PublicKey> getPeerKeys() {
