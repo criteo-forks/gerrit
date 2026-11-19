@@ -32,6 +32,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -50,6 +52,56 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 class IndexEventTailerTest {
   @TempDir Path storagePath;
+
+  @Test
+  void failedParallelBatchLeavesItsCursorAndAColdRestartReplaysEveryChange() throws Exception {
+    var manager = manager();
+    var project = Project.nameKey("platform/batched-retry");
+    manager.createRepository(project).close();
+    var cursor = new IndexCursorStore(manager.manifestStore(project).indexCursorPath());
+    tailer(manager, (p, txn) -> {}).catchUp(project);
+    var before = cursor.read();
+    publishRef(manager, project, CHANGE_1);
+    publishRef(manager, project, CHANGE_2);
+
+    class Documents implements IndexEventApplier, IndexEventApplier.ChangeDocuments {
+      final Set<Integer> wrote = ConcurrentHashMap.newKeySet();
+      final CountDownLatch both = new CountDownLatch(2);
+      volatile boolean fail = true;
+
+      @Override
+      public void apply(Project.NameKey p, RefTransaction txn) {
+        throw new AssertionError("Expected a batch of ordinary metadata");
+      }
+
+      @Override
+      public void reindexChanges(Project.NameKey p, Set<Integer> changes) {
+        assertTrue(manager.isApplyingReplay());
+        assertEquals(project, p);
+        assertEquals(1, changes.size());
+        both.countDown();
+        try {
+          assertTrue(both.await(5, TimeUnit.SECONDS), "independent documents must overlap");
+          assertEquals(before, cursor.read(), "neither half can release a cursor");
+        } catch (IOException | InterruptedException e) {
+          throw new AssertionError(e);
+        }
+        if (fail && changes.contains(2)) {
+          throw new IllegalStateException("injected document write failure");
+        }
+        wrote.addAll(changes);
+      }
+    }
+    var first = new Documents();
+    assertThrows(IOException.class, () -> tailer(manager, first).catchUp(project));
+    assertEquals(Set.of(1), first.wrote, "a sibling can have finished before the failure");
+    assertEquals(before, cursor.read());
+    var restarted = new Documents();
+    restarted.fail = false;
+    assertEquals(2, tailer(manager, restarted).catchUp(project));
+    assertEquals(Set.of(1, 2), restarted.wrote);
+    assertAtHead(manager, project);
+  }
 
   @Test
   void replaysEachCommittedRefTransactionOnceAcrossRestart() throws Exception {

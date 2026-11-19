@@ -17,7 +17,9 @@ package dev.walgerrit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.gerrit.entities.Change;
 import com.google.gerrit.entities.Project;
+import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.server.config.GerritRuntime;
 import dev.walgerrit.proto.StorageProto.IndexCursor;
 import dev.walgerrit.proto.StorageProto.IndexUpdate;
@@ -26,6 +28,7 @@ import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
@@ -47,7 +50,8 @@ class EventLogReplayTest {
     homeTailer.catchUp(project); // Seed the cursor past the repository's creation.
     home.transactions = 0;
 
-    // One sweep's worth of entries: a ref update to change 7 and a journal entry naming 7 and 9.
+    // A waiter may be released at this first journal entry, before change 7's later ref update.
+    store.publishJournal(List.of(), IndexUpdate.newBuilder().addChanges(7).build());
     try (org.eclipse.jgit.lib.Repository repository = manager.openRepository(project)) {
       org.eclipse.jgit.lib.RefUpdate update = repository.updateRef("refs/changes/07/7/meta");
       update.setNewObjectId(WalGitRepositoryManagerTest.insertCommit(repository, "change 7"));
@@ -72,14 +76,17 @@ class EventLogReplayTest {
         new WalGitRepositoryManager(
             WalGitConfiguration.from(localConfig(), storagePath.resolve("other-site")));
     RecordingReindexer foreign = new RecordingReindexer();
-    IndexEventTailer foreignTailer = tailer(other, foreign, storagePath.resolve("other-READY"), true);
+    IndexEventTailer foreignTailer =
+        tailer(other, foreign, storagePath.resolve("other-READY"), true);
     foreignTailer.catchUp(project);
     assertEquals(2, foreign.transactions, "the repository's creation and change 7");
-    assertEquals(1, foreign.updates.size());
-    assertEquals(List.of(7, 9), foreign.updates.get(0).getChangesList());
-    assertEquals(Set.of(7), foreign.skipped.get(0));
+    assertEquals(2, foreign.updates.size());
+    assertEquals(
+        Set.of(), foreign.skipped.get(0), "a later ref cannot satisfy an earlier checkpoint");
+    assertEquals(List.of(7, 9), foreign.updates.get(1).getChangesList());
+    assertEquals(Set.of(7), foreign.skipped.get(1));
     foreignTailer.catchUp(project);
-    assertEquals(1, foreign.updates.size(), "an acknowledged entry is not replayed again");
+    assertEquals(2, foreign.updates.size(), "an acknowledged entry is not replayed again");
 
     // A batch with both events and reindexed documents is one EVENT entry carrying both.
     before = store.read();
@@ -91,7 +98,7 @@ class EventLogReplayTest {
     assertEquals(LogEntry.Kind.EVENT, entry.getKind());
     assertEquals(List.of(11), entry.getIndexUpdate().getChangesList());
     foreignTailer.catchUp(project);
-    assertEquals(List.of(11), foreign.updates.get(1).getChangesList());
+    assertEquals(List.of(11), foreign.updates.get(2).getChangesList());
   }
 
   private IndexEventTailer tailer(
@@ -117,6 +124,19 @@ class EventLogReplayTest {
     }
 
     @Override
+    public Applied applyReporting(Project.NameKey project, RefTransaction transaction) {
+      apply(project, transaction);
+      Set<Integer> indexed = new HashSet<>();
+      for (var update : transaction.getUpdatesList()) {
+        Change.Id id = Change.Id.fromRef(update.getName());
+        if (id != null && RefNames.changeMetaRef(id).equals(update.getName())) {
+          indexed.add(id.get());
+        }
+      }
+      return new Applied(indexed, Set.of());
+    }
+
+    @Override
     public void reindex(Project.NameKey project, IndexUpdate update, Set<Integer> alreadyReindexed) {
       updates.add(update);
       skipped.add(Set.copyOf(alreadyReindexed));
@@ -133,8 +153,13 @@ class EventLogReplayTest {
     List<LogEntry> replayed = new ArrayList<>();
     IndexEventTailer home =
         new IndexEventTailer(
-            manager, (p, t) -> {}, GerritRuntime.DAEMON, "lucene", new org.eclipse.jgit.lib.Config(),
-            new IndexEventReadiness(storagePath.resolve("home-READY")), null,
+            manager,
+            (p, t) -> {},
+            GerritRuntime.DAEMON,
+            "lucene",
+            new org.eclipse.jgit.lib.Config(),
+            new IndexEventReadiness(storagePath.resolve("home-READY")),
+            null,
             (p, entry) -> replayed.add(entry));
     home.catchUp(project);
     long headBefore = store.read().getHeadSeq();
@@ -143,7 +168,8 @@ class EventLogReplayTest {
     store.publishEvents(List.of("{\"type\":\"ref-updated\"}", "{\"type\":\"patchset-created\"}"));
     store.publishEvents(List.of());
 
-    assertEquals(headBefore + 1, store.read().getHeadSeq(), "one entry per batch, none for an empty batch");
+    assertEquals(
+        headBefore + 1, store.read().getHeadSeq(), "one entry per batch, none for an empty batch");
     LogEntry entry =
         store
             .readLogEntriesAfter(headBefore, transactionBefore, store.read(), 10)

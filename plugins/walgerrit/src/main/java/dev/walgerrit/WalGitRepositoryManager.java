@@ -52,6 +52,33 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   /** The repository whose log entry the thread is applying; see {@link #applyingReplay}. */
   private final ThreadLocal<RepositoryId> applyingReplay = new ThreadLocal<>();
 
+  private final ThreadLocal<ReplayHandle> replayHandle = new ThreadLocal<>();
+
+  /** One reference for a replay pass; each NoteDb caller borrows and closes its own reference. */
+  final class ReplayHandle implements AutoCloseable {
+    final RepositoryId id;
+    final ReplayHandle outer = replayHandle.get();
+    Binding binding;
+    LocalWalGitRepository repository;
+
+    ReplayHandle(RepositoryId id) {
+      this.id = id;
+      replayHandle.set(this);
+    }
+
+    @Override
+    public void close() {
+      replayHandle.set(outer);
+      if (repository != null) {
+        repository.close();
+      }
+    }
+  }
+
+  ReplayHandle reuseReplayHandle(RepositoryId id) {
+    return new ReplayHandle(id);
+  }
+
   @Inject
   WalGitRepositoryManager(
       @GerritServerConfig Config serverConfig, @SitePath Path sitePath, GerritRuntime runtime) {
@@ -137,6 +164,10 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     return () -> applyingReplay.set(outer);
   }
 
+  boolean isApplyingReplay() {
+    return applyingReplay.get() != null;
+  }
+
   /**
    * Opening a handle is the request-level freshness boundary: one conditional read of the catalog,
    * which every repository shares, and one of the repository's manifest.
@@ -161,6 +192,20 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
     if (!exists) {
       throw new IOException(
           "Catalog binds " + name.get() + " to " + binding.id() + " but it has no manifest");
+    }
+    ReplayHandle reuse = replayHandle.get();
+    if (reuse != null && reuse.id.equals(binding.id()) && reuse.id.equals(applyingReplay.get())) {
+      if (!binding.equals(reuse.binding)) {
+        if (reuse.repository != null) {
+          reuse.repository.close();
+          reuse.repository = null;
+          reuse.binding = null;
+        }
+        reuse.repository = openInitialized(name, binding.id(), binding.epoch());
+        reuse.binding = binding;
+      }
+      reuse.repository.incrementOpen();
+      return reuse.repository;
     }
     return openInitialized(name, binding.id(), binding.epoch());
   }

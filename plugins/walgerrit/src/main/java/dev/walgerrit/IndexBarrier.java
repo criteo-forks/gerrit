@@ -39,16 +39,13 @@ import org.slf4j.LoggerFactory;
  * Brings this node's change index up to date with other nodes' writes before Gerrit decides
  * something on it, and says so when it cannot.
  *
- * <p>Gerrit calls it through its {@code ChangeIndexFreshness} hook, which {@link WalGitIndexModule}
- * binds it to: with a project before a push, a move, a cherry-pick or a change creation looks a
- * Change-Id up there, and with no project before a submission looks up the members of a topic. The
- * argument is the project name, or empty for every project; the result is empty when the index
- * holds what other nodes wrote before the call, and otherwise the reason it may not. Gerrit rejects
- * the request in that case, so the caller can repeat it.
+ * <p>{@link WalGitIndexModule} binds Gerrit's {@code ChangeIndexFreshness} hook to this barrier. A
+ * project name scopes the wait to indexed decisions such as finding changes to close after a direct
+ * push. An empty argument requests a global wait for whole-topic submission. The result is empty on
+ * success and otherwise gives the caller a reason to retry.
  *
- * <p>The wait is bounded by {@code walgerrit.indexBarrierTimeout}. A timeout of zero turns the
- * barrier off, and a node that does not tail the log has nothing to wait for; both let every
- * request through.
+ * <p>{@code walgerrit.indexBarrierTimeout} bounds this wait. A zero timeout or a disabled tailer
+ * skips the replay wait. Branch/Change-Id membership is still checked at ref publication.
  */
 @Singleton
 final class IndexBarrier

@@ -17,6 +17,9 @@ package dev.walgerrit;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -33,6 +36,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -165,6 +169,111 @@ class IndexBarrierTest {
     eventually(() -> second.cursorSequence() >= head, "the abandoned replay completes");
     assertEquals(new Push(Result.NEW_PATCH_SET, created.number()), second.push(changeId(0)));
     assertEquals(1, second.index.byBranchKey(BRANCH, changeId(0)).size());
+  }
+
+  @Test
+  void aWaiterCompletesAtItsTargetWhileTheWorkerIsStillIndexingTheNextEntry() throws Exception {
+    GatedStore store = new GatedStore(bucket());
+    Node writer = node("writer", "5 s");
+    Node reader = node("reader", "5 s", "1 hour", store, null);
+    startWithProject(writer, reader);
+    Push first = writer.push(changeId(1));
+    CountDownLatch readHead = new CountDownLatch(1);
+    store.gatedThreads = "WalGerrit-Index-Barrier-Replay-";
+    store.manifestGate = readHead;
+    AtomicInteger entries = new AtomicInteger();
+    CountDownLatch laterEntry = new CountDownLatch(1);
+    reader.beforeApply =
+        (project, node) -> {
+          if (entries.incrementAndGet() == 2) {
+            node.replayGate = laterEntry;
+          }
+        };
+    List<Optional<String>> answers = new CopyOnWriteArrayList<>();
+    List<Throwable> failures = new CopyOnWriteArrayList<>();
+    Thread waiter = thread(() -> answers.add(reader.await()), failures);
+    waiter.start();
+    try {
+      eventually(
+          () -> store.waitingReads.get() == 1,
+          "replay starts after the request captured its target");
+      writer.push(changeId(2));
+      readHead.countDown();
+      eventually(() -> entries.get() == 2, "worker reached the later ref update");
+      waiter.join(TimeUnit.SECONDS.toMillis(2));
+      assertEquals(List.of(Optional.empty()), answers);
+      assertEquals(List.of(first.number()), numbers(reader.index.byBranchKey(BRANCH, changeId(1))));
+      assertTrue(reader.index.byBranchKey(BRANCH, changeId(2)).isEmpty());
+    } finally {
+      readHead.countDown();
+      laterEntry.countDown();
+      waiter.join(TimeUnit.SECONDS.toMillis(10));
+    }
+    assertEquals(List.of(), failures);
+  }
+
+  @Test
+  void replayReusesItsRepositoryAcrossEntriesAndReleasesItAtTheEndOfThePass() throws Exception {
+    Node reader = node("reader", "5 s");
+    startWithProject(reader);
+    RepositoryId id = reader.id();
+    var manager = reader.repositories;
+    Repository first;
+    try (var pass = manager.reuseReplayHandle(id)) {
+      try (var entry = manager.applyingReplay(id);
+          var borrowed = manager.openRepository(PROJECT)) {
+        first = borrowed;
+      }
+      try (var ordinary = manager.openRepository(PROJECT)) {
+        assertNotSame(first, ordinary);
+      }
+      try (var entry = manager.applyingReplay(id);
+          var borrowed = manager.openRepository(PROJECT)) {
+        assertSame(first, borrowed);
+        assertNotNull(borrowed.exactRef("HEAD"));
+      }
+    }
+    try (var next = manager.openRepository(PROJECT)) {
+      assertNotSame(first, next);
+    }
+  }
+
+  @Test
+  void sweepCanReleaseAWaiterWhoseOwnReplayWorkerIsBlocked() throws Exception {
+    GatedStore store = new GatedStore(bucket());
+    Node writer = node("writer", "5 s");
+    Node reader = node("reader", "5 s", "1 hour", store, null);
+    startWithProject(writer, reader);
+    Push first = writer.push(changeId(1));
+    CountDownLatch apply = new CountDownLatch(1);
+    CountDownLatch worker = new CountDownLatch(1);
+    reader.replayGate = apply;
+    store.gatedThreads = "WalGerrit-Index-Barrier-Replay-";
+    store.manifestGate = worker;
+    List<Optional<String>> answers = new CopyOnWriteArrayList<>();
+    List<Throwable> failures = new CopyOnWriteArrayList<>();
+    Thread sweep = thread(reader.tailer::runOnce, failures);
+    Thread waiter = thread(() -> answers.add(reader.await()), failures);
+    sweep.start();
+    try {
+      eventually(() -> reader.applying.get() == 1, "the sweep is applying the entry");
+      waiter.start();
+      eventually(
+          () ->
+              Arrays.stream(waiter.getStackTrace())
+                  .anyMatch(frame -> frame.getMethodName().equals("replayTo")),
+          "the request captured its target");
+      apply.countDown();
+      waiter.join(TimeUnit.SECONDS.toMillis(2));
+      assertEquals(List.of(Optional.empty()), answers);
+      assertEquals(List.of(first.number()), numbers(reader.index.byBranchKey(BRANCH, changeId(1))));
+    } finally {
+      apply.countDown();
+      worker.countDown();
+      waiter.join(TimeUnit.SECONDS.toMillis(10));
+      sweep.join(TimeUnit.SECONDS.toMillis(10));
+    }
+    assertEquals(List.of(), failures);
   }
 
   @Test

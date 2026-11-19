@@ -22,6 +22,11 @@ import java.util.Set;
 
 /** Consumer boundary for idempotently applying committed WAL entries to derived state. */
 interface IndexEventApplier {
+  /** Replaces ordinary change documents from current NoteDb. Disjoint sets may run concurrently. */
+  interface ChangeDocuments {
+    void reindexChanges(Project.NameKey project, Set<Integer> changes);
+  }
+
   /** What the catalog says now about a name a replayed catalog transaction touched. */
   record NamespaceChange(Project.NameKey name, RepositoryId id, Catalog.State state) {}
 

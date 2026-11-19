@@ -34,7 +34,7 @@ and rebuild behavior.
 | All-Users `refs/users/*` | Replace or delete the account document. |
 | All-Users `refs/groups/*` | Replace or delete the group document. |
 | `refs/meta/config` | Evict project configuration, update the project document and reindex open changes. |
-| `refs/heads/*` | Reindex open changes targeting the branch. |
+| `refs/heads/*` | Reindex open changes targeting the branch when Gerrit indexes mergeability or the site enables `walgerrit.reindexOnBranchUpdate`. |
 
 Object-only and compaction entries advance the cursor without index work. The tailer does not
 synthesize public ref events from the logical payload; those travel as separate `EVENT` entries.
@@ -172,7 +172,7 @@ pod. A project and numeric change number, such as `GET /changes/my-project~123/d
 still read NoteDb directly. Git ref reads and background index replay also remain available when
 their own dependencies are healthy.
 
-The default age is 75 seconds, the limit used in the B5 experiment. Compare
+The default age is 75 seconds. Compare
 `walgerrit/index_events/search_coverage_age_seconds` against that limit on each pod during normal
 peak traffic. It reads `-1` before coverage is established. The strict barrier for write
 decisions still catches up to publications acknowledged before the call.
@@ -221,30 +221,57 @@ retry failed work and discover writes whose hints were lost. See [Peer wake-ups]
 
 ## Change lookups wait for other nodes' writes
 
-Gerrit decides two things on the change index that are wrong on a stale one:
+WalGerrit reads exact branch/Change-Id membership from storage. Some write decisions still
+need Lucene, including finding changes to close after a direct push and finding all members of
+a topic before submission. The `ChangeIndexFreshness` barrier brings the node's index up to
+date before those lookups. A timeout rejects the request.
 
-- whether a pushed commit is a new change or a new patch set, by looking its Change-Id up in the
-  destination branch. A lookup made right after another node created the change would miss it and
-  create the change again;
-- which changes a topic holds, when it submits a whole topic. A member another node just uploaded
-  to another repository would be left out, and the rest of the topic merged without it.
+### Authoritative branch and Change-Id lookups
 
-A node's index trails the other nodes' writes, so before either decision the node brings its
-index up to date, and rejects the request when it cannot. Gerrit calls the barrier through the
-fork's `ChangeIndexFreshness` hook; a node whose Gerrit build lacks the hook refuses to start
-unless the barrier is turned off.
+The WalGerrit storage module installs the branch/Change-Id directory lookup for review
+pushes, REST change creation, moves and cherry-picks. It requires a WAR with the
+`ChangeKeyLookup` hook and a WalGerrit repository handle for each guarded operation. A server
+configured with WalGerrit storage refuses to start if its storage JAR lacks the guard.
+The operation reads one manifest snapshot and loads any selected change from NoteDb. The
+conditional publication that makes the Git refs visible validates the memberships the operation
+read, including an empty destination. Only one of two concurrent creations on the same branch
+and Change-Id can publish. Receive repeats selection once after a proven conflict. REST returns
+HTTP 409 for a confirmed membership conflict.
+
+On first use, requests to one pod join a background seed for the project. Each pod has one
+seed worker and queues up to 16 more projects. Once a seed succeeds the request rereads the
+manifest and checks coverage before using the directory. A request that cannot obtain coverage
+within the seed wait receives a retriable error before publishing refs. The wait uses
+`indexBarrierTimeout`. A zero timeout allows an already covered lookup and gives a cold
+request no waiting time. An unreadable legacy meta ref can keep one project unavailable for
+these writes until its metadata is repaired. For a cutover from writers that lack the guard,
+drain their in-flight writes before admitting writes through the matching WAR and storage JAR.
+Raw imports, older binaries and extensions that write refs outside these paths can invalidate
+coverage or introduce duplicates.
+The directory preserves historical duplicates and closed changes. See the
+[storage format](storage-format.md#branch-and-change-id-directory).
+
+Direct pushes retain the project barrier. Auto-close can query open changes, and creation of a
+branch or tag can use a visibility-filtered change-index query during permission checks. A review
+without a Change-Id still uses a by-commit index lookup. REST operations also keep the barrier
+for auxiliary lookups such as resolving an indexed base change. Whole-topic submission keeps
+its global barrier. Search visibility on each pod follows its own replay.
+
+The `walgerrit/change_keys/decisions` counter reports `covered`, `seed_wait`,
+`seed_unavailable`, `unsupported_repository` and `publication_conflict`. A cold lookup can record
+both a wait and a covered snapshot. A receive can open two snapshots if it repeats selection.
 
 ### One repository
 
-Before a push, and before the REST calls that create a change, cherry-pick or move one look a
-Change-Id up, the node brings the index up to date for the destination project:
+When a write needs an indexed project lookup, its pod brings the index up to date for that project.
 
 1. It reads the repository's manifest conditionally to learn the log head.
 2. If its cursor is at the head, or this node published every entry between the cursor and the
    head, the request continues. The request that publishes an entry indexes its own work, so a
    node's own entries are not waited for; the tailer replays them later as usual.
-3. Otherwise the repository is replayed through the usual catch-up path, and the request
-   continues once the cursor has reached the head it read.
+3. Otherwise the request waits for its captured head. Each durable cursor advance from a sweep,
+   a hint or another request can satisfy the waiter. Later writes can still be replaying when the
+   request continues. The catalog uses the same per-target wake-up and requires actual replay.
 
 The index holds a repository under the name the catalog gave it when the node last replayed the
 catalog. While the catalog the node has read is ahead of the one it has replayed, for instance
@@ -291,9 +318,8 @@ happens when:
   failed one leaves the cursors saying what the indexes held before. The node therefore rejects
   until a rebuild has completed, which the next sweep attempts.
 
-A node that stays unable to replay therefore rejects pushes and whole-topic submissions until it
-recovers, instead of creating duplicate changes or merging part of a topic. It also revokes
-readiness when its sweep fails; see [Startup and readiness](#startup-and-readiness).
+A node that stays unable to replay rejects writes that need these index lookups. A failed
+sweep also revokes readiness. See [Startup and readiness](#startup-and-readiness).
 
 The store is read on up to 16 threads and the log replayed on up to 4 threads of their own,
 never on the request thread, and at most 256 reads and 256 replays wait for one. Requests for
@@ -307,25 +333,17 @@ A sweep, wake-up or rebuild waits up to one minute for a replay running on anoth
 wait times out, it fails and the next sweep retries. A replay never waits for the barrier: a
 request made on a thread that is replaying is rejected rather than deadlocked.
 
-### What it guarantees, and what it does not
+### Index barrier guarantees
 
-A lookup sees every change update that any node acknowledged before the request asked the
-barrier. It does not order requests that overlap in time:
+A successful barrier covers updates that peers acknowledged before the request asked.
+Additional writes can overlap a subsequent Lucene lookup.
 
-- Two pushes of one new Change-Id to one branch that overlap, on one node or on two, can both
-  find no change and each create one, as on a single Gerrit server. They write different refs, so
-  the store's conditional write does not make one of them fail, and a retry of that write does
-  not repeat the lookup. Change-Ids are not unique; such a pair shows up as two changes with one
-  Change-Id on the branch, and Gerrit rejects later pushes of it (`has duplicates`) until one of
-  the two is deleted or moved to another branch.
 - A change that joins a topic, or is uploaded with it, after a submission's listing began may or
   may not be part of that submission: nothing guarantees either. A single Gerrit server makes
   the same choice at the moment it looks the topic up.
-- A rebuild that begins after a request passed the barrier is not held back for it. The request
-  then looks its Change-Id or topic up in indexes being emptied and refilled, and can miss what
-  they held. Rebuilds are rare, and the node revokes readiness before one begins, but a request
-  already admitted, or sent to the node directly, is not stopped. A request that is still in the
-  barrier when the rebuild begins is rejected.
+- A rebuild can overlap a lookup that passed the barrier, causing it to miss changes while
+  indexes are emptied and refilled. The node revokes readiness before a rebuild; admitted requests
+  can continue, but requests still waiting at the barrier are rejected.
 - Nodes that share a host name take one another's entries for their own and do not wait for
   them. Every node needs its own.
 - The barrier covers the decisions above. Queries, dashboards and other reads see the index as it
@@ -337,10 +355,10 @@ barrier. It does not order requests that overlap in time:
   indexBarrierTimeout = 5 sec
 ```
 
-`0` turns the barrier off: every request continues on the index as it is, as do requests on a
-node that does not tail the log. The timer `walgerrit/index_barrier/latency` records how long each
-request spent in the barrier, by `scope` (`project` for one repository, `all` for every
-repository) and `outcome`:
+With `indexBarrierTimeout = 0` or the tailer disabled, indexed lookups use the local index
+immediately. Exact branch/Change-Id lookups still require certified storage coverage. The
+`walgerrit/index_barrier/latency` timer records the wait by `scope` (`project` or `all`) and
+`outcome`.
 
 | Outcome | Request | Meaning |
 | --- | --- | --- |
@@ -357,10 +375,30 @@ The manifest names the log head; each entry names its predecessor. The tailer wa
 the cursor, validates its transaction ID, then applies the entries forward. Catch-up reads one
 log object per intervening entry. See [Storage format](storage-format.md#the-log-chain).
 
-Indexing a change opens its repository and All-Users. While the tailer applies an entry, an open
-of the entry's own repository does not validate its manifest again unless
-`manifestRevalidateInterval` has passed: the replay read that manifest to find the entry, and
-the handle starts from it. The catalog and every other repository are validated as on any open.
+Indexing a change opens its repository and All-Users. Repeated NoteDb opens on a replay
+thread borrow the same repository handle, retaining its DFS pack inventory for that scope.
+The repository manifest is revalidated when `manifestRevalidateInterval` expires. The catalog
+and any other repository are validated as on an ordinary open.
+
+For ordinary positive change-ref updates, the tailer reads up to 16 already available WAL
+entries and 64 ref updates at a time. It replaces each distinct change document from current
+NoteDb state. Up to `indexReplayWorkers` workers share that work (default 4, range 1–16).
+Setting it to 1 keeps coalescing and runs the writes serially. The tailer never waits to fill
+a batch. Branch or config changes, deletions, All-Users, catalog transactions, events and
+explicit index updates follow their ordered paths. Each original transaction retains its merge
+accounting. The durable cursor advances only after the entire prefix succeeds. On failure the
+next pass repeats the prefix, including any idempotent document writes that already succeeded.
+A waiting project barrier gets entry checkpoints after any batch already in flight finishes.
+A head checkpoint includes the manifest version.
+
+Stock Gerrit defaults to omitting mergeability from the index. With that setting a branch-tip
+move alone does no change-document work. Both Gerrit configurations that index mergeability
+still reindex open reviews on the destination branch. Enable `walgerrit.reindexOnBranchUpdate`
+if a site extension indexes fields that depend on the destination tip. Project-config, account,
+group and explicit change updates keep their own invalidations. The counter
+`walgerrit/index_events/change_documents` counts document replacements or removals by reason
+(`metadata`, `metadata_batch`, `branch_tip` and `project_config`). Retries count the work
+again.
 
 `indexReplayLimit` counts all publications, including object, compaction and notification entries.
 If any repository exceeds the limit, the configured automatic rebuild covers all four logical

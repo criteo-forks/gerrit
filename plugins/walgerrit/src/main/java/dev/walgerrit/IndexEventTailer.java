@@ -107,6 +107,7 @@ final class IndexEventTailer implements LifecycleListener {
 
   private final WalGitRepositoryManager repositories;
   private final IndexEventApplier applier;
+  private final int changeReplayWorkers;
   private final EventReplayer replayer;
   private volatile MergeEvents mergeEvents = MergeEvents.NONE;
 
@@ -409,6 +410,10 @@ final class IndexEventTailer implements LifecycleListener {
     this.runtime = runtime;
     this.indexType = indexType;
     this.serverConfig = serverConfig;
+    changeReplayWorkers = serverConfig.getInt("walgerrit", null, "indexReplayWorkers", 4);
+    if (changeReplayWorkers < 1 || changeReplayWorkers > 16) {
+      throw new IllegalArgumentException("walgerrit.indexReplayWorkers must be between 1 and 16");
+    }
     this.readiness = readiness;
     this.rebuilder = rebuilder;
     repositories.storage().onPublication(this::notePublished);
@@ -570,7 +575,10 @@ final class IndexEventTailer implements LifecycleListener {
     if (pools == null) {
       return stopped ? Indexed.UNAVAILABLE : Indexed.DISABLED;
     }
-    if (catchingUp || indexesInDoubt() || replayLock.isHeldByCurrentThread()) {
+    if (catchingUp
+        || indexesInDoubt()
+        || replayLock.isHeldByCurrentThread()
+        || repositories.isApplyingReplay()) {
       // The startup catch-up outlasts any request. A replay cannot wait for another one, nor
       // for itself.
       return Indexed.UNAVAILABLE;
@@ -636,7 +644,10 @@ final class IndexEventTailer implements LifecycleListener {
     if (pools == null) {
       return stopped ? Indexed.UNAVAILABLE : Indexed.DISABLED;
     }
-    if (catchingUp || indexesInDoubt() || replayLock.isHeldByCurrentThread()) {
+    if (catchingUp
+        || indexesInDoubt()
+        || replayLock.isHeldByCurrentThread()
+        || repositories.isApplyingReplay()) {
       return Indexed.UNAVAILABLE;
     }
     try {
@@ -743,18 +754,26 @@ final class IndexEventTailer implements LifecycleListener {
     for (int attempt = 0; attempt < 2; attempt++) {
       CompletableFuture<Void> replay =
           requestedReplays.computeIfAbsent(head.id(), id -> startReplay(pools.replays(), id));
-      replay.get(remaining(deadline), TimeUnit.NANOSECONDS);
-      // From memory only: this thread reads neither the store nor the cursor file.
-      Long applied = appliedSequences.get(head.id());
-      if (applied == null) {
-        continue;
-      }
-      // The catalog's own entries are waited for too: its replay is what reconciles the documents
-      // of the names they touched.
-      if (head.id().isCatalog()
-          ? applied >= head.sequence()
-          : indexed(head.id(), applied, head.sequence())) {
-        return true;
+      synchronized (replay) {
+        for (; ; ) {
+          // Any sweeper, hint or barrier worker may have covered this exact target.
+          Long applied = appliedSequences.get(head.id());
+          if (applied != null
+              && (head.id().isCatalog()
+                  ? applied >= head.sequence()
+                  : indexed(head.id(), applied, head.sequence()))) {
+            return true;
+          }
+          if (replay.isDone()) {
+            replay.get(); // Propagate a failed replay while the target is still outstanding.
+            break;
+          }
+          long left = remaining(deadline);
+          if (left == 0) {
+            throw new TimeoutException();
+          }
+          TimeUnit.NANOSECONDS.timedWait(replay, left);
+        }
       }
     }
     return false;
@@ -804,6 +823,12 @@ final class IndexEventTailer implements LifecycleListener {
         own.headSet(sequence, true).clear();
       }
     }
+    CompletableFuture<Void> replay = requestedReplays.get(id);
+    if (replay != null) {
+      synchronized (replay) {
+        replay.notifyAll();
+      }
+    }
   }
 
   /** Remembers the log entry this node just published as its own. */
@@ -843,10 +868,13 @@ final class IndexEventTailer implements LifecycleListener {
           } finally {
             // Remove the replay before allowing waiters to start another.
             requestedReplays.remove(id, done);
-            if (failure == null) {
-              done.complete(null);
-            } else {
-              done.completeExceptionally(failure);
+            synchronized (done) {
+              if (failure == null) {
+                done.complete(null);
+              } else {
+                done.completeExceptionally(failure);
+              }
+              done.notifyAll();
             }
           }
         });
@@ -1182,7 +1210,7 @@ final class IndexEventTailer implements LifecycleListener {
     lockForReplay(namespace, "replaying " + id);
     try {
       ReentrantLock replaying = lockForReplay(id);
-      try {
+      try (var handles = repositories.reuseReplayHandle(id)) {
         return replay(id, listedVersion, upTo);
       } finally {
         replaying.unlock();
@@ -1293,13 +1321,36 @@ final class IndexEventTailer implements LifecycleListener {
       cursor = cursor.toBuilder().clearMergesReadTo().clearOwed().addAllOwed(owed).build();
       cursorStore.write(cursor);
     }
-    Set<Integer> reindexedByRefs = changesTouched(entries);
+    Set<Integer> reindexedByRefs = new HashSet<>();
     int applied = 0;
     int replayed = 0;
     int reindexed = 0;
-    for (LogEntry entry : entries) {
-      boolean foreign = foreignWriter.test(entry.getWriter());
-      if (project != null && entry.getKind() == LogEntry.Kind.REF_UPDATE) {
+    boolean ordinaryProject =
+        project != null && !project.equals(repositories.configuration().allUsers());
+    for (int next = 0; next < entries.size(); ) {
+      int first = next++;
+      LogEntry entry = entries.get(first);
+      // A waiting receive wants its precise cursor promptly. Never deliberately extend its
+      // target into a batch; a waiter arriving during one waits for at most the in-flight batch.
+      ChangeReplayBatch batch =
+          ordinaryProject
+                  && applier instanceof IndexEventApplier.ChangeDocuments
+                  && !requestedReplays.containsKey(id)
+              ? ChangeReplayBatch.plan(entries, first)
+              : null;
+      IndexEventApplier.Applied effects = null;
+      if (batch != null) {
+        batch.apply(
+            changeReplayWorkers,
+            repositories,
+            id,
+            project,
+            (IndexEventApplier.ChangeDocuments) applier);
+        effects = new IndexEventApplier.Applied(batch.changes(), Set.of());
+        applied += batch.transactions();
+        next = batch.end();
+        entry = entries.get(next - 1);
+      } else if (project != null && entry.getKind() == LogEntry.Kind.REF_UPDATE) {
         if (!entry.hasRefTransaction()) {
           throw new IOException(
               "REF_UPDATE WAL entry "
@@ -1309,13 +1360,18 @@ final class IndexEventTailer implements LifecycleListener {
                   + " has no ref transaction payload");
         }
         try (EventReplay.Scope applying = repositories.applyingReplay(id)) {
-          noteUnindexed(id, applier.applyReporting(project, entry.getRefTransaction()));
+          effects = applier.applyReporting(project, entry.getRefTransaction());
         }
+        applied++;
+      }
+      if (effects != null) {
+        noteUnindexed(id, effects);
+        reindexedByRefs.addAll(effects.indexed());
         // This repository's cursor is replaced below.
         unindexedOutdated.remove(id);
         writeOutdatedUnindexedLists();
-        applied++;
       }
+      boolean foreign = foreignWriter.test(entry.getWriter());
       if (project != null && foreign && entry.getEventJsonCount() > 0) {
         replayer.replay(project, entry);
         replayed++;
@@ -1327,12 +1383,19 @@ final class IndexEventTailer implements LifecycleListener {
         reindexed++;
       }
       if (tracking && project != null) {
-        trackMerges(id, project, entry, owed);
+        // Retain original transaction membership and ordering for owed merge reconstruction.
+        for (int i = first; i < next; i++) {
+          trackMerges(id, project, entries.get(i), owed);
+        }
       }
-      // One replacement of the file passes the entry and records what it merged or announced,
-      // and the changes it named that the index does not hold.
+      // All documents and side effects through this position must succeed before the cursor moves.
       cursor =
-          IndexCursorStore.at(cursor, entry.getSeq(), entry.getTransactionId(), "").toBuilder()
+          IndexCursorStore.at(
+                  cursor,
+                  entry.getSeq(),
+                  entry.getTransactionId(),
+                  entry.getSeq() == manifest.getHeadSeq() ? versioned.version() : "")
+              .toBuilder()
               .clearOwed()
               .addAllOwed(owed)
               .clearUnindexed()
@@ -1356,7 +1419,7 @@ final class IndexEventTailer implements LifecycleListener {
     if (!toHead) {
       return new Replay(applied, false, false);
     }
-    if (!entries.isEmpty() || !versioned.version().equals(cursor.getManifestVersion())) {
+    if (!versioned.version().equals(cursor.getManifestVersion())) {
       // At the head now; remember which manifest version that is.
       cursorStore.write(
           IndexCursorStore.at(
@@ -1813,9 +1876,9 @@ final class IndexEventTailer implements LifecycleListener {
         continue;
       }
       for (RefUpdate update : entry.getRefTransaction().getUpdatesList()) {
-        Change.Id id = Change.Id.fromRef(update.getName());
+        Change.Id id = ChangeRefIds.fromRef(update.getName());
         if (id == null) {
-          id = Change.Id.fromAllUsersRef(update.getName());
+          id = ChangeRefIds.fromAllUsersRef(update.getName());
         }
         if (id != null) {
           changes.add(id.get());

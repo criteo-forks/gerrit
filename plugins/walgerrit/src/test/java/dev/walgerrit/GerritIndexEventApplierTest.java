@@ -23,6 +23,7 @@ import com.google.gerrit.entities.AccountGroup;
 import com.google.gerrit.entities.InternalGroup;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.entities.RefNames;
+import com.google.gerrit.metrics.DisabledMetricMaker;
 import com.google.gerrit.server.account.GroupCache;
 import com.google.gerrit.server.account.GroupIncludeCache;
 import com.google.gerrit.server.config.AllUsersName;
@@ -38,6 +39,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.ObjectId;
 import org.junit.jupiter.api.Test;
 
@@ -116,6 +118,8 @@ class GerritIndexEventApplierTest {
     GerritIndexEventApplier applier =
         new GerritIndexEventApplier(
             null,
+            new Config(),
+            new DisabledMetricMaker(),
             new AllUsersName("All-Users"),
             null,
             null,

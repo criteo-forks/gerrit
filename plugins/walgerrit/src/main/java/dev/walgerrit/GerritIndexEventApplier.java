@@ -14,6 +14,7 @@
 
 package dev.walgerrit;
 
+import com.google.common.cache.Cache;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.entities.AccountGroup;
 import com.google.gerrit.entities.BranchNameKey;
@@ -21,7 +22,13 @@ import com.google.gerrit.entities.Change;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.index.project.ProjectIndexer;
+import com.google.gerrit.metrics.Counter1;
+import com.google.gerrit.metrics.Description;
+import com.google.gerrit.metrics.Field;
+import com.google.gerrit.metrics.MetricMaker;
+import com.google.gerrit.server.change.MergeabilityComputationBehavior;
 import com.google.gerrit.server.config.AllUsersName;
+import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.git.GitRepositoryManager;
 import com.google.gerrit.server.index.account.AccountIndexer;
 import com.google.gerrit.server.index.change.ChangeIndexer;
@@ -33,11 +40,10 @@ import com.google.gerrit.server.query.change.ChangeData;
 import com.google.gerrit.server.query.change.InternalChangeQuery;
 import com.google.gerrit.server.util.ManualRequestContext;
 import com.google.gerrit.server.util.OneOffRequestContext;
-import com.google.common.cache.Cache;
 import com.google.inject.Inject;
-import com.google.inject.name.Named;
 import com.google.inject.Provider;
 import com.google.inject.Singleton;
+import com.google.inject.name.Named;
 import dev.walgerrit.proto.StorageProto.IndexUpdate;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
 import dev.walgerrit.proto.StorageProto.RefUpdate;
@@ -49,6 +55,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
@@ -57,12 +64,15 @@ import org.slf4j.LoggerFactory;
 
 /** Applies one committed WAL ref transaction to Gerrit's node-local derived state. */
 @Singleton
-final class GerritIndexEventApplier implements IndexEventApplier {
+final class GerritIndexEventApplier
+    implements IndexEventApplier, IndexEventApplier.ChangeDocuments {
   private static final Logger logger = LoggerFactory.getLogger(GerritIndexEventApplier.class);
   private static final String ZERO_OBJECT_ID = "0000000000000000000000000000000000000000";
 
   private final WalGitRepositoryManager repositories;
   private final Project.NameKey allUsers;
+  private final boolean reindexBranches;
+  private final Counter1<String> changedDocuments;
   private final ChangeIndexer changeIndexer;
   private final AccountIndexer accountIndexer;
   private final GroupIndexer groupIndexer;
@@ -77,6 +87,8 @@ final class GerritIndexEventApplier implements IndexEventApplier {
   @Inject
   GerritIndexEventApplier(
       GitRepositoryManager repositories,
+      @GerritServerConfig Config config,
+      MetricMaker metrics,
       AllUsersName allUsers,
       ChangeIndexer changeIndexer,
       AccountIndexer accountIndexer,
@@ -89,6 +101,13 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       ReplicatedCacheEvictions evictions,
       @Named("changeid_project") Cache<Change.Id, String> changeIdProjectCache) {
     this.repositories = (WalGitRepositoryManager) repositories;
+    this.reindexBranches = reindexOnBranchUpdate(config);
+    changedDocuments =
+        metrics.newCounter(
+            "walgerrit/index_events/change_documents",
+            new Description("Completed change document writes during repository ref replay")
+                .setCumulative(),
+            Field.ofString("reason", (metadata, value) -> {}).build());
     this.allUsers = allUsers;
     this.changeIndexer = changeIndexer;
     this.accountIndexer = accountIndexer;
@@ -100,6 +119,24 @@ final class GerritIndexEventApplier implements IndexEventApplier {
     this.requestContext = requestContext;
     this.evictions = evictions;
     this.changeIdProjectCache = changeIdProjectCache;
+  }
+
+  static boolean reindexOnBranchUpdate(Config config) {
+    // Match Gerrit's ReindexChangesAfterRefUpdate. A site extension can have its own
+    // destination-tip-dependent field even when Gerrit doesn't store mergeability.
+    return MergeabilityComputationBehavior.fromConfig(config).includeInIndex()
+        || config.getBoolean("walgerrit", null, "reindexOnBranchUpdate", false);
+  }
+
+  @Override
+  public void reindexChanges(Project.NameKey project, Set<Integer> changes) {
+    try (ManualRequestContext ignored = requestContext.open();
+        EventReplay.Scope replaying = EventReplay.enter()) {
+      for (int change : changes) {
+        indexOrDelete(project, Change.id(change));
+        changedDocuments.increment("metadata_batch");
+      }
+    }
   }
 
   @Override
@@ -198,7 +235,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
     List<Change.Id> ids = new ArrayList<>();
     for (Ref ref : repository.getRefDatabase().getRefsByPrefix(RefNames.REFS_CHANGES)) {
       if (ref.getName().endsWith(RefNames.META_SUFFIX)) {
-        Change.Id id = Change.Id.fromRef(ref.getName());
+        Change.Id id = ChangeRefIds.fromRef(ref.getName());
         if (id != null) {
           ids.add(id);
         }
@@ -226,14 +263,14 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       if (RefNames.REFS_CONFIG.equals(ref)) {
         projectConfigChanged = true;
       }
-      if (ref.startsWith(RefNames.REFS_HEADS)) {
+      if (reindexBranches && ref.startsWith(RefNames.REFS_HEADS)) {
         branches.add(BranchNameKey.create(project, ref));
       }
 
       if (project.equals(allUsers)) {
         collectAllUsersUpdate(update, allUsersChanges, accounts, groups);
       } else if (isChangeMetadataRef(ref)) {
-        Change.Id id = Change.Id.fromRef(ref);
+        Change.Id id = ChangeRefIds.fromRef(ref);
         if (id != null) {
           projectChanges.add(id);
           if (ref.endsWith(RefNames.META_SUFFIX)) {
@@ -260,6 +297,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
         indexOrDelete(project, change);
       }
       indexed.add(change.get());
+      changedDocuments.increment("metadata");
     }
     for (Map.Entry<Change.Id, Boolean> change : allUsersChanges.entrySet()) {
       if (!reindexIfIndexedInContext(change.getKey()) && !change.getValue()) {
@@ -288,6 +326,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       for (ChangeData change : changeQuery.get().byBranchNew(branch)) {
         if (!alreadyIndexed.contains(change.getId())) {
           indexOrDelete(change.project(), change.getId());
+          changedDocuments.increment("branch_tip");
         }
       }
     }
@@ -295,6 +334,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       for (ChangeData change : changeQuery.get().byProjectOpen(project)) {
         if (!alreadyIndexed.contains(change.getId())) {
           indexOrDelete(change.project(), change.getId());
+          changedDocuments.increment("project_config");
         }
       }
     }
@@ -326,7 +366,7 @@ final class GerritIndexEventApplier implements IndexEventApplier {
       Set<Account.Id> accounts,
       Map<AccountGroup.UUID, RefUpdate> groups) {
     String ref = update.getName();
-    Change.Id changeId = Change.Id.fromAllUsersRef(ref);
+    Change.Id changeId = ChangeRefIds.fromAllUsersRef(ref);
     if (changeId != null) {
       changes.merge(changeId, isZero(update.getNewObjectId()), Boolean::logicalAnd);
     }

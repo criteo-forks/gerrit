@@ -15,11 +15,15 @@
 package dev.walgerrit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Change;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.exceptions.StorageException;
+import com.google.gerrit.metrics.DisabledMetricMaker;
+import com.google.gerrit.server.change.MergeabilityComputationBehavior;
 import com.google.gerrit.server.config.AllUsersName;
 import com.google.gerrit.server.index.change.TestChangeIndexer;
 import com.google.gerrit.server.notedb.ChangeNotes;
@@ -29,6 +33,7 @@ import dev.walgerrit.proto.StorageProto.RefUpdate;
 import java.lang.reflect.InvocationTargetException;
 import java.util.HashSet;
 import java.util.Set;
+import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.ObjectId;
 import org.junit.jupiter.api.Test;
 
@@ -87,6 +92,8 @@ class GerritIndexEventApplierChangesTest {
   final GerritIndexEventApplier applier =
       new GerritIndexEventApplier(
           null,
+          new Config(),
+          new DisabledMetricMaker(),
           new AllUsersName("All-Users"),
           indexer,
           null,
@@ -119,6 +126,57 @@ class GerritIndexEventApplierChangesTest {
         throw failure;
       }
       throw e;
+    }
+  }
+
+  @Test
+  void defaultBranchPushDoesNotQueryOpenReviewsButStillIndexesItsExplicitChange() {
+    stored.add(CHANGE);
+    RefUpdate.Builder update =
+        RefUpdate.newBuilder()
+            .setOldObjectId(PATCH_SET_1.name())
+            .setNewObjectId(PATCH_SET_2.name());
+    var effects =
+        applier.applyInContext(
+            PROJECT,
+            RefTransaction.newBuilder()
+                .addUpdates(update.setName("refs/heads/main"))
+                .addUpdates(update.setName(RefNames.changeMetaRef(CHANGE)))
+                .build());
+    assertEquals(Set.of(CHANGE.get()), effects.indexed());
+    assertEquals(Set.of(CHANGE), documents);
+  }
+
+  @Test
+  void oversizedRawRefsLeaveTheOtherChangeInTheSameReplayIntact() {
+    stored.add(CHANGE);
+    RefUpdate.Builder update =
+        RefUpdate.newBuilder()
+            .setOldObjectId(PATCH_SET_1.name())
+            .setNewObjectId(PATCH_SET_2.name());
+    var effects =
+        applier.applyInContext(
+            PROJECT,
+            RefTransaction.newBuilder()
+                .addUpdates(update.setName("refs/changes/48/2147483648/meta"))
+                .addUpdates(update.setName("refs/changes/01/1/2147483648"))
+                .addUpdates(update.setName(RefNames.changeMetaRef(CHANGE)))
+                .build());
+    assertEquals(Set.of(CHANGE.get()), effects.indexed());
+    assertEquals(Set.of(CHANGE), documents);
+  }
+
+  @Test
+  void branchDependentFieldsRequireBranchReplay() {
+    Config config = new Config();
+    assertFalse(GerritIndexEventApplier.reindexOnBranchUpdate(config));
+    for (var behavior : MergeabilityComputationBehavior.values()) {
+      config.setEnum("change", null, "mergeabilityComputationBehavior", behavior);
+      config.setBoolean("walgerrit", null, "reindexOnBranchUpdate", false);
+      assertEquals(
+          behavior.includeInIndex(), GerritIndexEventApplier.reindexOnBranchUpdate(config));
+      config.setBoolean("walgerrit", null, "reindexOnBranchUpdate", true);
+      assertTrue(GerritIndexEventApplier.reindexOnBranchUpdate(config));
     }
   }
 
