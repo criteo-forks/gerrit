@@ -112,7 +112,7 @@ class DatabasePubKeyAuth implements PublickeyAuthenticator {
     SshSession sd = session.getAttribute(SshSession.KEY);
     checkState(sd.getUser() == null);
     if (PeerDaemonUser.USER_NAME.equals(username)) {
-      if (myHostKeys.contains(suppliedKey) || getPeerKeys().contains(suppliedKey)) {
+      if (isPeerKey(suppliedKey)) {
         PeerDaemonUser user = peerFactory.create(sd.getRemoteAddress());
         return SshUtil.success(username, session, sshScope, sshLog, sd, user);
       }
@@ -159,6 +159,11 @@ class DatabasePubKeyAuth implements PublickeyAuthenticator {
     }
 
     return SshUtil.success(username, session, sshScope, sshLog, sd, cu);
+  }
+
+  /** Whether {@code key} identifies this daemon or one of the peers it trusts. */
+  boolean isPeerKey(PublicKey key) {
+    return myHostKeys.contains(key) || getPeerKeys().contains(key);
   }
 
   private Set<PublicKey> getPeerKeys() {

@@ -100,6 +100,10 @@ public abstract class AbstractGitCommand extends BaseCommand implements TraceIdC
     project = projectState.getProject();
     projectName = project.getNameKey();
 
+    if (handedToPeer()) {
+      return;
+    }
+
     try {
       repo = repoManager.openRepository(projectName);
     } catch (RepositoryNotFoundException e) {
@@ -114,6 +118,15 @@ public abstract class AbstractGitCommand extends BaseCommand implements TraceIdC
   }
 
   protected abstract void runImpl() throws IOException, PermissionBackendException, Failure;
+
+  /**
+   * Lets a peer daemon run the command, before this one opens the repository.
+   *
+   * @return true when a peer ran it and its answer was sent to the client
+   */
+  protected boolean handedToPeer() throws IOException, Failure {
+    return false;
+  }
 
   @Override
   public void accept(String tagName, String traceId) {

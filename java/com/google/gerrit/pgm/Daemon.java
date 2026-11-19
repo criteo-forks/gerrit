@@ -31,7 +31,6 @@ import com.google.gerrit.httpd.GerritAuthModule;
 import com.google.gerrit.httpd.GetUserFilter.GetUserFilterModule;
 import com.google.gerrit.httpd.GitOverHttpModule;
 import com.google.gerrit.httpd.H2CacheBasedWebSession;
-import com.google.gerrit.httpd.WebSessionSigningKeyModule;
 import com.google.gerrit.httpd.HttpCanonicalWebUrlProvider;
 import com.google.gerrit.httpd.HttpdModule;
 import com.google.gerrit.httpd.RequestCleanupFilter;
@@ -41,7 +40,9 @@ import com.google.gerrit.httpd.RequireSslFilter.RequireSslFilterModule;
 import com.google.gerrit.httpd.ServingGateFilter;
 import com.google.gerrit.httpd.SetThreadNameFilter;
 import com.google.gerrit.httpd.WebModule;
+import com.google.gerrit.httpd.WebSessionSigningKeyModule;
 import com.google.gerrit.httpd.WebSshGlueModule;
+import com.google.gerrit.httpd.WriteForwardingFilter;
 import com.google.gerrit.httpd.auth.oauth.OAuthModule;
 import com.google.gerrit.httpd.auth.openid.OpenIdModule;
 import com.google.gerrit.httpd.auth.restapi.OAuthRestModule;
@@ -680,6 +681,7 @@ public class Daemon extends SiteProgram {
   private Injector createWebInjector() {
     final List<Module> modules = new ArrayList<>();
     modules.add(ServingGateFilter.module());
+    modules.add(WriteForwardingFilter.module());
     modules.add(RequestContextFilter.module());
     modules.add(RequestMetricsFilter.module());
     modules.add(H2CacheBasedWebSession.module());

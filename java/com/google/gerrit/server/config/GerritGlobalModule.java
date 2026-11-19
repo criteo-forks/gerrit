@@ -97,6 +97,7 @@ import com.google.gerrit.server.ServerStateProvider;
 import com.google.gerrit.server.ServingGate.ServingGateModule;
 import com.google.gerrit.server.TraceRequestListener;
 import com.google.gerrit.server.ValidationOptionsListener;
+import com.google.gerrit.server.WriteForwarding.WriteForwardingModule;
 import com.google.gerrit.server.account.AccountControl;
 import com.google.gerrit.server.account.AccountDeactivator;
 import com.google.gerrit.server.account.AccountExternalIdCreator;
@@ -296,6 +297,7 @@ public class GerritGlobalModule extends FactoryModule {
     install(new GroupDbModule());
     install(new GroupModule());
     install(new ServingGateModule());
+    install(new WriteForwardingModule());
     install(new NoteDbModule());
     install(new PrologModule(cfg));
     install(new DefaultSubmitRuleModule());

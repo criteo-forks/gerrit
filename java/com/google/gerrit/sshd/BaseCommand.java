@@ -380,7 +380,9 @@ public abstract class BaseCommand implements Command {
     if (e instanceof Failure) {
       final Failure f = (Failure) e;
       try {
-        err.write((f.getMessage() + "\n").getBytes(ENC));
+        if (!(f instanceof RelayedExit)) {
+          err.write((f.getMessage() + "\n").getBytes(ENC));
+        }
         err.flush();
       } catch (IOException e2) {
         // Ignored
@@ -654,6 +656,15 @@ public abstract class BaseCommand implements Command {
      */
     public UnloggedFailure(int exitCode, String msg, Throwable why) {
       super(exitCode, msg, why);
+    }
+  }
+
+  /** Ends a command with the exit code of a peer daemon whose output the client already has. */
+  public static class RelayedExit extends UnloggedFailure {
+    private static final long serialVersionUID = 1L;
+
+    public RelayedExit(int exitCode) {
+      super(exitCode, "peer exit " + exitCode);
     }
   }
 }

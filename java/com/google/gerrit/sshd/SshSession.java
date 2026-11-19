@@ -36,6 +36,7 @@ public class SshSession {
   private volatile String peerAgent;
 
   private volatile boolean gracefulStop = false;
+  private volatile boolean fromPeer;
 
   SshSession(int sessionId, SocketAddress peer) {
     this.sessionId = sessionId;
@@ -53,6 +54,7 @@ public class SshSession {
       this.remoteAsString = format(peer) + "/" + parent.remoteAsString;
     }
     this.identity = user;
+    this.fromPeer = parent.fromPeer;
   }
 
   /** Unique session number, assigned during connect. */
@@ -66,6 +68,15 @@ public class SshSession {
 
   public void setGracefulStop(boolean gracefulStop) {
     this.gracefulStop = gracefulStop;
+  }
+
+  /** Whether a peer daemon runs this session's command for one of its own clients. */
+  public boolean isFromPeer() {
+    return fromPeer;
+  }
+
+  void setFromPeer() {
+    fromPeer = true;
   }
 
   /** Identity of the authenticated user account on the socket. */

@@ -27,10 +27,13 @@ import com.google.gerrit.server.permissions.PermissionBackend;
 import com.google.gerrit.server.permissions.PermissionBackendException;
 import com.google.gerrit.server.permissions.ProjectPermission;
 import com.google.gerrit.sshd.AbstractGitCommand;
+import com.google.gerrit.sshd.CommandExecutor;
 import com.google.gerrit.sshd.CommandMetaData;
+import com.google.gerrit.sshd.PeerRelay;
 import com.google.gerrit.sshd.SshMetrics;
 import com.google.inject.Inject;
 import java.io.IOException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import org.eclipse.jgit.errors.TooLargeObjectInPackException;
 import org.eclipse.jgit.errors.UnpackException;
 import org.eclipse.jgit.transport.AdvertiseRefsHook;
@@ -47,6 +50,8 @@ final class Receive extends AbstractGitCommand {
   @Inject private AsyncReceiveCommits.Factory factory;
   @Inject private PermissionBackend permissionBackend;
   @Inject private SshMetrics sshMetrics;
+  @Inject private PeerRelay peerRelay;
+  @Inject @CommandExecutor private ScheduledThreadPoolExecutor commandExecutor;
 
   private final SetMultimap<ReviewerStateInternal, Account.Id> reviewers =
       MultimapBuilder.hashKeys(2).hashSetValues().build();
@@ -67,6 +72,24 @@ final class Receive extends AbstractGitCommand {
       usage = "CC user on change(s)")
   void addCC(Account.Id id) {
     reviewers.put(ReviewerStateInternal.CC, id);
+  }
+
+  @Override
+  protected boolean handedToPeer() throws IOException, Failure {
+    CurrentUser currentUser = session.getUser();
+    if (session.isFromPeer() || !currentUser.isIdentifiedUser() || currentUser.isImpersonating()) {
+      return false;
+    }
+    return peerRelay.receivePack(
+        projectName.get(),
+        currentUser.getAccountId(),
+        session.getRemoteAddress(),
+        getArguments(),
+        extraParameters,
+        commandExecutor,
+        in,
+        out,
+        err);
   }
 
   @Override

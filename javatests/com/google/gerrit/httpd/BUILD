@@ -10,6 +10,7 @@ junit_tests(
         "//java/com/google/gerrit/extensions:api",
         "//java/com/google/gerrit/httpd",
         "//java/com/google/gerrit/httpd/auth/oauth",
+        "//java/com/google/gerrit/metrics",
         "//java/com/google/gerrit/server",
         "//java/com/google/gerrit/testing:gerrit-junit",
         "//javatests/com/google/gerrit/util/http/testutil",

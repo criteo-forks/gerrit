@@ -37,6 +37,7 @@ import com.google.gerrit.httpd.ServingGateFilter;
 import com.google.gerrit.httpd.SetThreadNameFilter;
 import com.google.gerrit.httpd.WebModule;
 import com.google.gerrit.httpd.WebSshGlueModule;
+import com.google.gerrit.httpd.WriteForwardingFilter;
 import com.google.gerrit.httpd.auth.oauth.OAuthModule;
 import com.google.gerrit.httpd.auth.openid.OpenIdModule;
 import com.google.gerrit.httpd.auth.restapi.OAuthRestModule;
@@ -438,6 +439,7 @@ public class WebAppInitializer extends GuiceServletContextListener implements Fi
   private Injector createWebInjector() {
     final List<Module> modules = new ArrayList<>();
     modules.add(ServingGateFilter.module());
+    modules.add(WriteForwardingFilter.module());
     modules.add(RequestContextFilter.module());
     modules.add(RequestMetricsFilter.module());
     modules.add(sysInjector.getInstance(GerritAuthModule.class));
