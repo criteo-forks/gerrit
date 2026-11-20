@@ -17,9 +17,12 @@ package dev.walgerrit;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import dev.walgerrit.proto.StorageProto.ChangeKeyPage;
+import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.LogPosition;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Node-wide record of the newest manifest observed per repository.
@@ -35,6 +38,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * is current.
  */
 final class ManifestCache {
+  private static final Logger logger = LoggerFactory.getLogger(ManifestCache.class);
+
   record Page(String repo, LogPosition position, int shard) {}
 
   // Immutable WAL pages, shared by repository handles on this node.
@@ -43,6 +48,34 @@ final class ManifestCache {
           .maximumWeight(16L << 20)
           .weigher((Page key, ChangeKeyPage page) -> 128 + page.getSerializedSize())
           .build();
+
+  record Entry(String repo, long sequence, String transactionId) {}
+
+  // The limits bound estimated weight, not heap usage.
+  static final long LOG_ENTRIES_WEIGHT = 64L << 20;
+  static final long LOG_ENTRY_MAX_WEIGHT = LOG_ENTRIES_WEIGHT / 8;
+
+  // Log entries are immutable under their keys.
+  final Cache<Entry, LogEntry> logEntries =
+      CacheBuilder.newBuilder()
+          .maximumWeight(LOG_ENTRIES_WEIGHT)
+          .weigher((Entry key, LogEntry entry) -> (int) Math.min(Integer.MAX_VALUE, weight(entry)))
+          .build();
+
+  static long weight(LogEntry entry) {
+    return 256 + 2L * entry.getSerializedSize();
+  }
+
+  /** Caches a log entry unless it is oversized; never throws. */
+  void keep(Entry key, LogEntry entry) {
+    try {
+      if (weight(entry) <= LOG_ENTRY_MAX_WEIGHT) {
+        logEntries.put(key, entry);
+      }
+    } catch (RuntimeException failure) {
+      logger.warn("Log entry {} of {} not kept", key.sequence(), key.repo(), failure);
+    }
+  }
 
   record VersionedManifest(Manifest manifest, String version) {}
 

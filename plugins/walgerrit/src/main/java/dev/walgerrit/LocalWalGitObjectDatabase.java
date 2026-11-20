@@ -47,6 +47,7 @@ import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
 import org.eclipse.jgit.internal.storage.dfs.ReadableChannel;
 import org.eclipse.jgit.internal.storage.pack.PackExt;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.ReceiveCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -333,6 +334,32 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     adoptObservedManifest();
     long refRevision = manifestStore.current().getRefRevision();
     refTransaction.set(new RefTransactionState(refRevision, publisher.observe(refRevision)));
+  }
+
+  /**
+   * Best-effort prefetch, before the node lock, of what a ref transaction with these commands is
+   * likely to read: an announced manifest, pending publication outcomes, reftables and the
+   * commands' objects. It decides nothing; the transaction revalidates under the lock and may
+   * still read the store there.
+   */
+  void prefetchRefTransaction(RevWalk walk, List<ReceiveCommand> commands) {
+    try {
+      revalidateIfStale();
+      String reftable = "." + PackExt.REFTABLE.getExtension();
+      for (PackRef pack : publisher.snapshot(manifestStore, false).manifest().getPacksList()) {
+        if (ManifestStore.hasReftable(pack)) {
+          manifestStore.immutableFile(pack.getName() + reftable);
+        }
+      }
+      for (ReceiveCommand command : commands) {
+        if (!ObjectId.zeroId().equals(command.getNewId())) {
+          walk.peel(walk.parseAny(command.getNewId()));
+        }
+      }
+    } catch (IOException | RuntimeException unavailable) {
+      logger.debug(
+          "Nothing more prefetched for a ref transaction on {}", repositoryName(), unavailable);
+    }
   }
 
   /** This node's publication pipeline for the repository, shared by every handle on it. */

@@ -239,6 +239,7 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
             }
           }
           admission = publisher.admit(names);
+          objectDatabase.prefetchRefTransaction(walk, pending);
           nodeLock.lock();
           try {
             objectDatabase.beginRefTransaction();

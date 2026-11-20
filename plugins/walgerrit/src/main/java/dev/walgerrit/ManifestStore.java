@@ -367,6 +367,11 @@ final class ManifestStore {
   }
 
   private LogEntry readEntry(long sequence, String transactionId) throws IOException {
+    LogEntry known =
+        cache.logEntries.getIfPresent(new ManifestCache.Entry(cacheKey, sequence, transactionId));
+    if (known != null) {
+      return known;
+    }
     String key = logKey(sequence, transactionId);
     ObjectStore.StoredObject stored =
         objectStore.get(key).orElseThrow(() -> new IOException("WAL entry not found: " + key));
@@ -374,7 +379,13 @@ final class ManifestStore {
     if (entry.getSeq() != sequence || !entry.getTransactionId().equals(transactionId)) {
       throw new IOException("WAL entry " + key + " does not describe itself");
     }
+    remember(entry);
     return entry;
+  }
+
+  /** Caches a verified store entry or this node's entry once its publication has landed. */
+  private void remember(LogEntry entry) {
+    cache.keep(new ManifestCache.Entry(cacheKey, entry.getSeq(), entry.getTransactionId()), entry);
   }
 
   ChangeKeyPage keyPage(LogPosition position, int shard) throws IOException {
@@ -684,7 +695,8 @@ final class ManifestStore {
           next.clearChangeKeys();
         }
       }
-      objectStore.putIfAbsent(logKey(sequence, transactionId), entry.build().toByteArray());
+      LogEntry written = entry.build();
+      objectStore.putIfAbsent(logKey(sequence, transactionId), written.toByteArray());
       Manifest updated = next.build();
 
       attempts.attempting(sequence, transactionId);
@@ -711,6 +723,7 @@ final class ManifestStore {
         }
         if (landed) {
           attempts.settled(true);
+          remember(written);
           notifyPublished(fresh, entry.getKind());
           return fresh.manifest();
         }
@@ -726,6 +739,7 @@ final class ManifestStore {
         continue;
       }
       attempts.settled(true);
+      remember(written);
       VersionedManifest published = new VersionedManifest(updated, stored.version());
       cache.offer(cacheKey, published);
       notifyPublished(published, entry.getKind());

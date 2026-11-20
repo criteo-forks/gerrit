@@ -30,6 +30,18 @@ local transactions from touching the same ref or conflicting parent/child ref na
 validation and table construction use the node lock; publication can batch independent prepared
 transactions into one log entry and one manifest CAS.
 
+Before it takes the node lock, a ref transaction prefetches an announced manifest, the outcome of
+pending publication attempts, the stack's reftables and the objects its commands name, so most
+store reads happen outside the lock that the node's other transactions on the repository wait
+for. The prefetch decides nothing: under the lock the transaction revalidates and still reads the
+store for newer or evicted data, failed prefetches, newly resolvable attempts, periodic
+revalidation and fast-forward history.
+
+A node keeps the log entries it read or published in memory. The limit is 64 MiB of estimated
+weight for all repositories, which is not a measure of heap, and an entry above 8 MiB of it is
+not kept. Entries are immutable, so replay, landed checks and change-key pages read a kept entry
+from the store at most once. Whether an entry is kept has no effect on a publication.
+
 Object inserters and received-pack parsers upload files before ref publication. Their packs remain
 pending on the node until a ref transaction carries them or the originating handle closes and
 flushes them. Local readers can see these pending objects. Other nodes see them only after

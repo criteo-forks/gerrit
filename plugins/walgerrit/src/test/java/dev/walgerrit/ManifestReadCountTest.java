@@ -161,9 +161,9 @@ class ManifestReadCountTest {
         store.count("GET-if-changed catalog/manifest.pb"),
         "one authoritative catalog read for the names the catalog's own entries touched");
     assertEquals(
-        3 * projects.size() + 1,
+        0,
         store.count("GET log/*"),
-        "one WAL entry per new repository, and its reservation, activation and HEAD in the catalog");
+        "the WAL entries this node published are replayed from its memory");
 
     store.reset();
     tailer.runOnce();
