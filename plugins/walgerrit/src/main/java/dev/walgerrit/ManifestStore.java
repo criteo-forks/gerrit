@@ -405,19 +405,30 @@ final class ManifestStore {
   }
 
   @Nullable
-  AccountRefPage accountPage(String pointer) throws IOException {
+  AccountRefPage accountPage(String pointer) {
     String cachePage = cacheKey + "/" + pointer;
     AccountRefPage page = cache.accountPages.getIfPresent(cachePage);
-    if (page == null) {
-      String key = ACCOUNT_PAGES + pointer;
-      var stored = objectStore.get(key);
-      if (stored.isEmpty()) {
-        return null;
-      }
-      page = AccountRefPage.parseFrom(stored.get().bytes());
-      cache.accountPages.put(cachePage, page);
+    if (page != null) {
+      return page;
     }
-    return page;
+    IOException cause = null;
+    try {
+      var stored = objectStore.get(ACCOUNT_PAGES + pointer);
+      if (stored.isPresent()) {
+        page = AccountRefPage.parseFrom(stored.get().bytes());
+        if (page.getTipsCount() == 0) {
+          throw new IOException("Referenced account ref page is empty");
+        }
+        cache.accountPages.put(cachePage, page);
+        return page;
+      }
+    } catch (IOException failure) {
+      cause = failure;
+    }
+    if (cache.accountPageWarnings.asMap().putIfAbsent(cachePage, true) == null) {
+      logger.warn("Cannot load account ref page {} of {}", pointer, repositoryName, cause);
+    }
+    return null;
   }
 
   String writeAccountPage(AccountRefPage page) throws IOException {
@@ -453,14 +464,15 @@ final class ManifestStore {
     Attempts UNOBSERVED =
         new Attempts() {
           @Override
-          public void attempting(long sequence, String transactionId) {}
+          public void attempting(
+              long sequence, String transactionId, AuthRefDirectory.Bootstrap bootstrap) {}
 
           @Override
           public void settled(boolean landed) {}
         };
 
     /** Called before each CAS with the log entry it would make the head. */
-    void attempting(long sequence, String transactionId);
+    void attempting(long sequence, String transactionId, AuthRefDirectory.Bootstrap bootstrap);
 
     /**
      * The attempt announced last is proved to be in the history, or proved never to get there
@@ -727,14 +739,17 @@ final class ManifestStore {
           next.clearChangeKeys();
         }
       }
+      AuthRefDirectory.Bootstrap bootstrap = null;
       if (changesRefs && (current.hasAuthRefs() || authSeed != null)) {
-        AuthRefDirectory.publish(this, current, authSeed, refTransaction, entry.getKind(), next);
+        bootstrap =
+            AuthRefDirectory.publish(
+                this, current, authSeed, refTransaction, entry.getKind(), next);
       }
       LogEntry written = entry.build();
       objectStore.putIfAbsent(logKey(sequence, transactionId), written.toByteArray());
       Manifest updated = next.build();
 
-      attempts.attempting(sequence, transactionId);
+      attempts.attempting(sequence, transactionId, bootstrap);
       ObjectStore.StoredObject stored;
       try {
         stored =
@@ -953,24 +968,32 @@ final class ManifestStore {
     return names;
   }
 
-  /** Every object beneath {@code wal/}, keyed by file name, with the store's timestamps. */
-  List<ObjectStore.ObjectSummary> listWalObjects() throws IOException {
-    String prefix = WAL_DIRECTORY + "/";
-    List<ObjectStore.ObjectSummary> files = new ArrayList<>();
-    for (ObjectStore.ObjectSummary object : objectStore.listWithVersions(prefix)) {
-      if (object.key().startsWith(prefix) && object.key().length() > prefix.length()) {
-        files.add(
-            new ObjectStore.ObjectSummary(
-                object.key().substring(prefix.length()),
-                object.version(),
-                object.lastModifiedEpochMillis()));
+  /** Repository-relative keys sharing the upload and retirement grace periods. */
+  List<ObjectStore.ObjectSummary> listReclaimableObjects() throws IOException {
+    List<ObjectStore.ObjectSummary> objects = new ArrayList<>();
+    for (String prefix : List.of(WAL_DIRECTORY + "/", ACCOUNT_PAGES)) {
+      for (ObjectStore.ObjectSummary object : objectStore.listWithVersions(prefix)) {
+        if (object.key().startsWith(prefix) && object.key().length() > prefix.length()) {
+          objects.add(object);
+        }
       }
     }
-    return files;
+    return objects;
   }
 
-  void deleteWalObject(String fileName) throws IOException {
-    objectStore.delete(WAL_DIRECTORY + "/" + fileName);
+  static java.util.Set<String> liveObjectKeys(Manifest manifest, java.util.Set<String> walFiles) {
+    java.util.Set<String> keys = new java.util.HashSet<>();
+    walFiles.forEach(file -> keys.add(WAL_DIRECTORY + "/" + file));
+    manifest
+        .getAuthRefs()
+        .getPagesMap()
+        .values()
+        .forEach(pointer -> keys.add(ACCOUNT_PAGES + pointer));
+    return keys;
+  }
+
+  void deleteReclaimableObject(String key) throws IOException {
+    objectStore.delete(key);
   }
 
   /**

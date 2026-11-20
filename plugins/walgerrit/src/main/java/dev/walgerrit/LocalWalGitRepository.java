@@ -14,6 +14,7 @@
 
 package dev.walgerrit;
 
+import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Project;
 import java.io.IOException;
 import java.time.Duration;
@@ -40,14 +41,14 @@ final class LocalWalGitRepository extends DfsRepository {
       ManifestStore manifestStore,
       Duration revalidateInterval,
       long writeEpoch,
-      boolean allUsers)
+      @Nullable AuthRefDirectory.Reader authRefs)
       throws IOException {
     super(
         new Builder()
             .setRepositoryDescription(new DfsRepositoryDescription(name.get())));
     objectDatabase =
         new LocalWalGitObjectDatabase(this, manifestStore, revalidateInterval, writeEpoch);
-    refDatabase = new LocalWalGitRefDatabase(this, objectDatabase, allUsers);
+    refDatabase = new LocalWalGitRefDatabase(this, objectDatabase, authRefs);
   }
 
   @Override

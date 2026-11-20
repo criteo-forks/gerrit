@@ -552,7 +552,7 @@ final class Catalog {
         store.create();
       }
       LocalWalGitRepository opened =
-          new LocalWalGitRepository(NAME, store, revalidateInterval, ManifestStore.UNFENCED, false);
+          new LocalWalGitRepository(NAME, store, revalidateInterval, ManifestStore.UNFENCED, null);
       if (!opened.exists()) {
         // Recover a process death between manifest creation and the initial HEAD transaction, or
         // this is a brand-new deployment. Of two nodes doing this at once, the CAS refuses one.

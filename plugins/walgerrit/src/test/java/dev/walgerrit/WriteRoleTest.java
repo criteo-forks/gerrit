@@ -50,7 +50,7 @@ class WriteRoleTest {
   @TempDir Path root;
 
   /** Counts increments by metric name and field values. */
-  private static final class Counters extends DisabledMetricMaker {
+  static final class Counters extends DisabledMetricMaker {
     final Map<String, Long> counts = new ConcurrentHashMap<>();
 
     long count(String... key) {

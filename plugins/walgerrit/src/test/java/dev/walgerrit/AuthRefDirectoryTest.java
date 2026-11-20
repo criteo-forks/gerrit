@@ -10,10 +10,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.entities.Project;
+import com.google.gerrit.metrics.DisabledMetricMaker;
+import com.google.gerrit.metrics.MetricMaker;
 import com.google.gerrit.server.account.AccountConfig;
 import com.google.gerrit.server.account.externalids.ExternalId;
 import com.google.gerrit.server.account.externalids.storage.notedb.ExternalIdReader;
@@ -22,8 +25,13 @@ import com.google.gerrit.server.config.VersionedDefaultPreferences;
 import dev.walgerrit.ManifestReadCountTest.CountingObjectStore;
 import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +40,7 @@ import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.eclipse.jgit.internal.storage.dfs.DfsBlockCache;
 import org.eclipse.jgit.internal.storage.pack.PackExt;
@@ -52,6 +61,8 @@ import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.ReceiveCommand;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 class AuthRefDirectoryTest {
   private static final Project.NameKey USERS = Project.nameKey("Site-Accounts");
@@ -328,7 +339,83 @@ class AuthRefDirectoryTest {
   }
 
   @Test
-  void missingReferencedPageFallsBackForBothPresentAndAbsentAccounts() throws Exception {
+  void sweepsRetiredAndLosingPagesAfterGraceAndKeepsThePublishedPage() throws Exception {
+    Path bucketPath = root.resolve("bucket");
+    ObjectStore bucket = new FileObjectStore(bucketPath);
+    WalGitRepositoryManager a = node("a", bucket);
+    try (Repository writer = a.createRepository(USERS)) {
+      ObjectId first = insertCommit(writer, "initial account");
+      set(writer, USER, ZERO, first);
+      String logs = "repos/" + a.idOf(USERS) + "/log/";
+      String pages = logs + "auth-refs/";
+      String original = pages + manifest(a).getAuthRefs().getPagesOrThrow(1001 >>> 8);
+      Duration grace = Duration.ofDays(1);
+      SteppingClock clock = new SteppingClock(Instant.now());
+      Files.setLastModifiedTime(
+          bucketPath.resolve(original), FileTime.from(clock.instant().minus(grace)));
+      Reclaimer reclaimer = new Reclaimer(a, clock, grace, 0);
+      CountingObjectStore oldReads = new CountingObjectStore(bucket);
+      try (Repository oldReader = node("old-reader", oldReads).openRepository(USERS)) {
+        ObjectId changed = insertCommit(writer, "changed account");
+        HookedObjectStore race =
+            new HookedObjectStore(
+                bucket,
+                HookedObjectStore::publishesRefChange,
+                () -> {
+                  try {
+                    // The losing page is uploaded and the original is still live.
+                    assertEquals(2, bucket.list(pages).size());
+                    reclaimer.reclaim(USERS);
+                    set(writer, USER, first, changed);
+                  } catch (Exception failure) {
+                    throw new AssertionError(failure);
+                  }
+                });
+        try (Repository other = node("b", race).openRepository(USERS)) {
+          set(other, NEIGHBOR, ZERO, first);
+        }
+        assertEquals(2, race.matchedCasAttempts.get());
+        String orphan =
+            pages + race.firstMatchingProposal.getAuthRefs().getPagesOrThrow(1001 >>> 8);
+        String live = pages + manifest(a).getAuthRefs().getPagesOrThrow(1001 >>> 8);
+        assertEquals(4, bucket.list(pages).size());
+        var entries = bucket.list(logs).stream().filter(key -> !key.startsWith(pages)).toList();
+        assertFalse(entries.isEmpty());
+
+        reclaimer.reclaim(USERS);
+        assertTrue(bucket.get(original).isPresent());
+        assertEquals(first, oldReader.exactRef(USER).getObjectId());
+        assertEquals(1, oldReads.count("GET auth-page"));
+        assertEquals(0, oldReads.count("DOWNLOAD wal/*.ref"));
+        clock.advance(grace.plusMinutes(1));
+        reclaimer.reclaim(USERS);
+        assertTrue(bucket.get(original).isEmpty());
+        assertTrue(
+            bucket.get(orphan).isPresent(), "the upload grace precedes the retirement grace");
+        clock.advance(grace);
+        reclaimer.reclaim(USERS);
+        assertEquals(List.of(live), bucket.list(pages));
+        assertTrue(bucket.list(logs).containsAll(entries));
+        CountingObjectStore reads = new CountingObjectStore(bucket);
+        try (Repository fresh = node("fresh", reads).openRepository(USERS)) {
+          assertEquals(changed, fresh.exactRef(USER).getObjectId());
+          assertEquals(first, fresh.exactRef(NEIGHBOR).getObjectId());
+          assertEquals(0, reads.count("DOWNLOAD wal/*.ref"));
+        }
+      }
+    }
+  }
+
+  enum PageFailure {
+    MISSING,
+    TIMEOUT,
+    INVALID_PROTO,
+    EMPTY_PAGE
+  }
+
+  @ParameterizedTest
+  @EnumSource(PageFailure.class)
+  void unavailablePageFallsBackAndCanBeRetriedOrRebuilt(PageFailure failure) throws Exception {
     ObjectStore bucket = new FileObjectStore(root.resolve("bucket"));
     WalGitRepositoryManager a = node("a", bucket);
     ObjectId tip;
@@ -336,21 +423,59 @@ class AuthRefDirectoryTest {
       tip = insertCommit(repo, "account");
       set(repo, USER, ZERO, tip);
     }
+    AtomicBoolean unavailable = new AtomicBoolean(true);
     var reads =
         new CountingObjectStore(bucket) {
           @Override
           public Optional<StoredObject> get(String key) throws IOException {
-            return key.contains("/log/auth-refs/") ? Optional.empty() : super.get(key);
+            if (!unavailable.get() || !key.contains("/log/auth-refs/")) {
+              return super.get(key);
+            }
+            return switch (failure) {
+              case MISSING -> Optional.empty();
+              case TIMEOUT -> throw new SocketTimeoutException("page GET timed out");
+              case INVALID_PROTO -> Optional.of(new StoredObject(new byte[] {(byte) 0x80}, "bad"));
+              case EMPTY_PAGE -> Optional.of(new StoredObject(new byte[0], "empty"));
+            };
           }
         };
-    WalGitRepositoryManager b = node("b", reads);
+    var metrics = new WriteRoleTest.Counters();
+    String counter = "walgerrit/auth_refs/lookups";
+    WalGitRepositoryManager b = node("b", reads, USERS.get(), metrics);
     try (Repository reader = b.openRepository(USERS)) {
+      metrics.counts.clear();
       long before = tableRequests();
       assertEquals(tip, reader.exactRef(USER).getObjectId());
       assertNull(reader.exactRef(ABSENT));
       assertTrue(tableRequests() > before);
+      assertEquals(2, metrics.count(counter, "fallback", "page_unavailable"));
+      assertNull(reader.exactRef(OTHER_PAGE));
+      assertNull(reader.exactRef("refs/heads/main"));
+      assertEquals(1, metrics.count(counter, "hit", "none"));
+      assertEquals(1, metrics.count(counter, "fallback", "unsupported"));
+
+      // Another handle retries the same pointer when it becomes available.
+      unavailable.set(false);
+      try (Repository recovered = b.openRepository(USERS)) {
+        before = tableRequests();
+        assertEquals(tip, recovered.exactRef(USER).getObjectId());
+        assertNull(recovered.exactRef(ABSENT));
+        assertEquals(before, tableRequests());
+      }
+      assertEquals(3, metrics.count(counter, "hit", "none"));
+
+      // A peer update forces a cold page load for the neighboring ref.
+      try (Repository writer = a.openRepository(USERS)) {
+        ObjectId edit = insertCommit(writer, "account edit");
+        set(writer, USER, tip, edit);
+      }
+      reader.scanForRepoChanges();
+      unavailable.set(true);
       set(reader, NEIGHBOR, ZERO, tip);
       assertFalse(manifest(b).hasAuthRefs());
+      long uncovered = metrics.count(counter, "fallback", "uncovered");
+      assertEquals(tip, reader.exactRef(NEIGHBOR).getObjectId());
+      assertEquals(uncovered + 1, metrics.count(counter, "fallback", "uncovered"));
     }
     try (Repository writer = a.openRepository(USERS)) {
       set(writer, REFS_USERS_DEFAULT, ZERO, tip);
@@ -360,12 +485,12 @@ class AuthRefDirectoryTest {
   }
 
   @Test
-  void acceptedGroupUpdatesOneAccountPageOnce() throws Exception {
+  void pendingRequestsShareOneBootstrapSeedAndGroupTheirAccountPageUpdates() throws Exception {
     ObjectStore bucket = new FileObjectStore(root.resolve("bucket"));
     ObjectId tip;
-    try (Repository repo = node("setup", bucket).createRepository(USERS)) {
+    try (Repository repo = node("setup", bucket, "Other-Accounts").createRepository(USERS)) {
       tip = insertCommit(repo, "base");
-      set(repo, REFS_EXTERNAL_IDS, ZERO, tip);
+      set(repo, OTHER_PAGE, ZERO, tip);
     }
     CountDownLatch inCas = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
@@ -395,7 +520,13 @@ class AuthRefDirectoryTest {
             && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(20)) {
           Thread.sleep(5);
         }
-        assertEquals(2, publisher.queuedForTesting());
+        var queued = publisher.queuedRequestsForTesting();
+        assertEquals(2, queued.size());
+        var seed = queued.getFirst().authSeed;
+        assertNotNull(seed);
+        assertEquals(tip.name(), seed.tips().get(2001).getObjectId());
+        assertSame(seed, queued.getLast().authSeed);
+        assertEquals(1, writes.count("PUT-if-absent auth-page"));
         release.countDown();
         a.get(30, TimeUnit.SECONDS);
         b.get(30, TimeUnit.SECONDS);
@@ -405,7 +536,7 @@ class AuthRefDirectoryTest {
       first.get(30, TimeUnit.SECONDS);
     }
     assertEquals(2, held.matchedCasAttempts.get());
-    assertEquals(1, writes.count("PUT-if-absent auth-page"));
+    assertEquals(2, writes.count("PUT-if-absent auth-page"));
     try (Repository reader = node("peer", bucket).openRepository(USERS)) {
       assertEquals(tip, reader.exactRef(USER).getObjectId());
       assertEquals(tip, reader.exactRef(NEIGHBOR).getObjectId());
@@ -459,6 +590,11 @@ class AuthRefDirectoryTest {
   }
 
   private WalGitRepositoryManager node(String name, ObjectStore store, String allUsers) {
+    return node(name, store, allUsers, new DisabledMetricMaker());
+  }
+
+  private WalGitRepositoryManager node(
+      String name, ObjectStore store, String allUsers, MetricMaker metrics) {
     Config config = new Config();
     config.setString("gerrit", null, "allUsers", allUsers);
     config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
@@ -466,7 +602,9 @@ class AuthRefDirectoryTest {
     return new WalGitRepositoryManager(
         WalGitConfiguration.from(config, root.resolve(name)),
         new StorageLayout(
-            store, root.resolve(name + "-cache"), root.resolve(name + "-cursors"), ""));
+            store, root.resolve(name + "-cache"), root.resolve(name + "-cursors"), ""),
+        null,
+        metrics);
   }
 
   private static long tableRequests() {

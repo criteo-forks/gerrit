@@ -14,6 +14,7 @@
 
 package dev.walgerrit;
 
+import com.google.gerrit.common.Nullable;
 import dev.walgerrit.proto.StorageProto.ChangeKeyCheck;
 import dev.walgerrit.proto.StorageProto.ChangeKeyMutation;
 import dev.walgerrit.proto.StorageProto.Manifest;
@@ -43,7 +44,7 @@ import org.slf4j.LoggerFactory;
 /** Reftable storage makes each Gerrit batch ref update one immutable DFS file. */
 final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   private final LocalWalGitObjectDatabase objectDatabase;
-  private final boolean allUsers;
+  @Nullable private final AuthRefDirectory.Reader authRefs;
 
   /** The manifest revision the cached reftable stack was built from. */
   private volatile long stackRevision = -1;
@@ -52,10 +53,12 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   private final AtomicLong generation = new AtomicLong();
 
   LocalWalGitRefDatabase(
-      DfsRepository repository, LocalWalGitObjectDatabase objectDatabase, boolean allUsers) {
+      DfsRepository repository,
+      LocalWalGitObjectDatabase objectDatabase,
+      @Nullable AuthRefDirectory.Reader authRefs) {
     super(repository);
     this.objectDatabase = objectDatabase;
-    this.allUsers = allUsers;
+    this.authRefs = authRefs;
   }
 
   @Override
@@ -75,9 +78,8 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   @Override
   public Ref exactRef(String name) throws IOException {
     Manifest validated = revalidate();
-    return allUsers
-        ? AuthRefDirectory.exactRef(
-            validated, objectDatabase.manifestStore(), name, super::exactRef)
+    return authRefs != null
+        ? authRefs.exactRef(validated, objectDatabase.manifestStore(), name, super::exactRef)
         : super.exactRef(name);
   }
 
@@ -103,7 +105,12 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
     if (!tables.isEmpty()) {
       return null;
     }
-    return AuthRefDirectory.scan(base.getRefRevision(), new MergedReftable(stack.readers()));
+    return objectDatabase
+        .publisher()
+        .authSeed(
+            objectDatabase.repositoryName(),
+            base.getRefRevision(),
+            new MergedReftable(stack.readers()));
   }
 
   @Override
@@ -367,7 +374,7 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
     protected void applyUpdates(List<Ref> newRefs, List<ReceiveCommand> pending)
         throws IOException {
       objectDatabase.recordRefTransaction(pending, mutations, checks);
-      if (refDatabase.allUsers) {
+      if (refDatabase.authRefs != null) {
         objectDatabase.recordAuthRefs(newRefs, refDatabase.authSeed());
       }
       try {

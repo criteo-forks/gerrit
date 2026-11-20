@@ -16,6 +16,8 @@ package dev.walgerrit;
 
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.extensions.events.LifecycleListener;
+import com.google.gerrit.metrics.DisabledMetricMaker;
+import com.google.gerrit.metrics.MetricMaker;
 import com.google.gerrit.server.config.GerritRuntime;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.config.SitePath;
@@ -54,6 +56,7 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   private final Namespace namespace;
   private final Compactor compactor;
   private final GerritRuntime runtime;
+  private final AuthRefDirectory.Reader authRefs;
 
   /** Whether Gerrit prefers this node to execute writes to the named project. */
   private volatile Predicate<String> writeExecutor = project -> true;
@@ -93,24 +96,31 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
 
   @Inject
   WalGitRepositoryManager(
-      @GerritServerConfig Config serverConfig, @SitePath Path sitePath, GerritRuntime runtime) {
-    this(WalGitConfiguration.from(serverConfig, sitePath), null, runtime);
+      @GerritServerConfig Config serverConfig,
+      @SitePath Path sitePath,
+      GerritRuntime runtime,
+      MetricMaker metrics) {
+    this(WalGitConfiguration.from(serverConfig, sitePath), null, runtime, metrics);
     configureBlockCache(serverConfig);
   }
 
   WalGitRepositoryManager(WalGitConfiguration configuration) {
-    this(configuration, null, null);
+    this(configuration, null);
   }
 
   WalGitRepositoryManager(WalGitConfiguration configuration, StorageLayout storage) {
-    this(configuration, storage, null);
+    this(configuration, storage, null, new DisabledMetricMaker());
   }
 
-  private WalGitRepositoryManager(
-      WalGitConfiguration configuration, StorageLayout storage, GerritRuntime runtime) {
+  WalGitRepositoryManager(
+      WalGitConfiguration configuration,
+      StorageLayout storage,
+      GerritRuntime runtime,
+      MetricMaker metrics) {
     this.configuration = configuration;
     this.storage = storage == null ? storageFor(configuration) : storage;
     this.runtime = runtime;
+    this.authRefs = new AuthRefDirectory.Reader(metrics);
     this.catalog = new Catalog(this.storage, configuration.manifestRevalidateInterval());
     Clock clock = Clock.systemUTC();
     this.namespace =
@@ -374,7 +384,7 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
         storage.manifestStore(id),
         configuration.manifestRevalidateInterval(),
         writeEpoch,
-        configuration.allUsers().equals(name));
+        configuration.allUsers().equals(name) ? authRefs : null);
   }
 
   /** The name the catalog binds {@code id} to, for handles and logs; the id itself when none. */

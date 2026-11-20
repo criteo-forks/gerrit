@@ -37,9 +37,9 @@ import org.slf4j.LoggerFactory;
  * <p>A file must be old enough that its upload cannot still be awaiting publication, then remain
  * unreferenced for a further grace period observed by this reclaimer. File age alone does not
  * protect a reader of an old manifest: a years-old pack may have been superseded only a moment ago.
- * Observation state is node memory only; a restart waits again. A published pack is never re-added,
- * so an eligible absent file cannot become live again. Upload-to-publication latency and reader
- * lifetime must each be shorter than the configured grace period. Log objects are never touched.
+ * Observations are node-local and reset on restart. Retired packs and account pages are never
+ * re-added. Upload-to-publication latency and reader lifetime must each be shorter than the
+ * configured grace period. Transaction log entries remain in the store.
  *
  * <p>The local cache is only a cache: files the manifest no longer lists are removed at once, and
  * when a size limit is configured the oldest cached files are dropped first, to be fetched again on
@@ -153,8 +153,9 @@ final class Reclaimer {
       Map<String, Candidate> observed =
           candidates.computeIfAbsent(id, ignored -> new HashMap<>());
       Set<String> eligible = new HashSet<>();
-      for (ObjectStore.ObjectSummary object : store.listWalObjects()) {
-        if (live.contains(object.key()) || object.lastModifiedEpochMillis() > cutoff) {
+      Set<String> liveKeys = ManifestStore.liveObjectKeys(manifest, live);
+      for (ObjectStore.ObjectSummary object : store.listReclaimableObjects()) {
+        if (liveKeys.contains(object.key()) || object.lastModifiedEpochMillis() > cutoff) {
           observed.remove(object.key());
           continue;
         }
@@ -169,7 +170,7 @@ final class Reclaimer {
         if (candidate.observedAt() > cutoff) {
           continue;
         }
-        store.deleteWalObject(object.key());
+        store.deleteReclaimableObject(object.key());
         observed.remove(object.key());
         deleted++;
       }

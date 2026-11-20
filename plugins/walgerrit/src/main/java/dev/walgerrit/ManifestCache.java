@@ -21,6 +21,7 @@ import dev.walgerrit.proto.StorageProto.ChangeKeyPage;
 import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.LogPosition;
 import dev.walgerrit.proto.StorageProto.Manifest;
+import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -55,6 +56,9 @@ final class ManifestCache {
           .maximumWeight(16L << 20)
           .weigher((String pointer, AccountRefPage page) -> 128 + page.getSerializedSize())
           .build();
+
+  final Cache<String, Boolean> accountPageWarnings =
+      CacheBuilder.newBuilder().maximumSize(1024).expireAfterWrite(Duration.ofMinutes(1)).build();
 
   record Entry(String repo, long sequence, String transactionId) {}
 

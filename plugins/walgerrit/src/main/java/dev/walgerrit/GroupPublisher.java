@@ -18,6 +18,7 @@ import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.PackRef;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -31,6 +32,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import org.eclipse.jgit.internal.storage.reftable.MergedReftable;
 
 /**
  * This node's publication pipeline for one repository, shared by every handle on the node.
@@ -134,6 +136,9 @@ final class GroupPublisher {
   }
 
   private final ReentrantLock nodeLock = new ReentrantLock();
+
+  // Guarded by nodeLock. Pending requests hold the seed strongly through publication.
+  private WeakReference<AuthRefDirectory.Seed> authSeed = new WeakReference<>(null);
   private final ReentrantLock state = new ReentrantLock();
   private final Condition changed = state.newCondition();
   private final Deque<Request> queue = new ArrayDeque<>();
@@ -161,6 +166,7 @@ final class GroupPublisher {
   private static final class Attempt {
     final long sequence;
     final String transactionId;
+    final AuthRefDirectory.Bootstrap bootstrap;
 
     /** Null until proved, then never changed. Guarded by this. */
     private Boolean landed;
@@ -168,15 +174,19 @@ final class GroupPublisher {
     /** A reader's walk in progress. Guarded by this. */
     private CompletableFuture<Boolean> lookup;
 
-    Attempt(long sequence, String transactionId) {
+    Attempt(long sequence, String transactionId, AuthRefDirectory.Bootstrap bootstrap) {
       this.sequence = sequence;
       this.transactionId = transactionId;
+      this.bootstrap = bootstrap;
     }
 
     /** Records an outcome the store proved. */
     synchronized void settle(boolean outcome) {
       if (landed == null) {
         landed = outcome;
+        if (outcome && bootstrap != null) {
+          bootstrap.log();
+        }
       }
     }
 
@@ -212,9 +222,7 @@ final class GroupPublisher {
         throw failure;
       }
       synchronized (this) {
-        if (landed == null) {
-          landed = outcome;
-        }
+        settle(outcome);
         outcome = landed;
         lookup = null;
       }
@@ -254,6 +262,17 @@ final class GroupPublisher {
   private boolean publishing;
   private long epoch;
   private long knownRefRevision = -1;
+
+  /** Called under the node lock with a stack validated at refRevision. */
+  AuthRefDirectory.Seed authSeed(String repository, long refRevision, MergedReftable table)
+      throws IOException {
+    AuthRefDirectory.Seed seed = authSeed.get();
+    if (seed == null || seed.refRevision() != refRevision) {
+      seed = AuthRefDirectory.scan(repository, refRevision, table);
+      authSeed = new WeakReference<>(seed);
+    }
+    return seed;
+  }
 
   /** Serializes this node's ref transactions on the repository while they validate and write. */
   ReentrantLock nodeLock() {
@@ -397,9 +416,13 @@ final class GroupPublisher {
 
   /** Requests waiting for a publisher; lets tests wait for a transaction to queue. */
   int queuedForTesting() {
+    return queuedRequestsForTesting().size();
+  }
+
+  List<Request> queuedRequestsForTesting() {
     state.lock();
     try {
-      return queue.size();
+      return List.copyOf(queue);
     } finally {
       state.unlock();
     }
@@ -653,8 +676,9 @@ final class GroupPublisher {
     }
 
     @Override
-    public void attempting(long sequence, String transactionId) {
-      Attempt attempt = new Attempt(sequence, transactionId);
+    public void attempting(
+        long sequence, String transactionId, AuthRefDirectory.Bootstrap bootstrap) {
+      Attempt attempt = new Attempt(sequence, transactionId, bootstrap);
       state.lock();
       try {
         for (PackRef pack : carried) {

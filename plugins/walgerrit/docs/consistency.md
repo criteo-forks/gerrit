@@ -139,9 +139,15 @@ JGit's individual read operations still use their own in-memory structures.
 
 All-Users exact reads for account refs, default preferences and external IDs use the authentication
 ref directory when its `ref_revision` matches the manifest's. An absent entry or page pointer then
-certifies an absent ref. Missing or mismatched directories, unavailable referenced pages and
-symbolic refs fall back to JGit. Handles on a node share a 16 MiB cache keyed by immutable page
-pointer, with the limit measured by estimated weight.
+certifies an absent ref. Reads fall back to JGit for missing or mismatched coverage, symbolic refs,
+or pages that are unavailable, cannot be parsed or are empty. A writer needing an unavailable page
+publishes its update with coverage cleared. Handles on a node share a 16 MiB cache keyed by immutable
+page pointer, bounded by estimated weight.
+
+`walgerrit/auth_refs/lookups` counts All-Users exact ref lookups by `outcome` and `reason`: `hit`
+with `none`, or `fallback` with `uncovered`, `page_unavailable` or `unsupported`. A confirmed
+bootstrap logs the repository, ref revision, account count and elapsed milliseconds at INFO.
+Page-load warnings are rate-limited per page on each node.
 
 With `manifestRevalidateOnOpen = true` and the required store semantics, an open sees writes
 acknowledged before its revalidation. Setting it to `false` permits reuse of a node view validated

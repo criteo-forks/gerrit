@@ -6,6 +6,10 @@ package dev.walgerrit;
 import com.google.common.primitives.Ints;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.entities.RefNames;
+import com.google.gerrit.metrics.Counter2;
+import com.google.gerrit.metrics.Description;
+import com.google.gerrit.metrics.Field;
+import com.google.gerrit.metrics.MetricMaker;
 import dev.walgerrit.proto.StorageProto.AccountRefPage;
 import dev.walgerrit.proto.StorageProto.AuthRefTip;
 import dev.walgerrit.proto.StorageProto.AuthRefs;
@@ -14,16 +18,21 @@ import dev.walgerrit.proto.StorageProto.Manifest;
 import dev.walgerrit.proto.StorageProto.RefTransaction;
 import dev.walgerrit.proto.StorageProto.RefUpdate;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import org.eclipse.jgit.internal.storage.reftable.MergedReftable;
 import org.eclipse.jgit.internal.storage.reftable.RefCursor;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectIdRef;
 import org.eclipse.jgit.lib.Ref;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Exact direct refs used by All-Users authentication, at one manifest ref revision. */
 final class AuthRefDirectory {
+  private static final Logger logger = LoggerFactory.getLogger(AuthRefDirectory.class);
   private static final int OTHER = -1;
   private static final int EXTERNAL_IDS = -2;
   private static final int DEFAULT_PREFERENCES = -3;
@@ -73,54 +82,91 @@ final class AuthRefDirectory {
     Ref exactRef(String name) throws IOException;
   }
 
-  static Ref exactRef(Manifest manifest, ManifestStore store, String name, Lookup fallback)
-      throws IOException {
-    if (!complete(manifest)) {
+  static final class Reader {
+    private final Counter2<String, String> lookups;
+
+    Reader(MetricMaker metrics) {
+      lookups =
+          metrics.newCounter(
+              "walgerrit/auth_refs/lookups",
+              new Description("All-Users exact ref lookups by directory outcome").setCumulative(),
+              Field.ofString("outcome", (metadata, value) -> {})
+                  .description("hit or fallback")
+                  .build(),
+              Field.ofString("reason", (metadata, value) -> {})
+                  .description("none, uncovered, page_unavailable or unsupported")
+                  .build());
+    }
+
+    Ref exactRef(Manifest manifest, ManifestStore store, String name, Lookup fallback)
+        throws IOException {
+      int id = key(name);
+      if (id == OTHER) {
+        return fallback(name, fallback, "unsupported");
+      }
+      if (!complete(manifest)) {
+        return fallback(name, fallback, "uncovered");
+      }
+      AuthRefs directory = manifest.getAuthRefs();
+      AuthRefTip tip;
+      switch (id) {
+        case EXTERNAL_IDS -> tip = directory.hasExternalIds() ? directory.getExternalIds() : null;
+        case DEFAULT_PREFERENCES ->
+            tip = directory.hasDefaultPreferences() ? directory.getDefaultPreferences() : null;
+        default -> {
+          String pointer = directory.getPagesMap().get(pageNumber(id));
+          tip = null;
+          if (pointer != null) {
+            AccountRefPage page = store.accountPage(pointer);
+            if (page == null) {
+              return fallback(name, fallback, "page_unavailable");
+            }
+            tip = page.getTipsMap().get(id);
+          }
+        }
+      }
+      if (tip != null && tip.getObjectId().isEmpty()) {
+        return fallback(name, fallback, "unsupported");
+      }
+      lookups.increment("hit", "none");
+      if (tip == null) {
+        return null;
+      }
+      ObjectId oid = ObjectId.fromString(tip.getObjectId());
+      return tip.getPeeledObjectId().isEmpty()
+          ? new ObjectIdRef.PeeledNonTag(Ref.Storage.PACKED, name, oid, tip.getUpdateIndex())
+          : new ObjectIdRef.PeeledTag(
+              Ref.Storage.PACKED,
+              name,
+              oid,
+              ObjectId.fromString(tip.getPeeledObjectId()),
+              tip.getUpdateIndex());
+    }
+
+    private Ref fallback(String name, Lookup fallback, String reason) throws IOException {
+      lookups.increment("fallback", reason);
       return fallback.exactRef(name);
     }
-    AuthRefs directory = manifest.getAuthRefs();
-    AuthRefTip tip;
-    int id = key(name);
-    switch (id) {
-      case OTHER -> {
-        return fallback.exactRef(name);
-      }
-      case EXTERNAL_IDS -> tip = directory.hasExternalIds() ? directory.getExternalIds() : null;
-      case DEFAULT_PREFERENCES ->
-          tip = directory.hasDefaultPreferences() ? directory.getDefaultPreferences() : null;
-      default -> {
-        String pointer = directory.getPagesMap().get(pageNumber(id));
-        if (pointer == null) {
-          return null;
-        }
-        AccountRefPage page = store.accountPage(pointer);
-        if (page == null) {
-          return fallback.exactRef(name);
-        }
-        tip = page.getTipsMap().get(id);
-      }
-    }
-    if (tip == null) {
-      return null;
-    }
-    if (tip.getObjectId().isEmpty()) {
-      return fallback.exactRef(name);
-    }
-    ObjectId oid = ObjectId.fromString(tip.getObjectId());
-    return tip.getPeeledObjectId().isEmpty()
-        ? new ObjectIdRef.PeeledNonTag(Ref.Storage.PACKED, name, oid, tip.getUpdateIndex())
-        : new ObjectIdRef.PeeledTag(
-            Ref.Storage.PACKED,
-            name,
-            oid,
-            ObjectId.fromString(tip.getPeeledObjectId()),
-            tip.getUpdateIndex());
   }
 
-  record Seed(long refRevision, Map<Integer, AuthRefTip> tips) {}
+  record Seed(
+      String repository, long refRevision, long startedNanos, Map<Integer, AuthRefTip> tips) {}
+
+  record Bootstrap(String repository, long refRevision, int accounts, long startedNanos) {
+    void log() {
+      logger.info(
+          "Bootstrapped authentication ref directory for {} at ref revision {} with {} accounts in"
+              + " {} ms",
+          repository,
+          refRevision,
+          accounts,
+          TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos));
+    }
+  }
 
   /** Scan raw refs so even a dangling symbolic ref gets a fallback marker. */
-  static Seed scan(long refRevision, MergedReftable table) throws IOException {
+  static Seed scan(String repository, long refRevision, MergedReftable table) throws IOException {
+    long startedNanos = System.nanoTime();
     Map<Integer, AuthRefTip> tips = new HashMap<>();
     Ref external = table.exactRef(RefNames.REFS_EXTERNAL_IDS);
     if (external != null) {
@@ -135,7 +181,7 @@ final class AuthRefDirectory {
         }
       }
     }
-    return new Seed(refRevision, tips);
+    return new Seed(repository, refRevision, startedNanos, Collections.unmodifiableMap(tips));
   }
 
   private static AuthRefTip tip(Ref ref) {
@@ -152,7 +198,8 @@ final class AuthRefDirectory {
     return tip.build();
   }
 
-  static void publish(
+  /** Returns the bootstrap to report if this manifest wins its CAS. */
+  static Bootstrap publish(
       ManifestStore store,
       Manifest base,
       Seed seed,
@@ -165,11 +212,12 @@ final class AuthRefDirectory {
       if (kind == LogEntry.Kind.COMPACT && complete(base)) {
         next.setAuthRefs(base.getAuthRefs().toBuilder().setRefRevision(next.getRefRevision()));
       }
-      return;
+      return null;
     }
 
     AuthRefDirectory editor;
-    if (complete(base)) {
+    boolean bootstrap = !complete(base);
+    if (!bootstrap) {
       editor = new AuthRefDirectory(store, base.getAuthRefs());
     } else if (seed != null && seed.refRevision == base.getRefRevision()) {
       editor = new AuthRefDirectory(store, AuthRefs.getDefaultInstance());
@@ -177,7 +225,7 @@ final class AuthRefDirectory {
         editor.set(entry.getKey(), entry.getValue());
       }
     } else {
-      return;
+      return null;
     }
     for (RefUpdate update : transaction.getUpdatesList()) {
       int id = key(update.getName());
@@ -189,7 +237,7 @@ final class AuthRefDirectory {
         tip = AuthRefTip.getDefaultInstance();
       } else if (!ObjectId.zeroId().name().equals(update.getNewObjectId())) {
         if (!update.hasAuthUpdateIndex()) {
-          return;
+          return null;
         }
         tip =
             AuthRefTip.newBuilder()
@@ -199,7 +247,7 @@ final class AuthRefDirectory {
                 .build();
       }
       if (!editor.set(id, tip)) {
-        return;
+        return null;
       }
     }
     for (var entry : editor.dirty.entrySet()) {
@@ -211,9 +259,15 @@ final class AuthRefDirectory {
       }
     }
     next.setAuthRefs(editor.directory.setRefRevision(next.getRefRevision()));
+    if (!bootstrap) {
+      return null;
+    }
+    int accounts =
+        editor.dirty.values().stream().mapToInt(AccountRefPage.Builder::getTipsCount).sum();
+    return new Bootstrap(seed.repository(), next.getRefRevision(), accounts, seed.startedNanos());
   }
 
-  private boolean set(int id, AuthRefTip tip) throws IOException {
+  private boolean set(int id, AuthRefTip tip) {
     if (id == EXTERNAL_IDS) {
       if (tip == null) {
         directory.clearExternalIds();

@@ -59,10 +59,11 @@ It points to immutable pages for canonical numeric account refs, each covering 2
 account IDs. Direct tips include the JGit update index and any peeled tag target. Symbolic refs
 fall back to JGit.
 
-An All-Users ref transaction seeds missing coverage from a merged reftable snapshot. The manifest
-CAS checks the snapshot's ref revision and publishes the accepted group's updates and changed page
-pointers together. Draft and star updates reuse all pages; compaction carries the directory to the
-new ref revision. Pages are retained with the log, including those from losing CAS attempts.
+Pending All-Users ref transactions on a node share one bootstrap scan of the merged reftables per
+ref revision. The manifest CAS checks that revision and publishes the group's updates and changed
+page pointers together. Draft and star updates reuse all pages; compaction carries the directory
+to the new ref revision. Unreferenced account pages, including uploads from losing CAS attempts,
+have the same upload and retirement grace periods as pack files.
 
 ## Branch and Change-Id directory
 
@@ -90,7 +91,7 @@ page, and loading a cold page reads its containing log entry.
 Each entry names its sequence, unique transaction ID and predecessor's transaction ID. Starting
 from the manifest head, a reader derives each predecessor key without listing the log prefix.
 Only entries reachable through that chain belong to committed history. Losing CAS attempts can
-leave unreferenced log objects.
+leave unreferenced transaction log entries.
 
 | Kind | Contents |
 | --- | --- |
@@ -105,9 +106,8 @@ A logical ref update records the ref name, old and new object IDs, and a new sym
 applicable. Several independent local batches can share one entry; their logical updates are
 concatenated in publication order.
 
-Log objects are not reclaimed. This preserves the recorded transitions, but does not retain all
-historical pack contents: superseded files can be deleted after the reclamation grace checks.
-Log retention alone therefore does not provide point-in-time data recovery.
+Transaction log entries preserve transitions, but point-in-time recovery also requires retained
+data. Reclamation can delete superseded pack files and account pages.
 
 ## A cursor names its history as well as its position
 
@@ -136,8 +136,9 @@ or handle close publishes them. Ref transactions publish their reftables and pen
 together.
 
 Failure before the CAS can leave files or log entries behind without exposing partial ref
-updates. The [reclaimer](compaction.md#reclamation) removes eligible unreferenced `wal/` files;
-log objects remain. A lost CAS response requires [outcome recovery](consistency.md#ambiguous-outcomes-and-recovery).
+updates. The [reclaimer](compaction.md#reclamation) removes eligible unreferenced `wal/` files
+and account pages. Transaction log entries remain. A lost CAS response requires
+[outcome recovery](consistency.md#ambiguous-outcomes-and-recovery).
 
 ## Format boundaries
 
