@@ -39,14 +39,15 @@ final class LocalWalGitRepository extends DfsRepository {
       Project.NameKey name,
       ManifestStore manifestStore,
       Duration revalidateInterval,
-      long writeEpoch)
+      long writeEpoch,
+      boolean allUsers)
       throws IOException {
     super(
         new Builder()
             .setRepositoryDescription(new DfsRepositoryDescription(name.get())));
     objectDatabase =
         new LocalWalGitObjectDatabase(this, manifestStore, revalidateInterval, writeEpoch);
-    refDatabase = new LocalWalGitRefDatabase(this, objectDatabase);
+    refDatabase = new LocalWalGitRefDatabase(this, objectDatabase, allUsers);
   }
 
   @Override

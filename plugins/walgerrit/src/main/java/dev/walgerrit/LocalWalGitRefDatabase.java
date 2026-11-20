@@ -16,6 +16,7 @@ package dev.walgerrit;
 
 import dev.walgerrit.proto.StorageProto.ChangeKeyCheck;
 import dev.walgerrit.proto.StorageProto.ChangeKeyMutation;
+import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -28,6 +29,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableBatchRefUpdate;
 import org.eclipse.jgit.internal.storage.dfs.DfsReftableDatabase;
 import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
+import org.eclipse.jgit.internal.storage.reftable.MergedReftable;
 import org.eclipse.jgit.lib.BatchRefUpdate;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ProgressMonitor;
@@ -41,6 +43,8 @@ import org.slf4j.LoggerFactory;
 /** Reftable storage makes each Gerrit batch ref update one immutable DFS file. */
 final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   private final LocalWalGitObjectDatabase objectDatabase;
+  private final boolean allUsers;
+
   /** The manifest revision the cached reftable stack was built from. */
   private volatile long stackRevision = -1;
 
@@ -48,9 +52,10 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
   private final AtomicLong generation = new AtomicLong();
 
   LocalWalGitRefDatabase(
-      DfsRepository repository, LocalWalGitObjectDatabase objectDatabase) {
+      DfsRepository repository, LocalWalGitObjectDatabase objectDatabase, boolean allUsers) {
     super(repository);
     this.objectDatabase = objectDatabase;
+    this.allUsers = allUsers;
   }
 
   @Override
@@ -69,8 +74,36 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
 
   @Override
   public Ref exactRef(String name) throws IOException {
-    revalidate();
-    return super.exactRef(name);
+    Manifest validated = revalidate();
+    return allUsers
+        ? AuthRefDirectory.exactRef(
+            validated, objectDatabase.manifestStore(), name, super::exactRef)
+        : super.exactRef(name);
+  }
+
+  /** Called under the JGit ref lock, after expected-value checks and before the table write. */
+  private AuthRefDirectory.Seed authSeed() throws IOException {
+    Manifest base = objectDatabase.manifestStore().current();
+    if (AuthRefDirectory.complete(base)) {
+      return null;
+    }
+    var stack = stack();
+    Set<String> tables = new HashSet<>();
+    for (var pack : base.getPacksList()) {
+      if (ManifestStore.hasReftable(pack)) {
+        tables.add(pack.getName());
+      }
+    }
+    // The handle may have validated before this node adopted the CAS base.
+    for (var file : stack.files()) {
+      if (!tables.remove(LocalWalGitObjectDatabase.packName(file.getPackDescription()))) {
+        return null;
+      }
+    }
+    if (!tables.isEmpty()) {
+      return null;
+    }
+    return AuthRefDirectory.scan(base.getRefRevision(), new MergedReftable(stack.readers()));
   }
 
   @Override
@@ -117,11 +150,12 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
    * built from differs from the one the object database now mirrors, regardless of which read
    * path adopted the newer manifest first.
    */
-  private void revalidate() throws IOException {
-    objectDatabase.revalidateIfStale();
+  private Manifest revalidate() throws IOException {
+    Manifest validated = objectDatabase.revalidateIfStale();
     if (objectDatabase.observedManifestRevision() != stackRevision) {
       refresh();
     }
+    return validated;
   }
 
   @Override
@@ -334,6 +368,9 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
     protected void applyUpdates(List<Ref> newRefs, List<ReceiveCommand> pending)
         throws IOException {
       objectDatabase.recordRefTransaction(pending, mutations, checks);
+      if (refDatabase.allUsers) {
+        objectDatabase.recordAuthRefs(newRefs, refDatabase.authSeed());
+      }
       try {
         super.applyUpdates(newRefs, pending);
       } catch (IOException | RuntimeException exception) {

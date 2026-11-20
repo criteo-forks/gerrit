@@ -9,6 +9,7 @@ the committed inventory do not publish refs merely by existing in the store.
   manifests/<repository-id>/manifest.pb
   repos/<repository-id>/
     log/<sequence>-<transaction-id>.pb
+    log/auth-refs/<page-id>                 # All-Users account ref tips
     wal/<pack-id>.pack
     wal/<pack-id>.idx
     wal/<pack-id>.ref
@@ -50,6 +51,18 @@ conditional replacement.
 Manifests have a dedicated prefix. A paginated listing discovers repository ids and manifest
 versions without enumerating packs or logs. On S3, the listed version is the ETag. An unchanged
 version lets the index tailer skip an already indexed repository.
+
+## All-Users authentication refs
+
+`auth_refs`, when present, holds the tips of `refs/meta/external-ids` and `refs/users/default`.
+It points to immutable pages for canonical numeric account refs, each covering 256 consecutive
+account IDs. Direct tips include the JGit update index and any peeled tag target. Symbolic refs
+fall back to JGit.
+
+An All-Users ref transaction seeds missing coverage from a merged reftable snapshot. The manifest
+CAS checks the snapshot's ref revision and publishes the accepted group's updates and changed page
+pointers together. Draft and star updates reuse all pages; compaction carries the directory to the
+new ref revision. Pages are retained with the log, including those from losing CAS attempts.
 
 ## Branch and Change-Id directory
 

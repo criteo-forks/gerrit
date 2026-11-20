@@ -237,7 +237,7 @@ class GroupPublisherFailureTest {
 
   private static GroupPublisher.Request request(ManifestStore store, String name) {
     return new GroupPublisher.Request(
-        store, List.of(pack(name)), List.of(), null, -1, -1, ManifestStore.UNFENCED);
+        store, List.of(pack(name)), List.of(), null, null, -1, -1, ManifestStore.UNFENCED);
   }
 
   private static PackRef pack(String name) {

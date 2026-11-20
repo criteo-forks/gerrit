@@ -16,6 +16,7 @@ package dev.walgerrit;
 
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import dev.walgerrit.proto.StorageProto.AccountRefPage;
 import dev.walgerrit.proto.StorageProto.ChangeKeyPage;
 import dev.walgerrit.proto.StorageProto.LogEntry;
 import dev.walgerrit.proto.StorageProto.LogPosition;
@@ -47,6 +48,12 @@ final class ManifestCache {
       CacheBuilder.newBuilder()
           .maximumWeight(16L << 20)
           .weigher((Page key, ChangeKeyPage page) -> 128 + page.getSerializedSize())
+          .build();
+
+  final Cache<String, AccountRefPage> accountPages =
+      CacheBuilder.newBuilder()
+          .maximumWeight(16L << 20)
+          .weigher((String pointer, AccountRefPage page) -> 128 + page.getSerializedSize())
           .build();
 
   record Entry(String repo, long sequence, String transactionId) {}

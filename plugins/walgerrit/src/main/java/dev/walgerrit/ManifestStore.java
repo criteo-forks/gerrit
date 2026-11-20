@@ -17,6 +17,7 @@ package dev.walgerrit;
 import com.google.gerrit.common.Nullable;
 import dev.walgerrit.ManifestCache.VersionedManifest;
 import dev.walgerrit.ObjectStore.ConditionalRead;
+import dev.walgerrit.proto.StorageProto.AccountRefPage;
 import dev.walgerrit.proto.StorageProto.ChangeKeyPage;
 import dev.walgerrit.proto.StorageProto.IndexUpdate;
 import dev.walgerrit.proto.StorageProto.LogEntry;
@@ -77,6 +78,7 @@ final class ManifestStore {
   static final long UNFENCED = -1;
   private static final String OBJECT_FORMAT = "sha1";
   private static final String LOG_DIRECTORY = "log";
+  private static final String ACCOUNT_PAGES = LOG_DIRECTORY + "/auth-refs/";
   private static final String STAGING_DIRECTORY = "staging";
   private static final String WAL_DIRECTORY = "wal";
 
@@ -402,12 +404,36 @@ final class ManifestStore {
     return page;
   }
 
+  @Nullable
+  AccountRefPage accountPage(String pointer) throws IOException {
+    String cachePage = cacheKey + "/" + pointer;
+    AccountRefPage page = cache.accountPages.getIfPresent(cachePage);
+    if (page == null) {
+      String key = ACCOUNT_PAGES + pointer;
+      var stored = objectStore.get(key);
+      if (stored.isEmpty()) {
+        return null;
+      }
+      page = AccountRefPage.parseFrom(stored.get().bytes());
+      cache.accountPages.put(cachePage, page);
+    }
+    return page;
+  }
+
+  String writeAccountPage(AccountRefPage page) throws IOException {
+    String pointer = UUID.randomUUID().toString();
+    objectStore.putIfAbsent(ACCOUNT_PAGES + pointer, page.toByteArray());
+    cache.accountPages.put(cacheKey + "/" + pointer, page);
+    return pointer;
+  }
+
   Manifest installChangeKeys(long refRevision, ChangeKeyDirectory seed) throws IOException {
     return publish(
         refRevision,
         List.of(),
         List.of(),
         true,
+        null,
         null,
         List.of(),
         null,
@@ -456,6 +482,7 @@ final class ManifestStore {
         supersedes,
         requireExactRefRevision,
         null,
+        null,
         UNFENCED,
         Attempts.UNOBSERVED);
   }
@@ -472,6 +499,7 @@ final class ManifestStore {
       Collection<String> supersedes,
       boolean requireExactRefRevision,
       RefTransaction refTransaction,
+      @Nullable AuthRefDirectory.Seed authSeed,
       long expectedWriteEpoch,
       Attempts attempts)
       throws IOException {
@@ -481,6 +509,7 @@ final class ManifestStore {
         supersedes,
         requireExactRefRevision,
         refTransaction,
+        authSeed,
         List.of(),
         null,
         false,
@@ -510,6 +539,7 @@ final class ManifestStore {
         List.of(),
         List.of(),
         false,
+        null,
         null,
         List.of(),
         null,
@@ -544,6 +574,7 @@ final class ManifestStore {
         List.of(),
         false,
         null,
+        null,
         eventJson,
         indexUpdate,
         false,
@@ -559,6 +590,7 @@ final class ManifestStore {
       Collection<String> supersedes,
       boolean requireExactRefRevision,
       RefTransaction refTransaction,
+      @Nullable AuthRefDirectory.Seed authSeed,
       List<String> eventJson,
       @Nullable IndexUpdate indexUpdate,
       boolean recoveryFence,
@@ -695,6 +727,9 @@ final class ManifestStore {
           next.clearChangeKeys();
         }
       }
+      if (changesRefs && (current.hasAuthRefs() || authSeed != null)) {
+        AuthRefDirectory.publish(this, current, authSeed, refTransaction, entry.getKind(), next);
+      }
       LogEntry written = entry.build();
       objectStore.putIfAbsent(logKey(sequence, transactionId), written.toByteArray());
       Manifest updated = next.build();
@@ -779,6 +814,7 @@ final class ManifestStore {
               List.of(),
               List.of(),
               false,
+              null,
               null,
               List.of(),
               null,

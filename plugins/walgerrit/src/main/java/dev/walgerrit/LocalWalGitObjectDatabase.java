@@ -32,6 +32,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
@@ -47,6 +48,7 @@ import org.eclipse.jgit.internal.storage.dfs.DfsRepository;
 import org.eclipse.jgit.internal.storage.dfs.ReadableChannel;
 import org.eclipse.jgit.internal.storage.pack.PackExt;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.ReceiveCommand;
 import org.slf4j.Logger;
@@ -168,6 +170,10 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     List<PackRef> additions = new ArrayList<>(descriptions.size());
     for (DfsPackDescription description : descriptions) {
       additions.add(toPackRef(description));
+      if (logicalRefUpdate && description.hasFileExt(PackExt.REFTABLE)) {
+        // JGit assigns the table's maximum index to this batch's refs, including on a top fold.
+        state.recordAuthUpdateIndex(description.getMaxUpdateIndex());
+      }
     }
     List<String> supersedes = new ArrayList<>();
     if (replacements != null) {
@@ -189,7 +195,8 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
             manifestStore,
             additions,
             supersedes,
-            logicalRefUpdate ? state.transaction : null,
+            logicalRefUpdate ? state.transaction.build() : null,
+            logicalRefUpdate ? state.authSeed : null,
             state == null ? -1 : state.observedRefRevision,
             state == null ? -1 : state.epoch,
             writeEpoch);
@@ -331,8 +338,7 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
    * and which epoch of this node's own publications it belongs to.
    */
   void beginRefTransaction() throws IOException {
-    adoptObservedManifest();
-    long refRevision = manifestStore.current().getRefRevision();
+    long refRevision = adoptObservedManifest().getRefRevision();
     refTransaction.set(new RefTransactionState(refRevision, publisher.observe(refRevision)));
   }
 
@@ -396,15 +402,25 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     if (state == null) {
       throw new IllegalStateException("Ref transaction recorded outside beginRefTransaction");
     }
-    state.transaction = transaction.build();
+    state.transaction = transaction;
+  }
+
+  void recordAuthRefs(List<Ref> newRefs, AuthRefDirectory.Seed seed) {
+    RefTransactionState state = refTransaction.get();
+    state.authSeed = seed;
+    for (Ref ref : newRefs) {
+      if (!ref.isSymbolic() && ref.getObjectId() != null && AuthRefDirectory.covers(ref.getName())) {
+        state.authUpdates.put(ref.getName(), ref);
+      }
+    }
   }
 
   /**
    * Adopts the newest manifest this node has observed, after a conditional read if the handle has
    * gone longer than the configured interval without one, or if a peer announced a manifest this
-   * node has not read yet. Returns whether the view changed.
+   * node has not read yet. Returns the manifest selected for this read.
    */
-  boolean revalidateIfStale() throws IOException {
+  Manifest revalidateIfStale() throws IOException {
     long now = System.nanoTime();
     boolean intervalElapsed =
         revalidateIntervalNanos > 0 && now - lastRevalidationNanos >= revalidateIntervalNanos;
@@ -415,13 +431,11 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     return adoptObservedManifest();
   }
 
-  /**
-   * Forces one conditional manifest read and adopts the result. Returns whether the view changed.
-   */
-  boolean revalidateNow() throws IOException {
+  /** Forces one conditional manifest read and adopts the result. */
+  void revalidateNow() throws IOException {
     manifestStore.refresh();
     lastRevalidationNanos = System.nanoTime();
-    return adoptObservedManifest();
+    adoptObservedManifest();
   }
 
   void invalidateCaches() {
@@ -457,10 +471,27 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
   private static final class RefTransactionState {
     final long observedRefRevision;
     final long epoch;
-    RefTransaction transaction;
+    RefTransaction.Builder transaction;
+    AuthRefDirectory.Seed authSeed;
+    final Map<String, Ref> authUpdates = new HashMap<>();
     boolean committed;
     boolean conflicted;
     boolean changeKeyConflict;
+
+    void recordAuthUpdateIndex(long updateIndex) {
+      if (authUpdates.isEmpty()) {
+        return;
+      }
+      for (var update : transaction.getUpdatesBuilderList()) {
+        Ref ref = authUpdates.get(update.getName());
+        if (ref != null) {
+          update.setAuthUpdateIndex(updateIndex);
+          if (ref.getPeeledObjectId() != null) {
+            update.setPeeledObjectId(ref.getPeeledObjectId().name());
+          }
+        }
+      }
+    }
 
     RefTransactionState(long observedRefRevision, long epoch) {
       this.observedRefRevision = observedRefRevision;
@@ -468,19 +499,18 @@ final class LocalWalGitObjectDatabase extends DfsObjDatabase {
     }
   }
 
-  private boolean adoptObservedManifest() throws IOException {
-    long latest = manifestStore.current().getRevision();
-    if (latest == observedManifestRevision) {
-      return false;
-    }
-    synchronized (this) {
-      if (latest == observedManifestRevision) {
-        return false;
+  private Manifest adoptObservedManifest() throws IOException {
+    Manifest latest = manifestStore.current();
+    if (latest.getRevision() != observedManifestRevision) {
+      synchronized (this) {
+        latest = manifestStore.current();
+        if (latest.getRevision() != observedManifestRevision) {
+          clearCache();
+          observedManifestRevision = latest.getRevision();
+        }
       }
-      clearCache();
-      observedManifestRevision = latest;
-      return true;
     }
+    return latest;
   }
 
   /**

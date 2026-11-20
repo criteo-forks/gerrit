@@ -64,6 +64,7 @@ final class GroupPublisher {
     final List<PackRef> additions;
     final List<String> supersedes;
     final RefTransaction refTransaction;
+    final AuthRefDirectory.Seed authSeed;
     final long observedRefRevision;
     final long epoch;
     /** The repository write epoch the handle was admitted under; fixed for the request's life. */
@@ -79,6 +80,7 @@ final class GroupPublisher {
         Collection<PackRef> additions,
         Collection<String> supersedes,
         RefTransaction refTransaction,
+        AuthRefDirectory.Seed authSeed,
         long observedRefRevision,
         long epoch,
         long writeEpoch) {
@@ -86,6 +88,7 @@ final class GroupPublisher {
       this.additions = List.copyOf(additions);
       this.supersedes = List.copyOf(supersedes);
       this.refTransaction = refTransaction;
+      this.authSeed = authSeed;
       this.observedRefRevision = observedRefRevision;
       this.epoch = epoch;
       this.writeEpoch = writeEpoch;
@@ -96,7 +99,7 @@ final class GroupPublisher {
      * no ref names yet, so no fence applies to it.
      */
     static Request flush(ManifestStore store) {
-      return new Request(store, List.of(), List.of(), null, -1, -1, ManifestStore.UNFENCED);
+      return new Request(store, List.of(), List.of(), null, null, -1, -1, ManifestStore.UNFENCED);
     }
 
     boolean isRefTransaction() {
@@ -511,6 +514,7 @@ final class GroupPublisher {
       List<String> supersedes = new ArrayList<>();
       RefTransaction.Builder transaction = RefTransaction.newBuilder();
       boolean refUpdate = false;
+      AuthRefDirectory.Seed authSeed = null;
       Set<String> pendingNames = new HashSet<>();
       for (PackRef pack : drained) {
         pendingNames.add(pack.getName());
@@ -520,7 +524,8 @@ final class GroupPublisher {
       if (supersedesPending) {
         // A compaction of packs no manifest lists yet (JGit's compactor run over a handle's own
         // flushes): list them first, so an entry only ever supersedes what was live.
-        publishCarrying(store, 0, drained, List.of(), false, null, ManifestStore.UNFENCED, drained);
+        publishCarrying(
+            store, 0, drained, List.of(), false, null, null, ManifestStore.UNFENCED, drained);
         settle(drained, true);
         drained = List.of();
         additions.clear();
@@ -551,6 +556,9 @@ final class GroupPublisher {
         supersedes.addAll(member.supersedes);
         if (member.isRefTransaction()) {
           refUpdate = true;
+          if (member.authSeed != null && member.authSeed.refRevision() == expectedRefRevision) {
+            authSeed = member.authSeed;
+          }
           transaction.addAllUpdates(member.refTransaction.getUpdatesList());
           transaction.addAllChangeKeyChecks(member.refTransaction.getChangeKeyChecksList());
           // Which updates were one transaction is what tells a submit's branch update from the
@@ -579,6 +587,7 @@ final class GroupPublisher {
               supersedes,
               refUpdate,
               refUpdate ? transaction.build() : null,
+              authSeed,
               writeEpoch,
               drained);
       settle(drained, true);
@@ -610,6 +619,7 @@ final class GroupPublisher {
       Collection<String> supersedes,
       boolean refUpdate,
       RefTransaction transaction,
+      AuthRefDirectory.Seed authSeed,
       long expectedWriteEpoch,
       List<PackRef> carried)
       throws IOException {
@@ -621,6 +631,7 @@ final class GroupPublisher {
           supersedes,
           refUpdate,
           transaction,
+          authSeed,
           expectedWriteEpoch,
           attempts);
     } catch (AmbiguousPublicationException unknown) {

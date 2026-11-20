@@ -385,6 +385,8 @@ class ManifestReadCountTest {
       String normalized = key.substring(key.lastIndexOf('/') + 1);
       if (key.startsWith("manifests/" + RepositoryId.CATALOG + "/")) {
         normalized = "catalog/" + normalized;
+      } else if (key.contains("/log/auth-refs/")) {
+        normalized = "auth-page";
       } else if (key.contains("/log/")) {
         normalized = "log/*";
       } else if (key.contains("/wal/")) {

@@ -39,6 +39,26 @@ message Manifest {
   // Complete only at this exact ref_revision. A writer predating this field
   // cannot silently keep the directory current after it changes refs.
   ChangeKeys change_keys = 16;
+  AuthRefs auth_refs = 17;
+}
+
+// Complete at exactly ref_revision. Missing tips and pages then certify absence.
+message AuthRefs {
+  uint64 ref_revision = 1;
+  AuthRefTip external_ids = 2;
+  AuthRefTip default_preferences = 3;
+  map<uint32, string> pages = 4;
+}
+
+// An empty tip delegates symbolic resolution to the reftable.
+message AuthRefTip {
+  string object_id = 1;
+  uint64 update_index = 2;
+  string peeled_object_id = 3;
+}
+
+message AccountRefPage {
+  map<uint32, AuthRefTip> tips = 1;
 }
 
 // Each pointer identifies an immutable page in the committed WAL. An absent
@@ -149,6 +169,9 @@ message RefUpdate {
   string new_symbolic_target = 4;
   // Present on a classified change meta update, empty when membership is unchanged.
   ChangeKeyMutation change_key = 5;
+  // The JGit table version and peel data for a covered direct ref.
+  optional uint64 auth_update_index = 6;
+  string peeled_object_id = 7;
 }
 
 message RefTransaction {

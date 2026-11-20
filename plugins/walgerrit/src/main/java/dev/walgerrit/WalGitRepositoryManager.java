@@ -370,7 +370,11 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   LocalWalGitRepository openById(RepositoryId id, Project.NameKey name, long writeEpoch)
       throws IOException {
     return new LocalWalGitRepository(
-        name, storage.manifestStore(id), configuration.manifestRevalidateInterval(), writeEpoch);
+        name,
+        storage.manifestStore(id),
+        configuration.manifestRevalidateInterval(),
+        writeEpoch,
+        configuration.allUsers().equals(name));
   }
 
   /** The name the catalog binds {@code id} to, for handles and logs; the id itself when none. */
@@ -388,10 +392,8 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
 
   private LocalWalGitRepository openInitialized(
       Project.NameKey name, RepositoryId id, long writeEpoch) throws IOException {
-    ManifestStore manifestStore = storage.manifestStore(id);
-    LocalWalGitRepository repository =
-        new LocalWalGitRepository(
-            name, manifestStore, configuration.manifestRevalidateInterval(), writeEpoch);
+    LocalWalGitRepository repository = openById(id, name, writeEpoch);
+    ManifestStore manifestStore = repository.manifestStore();
     if (!repository.exists()) {
       if (manifestStore.current().getRevision() != 0) {
         repository.close();
