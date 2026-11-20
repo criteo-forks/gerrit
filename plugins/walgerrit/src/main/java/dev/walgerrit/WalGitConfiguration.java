@@ -71,6 +71,8 @@ record WalGitConfiguration(
     String gossipSecret,
     boolean forwardWrites,
     boolean clusterPlacement,
+    Duration storeProbeInterval,
+    Duration storeProbeTimeout,
     Project.NameKey allProjects,
     Project.NameKey allUsers) {
   /**
@@ -160,6 +162,12 @@ record WalGitConfiguration(
 
   static final Duration DEFAULT_INDEX_MAX_SEARCH_AGE = Duration.ofSeconds(75);
 
+  /** Delay between store health checks on forwarding nodes. */
+  static final Duration DEFAULT_STORE_PROBE_INTERVAL = Duration.ofSeconds(2);
+
+  /** Read staleness limit and write-failure hold time; zero disables both checks. */
+  static final Duration DEFAULT_STORE_PROBE_TIMEOUT = Duration.ofSeconds(10);
+
   private static final String SECTION = "walgerrit";
 
   /** The local backend below the site's data directory, with every other setting at its default. */
@@ -210,6 +218,8 @@ record WalGitConfiguration(
         null,
         true,
         false,
+        DEFAULT_STORE_PROBE_INTERVAL,
+        DEFAULT_STORE_PROBE_TIMEOUT,
         Project.nameKey("All-Projects"),
         Project.nameKey("All-Users"));
   }
@@ -284,6 +294,8 @@ record WalGitConfiguration(
             blankToNull(config.getString(SECTION, null, "gossipSecret")),
             config.getBoolean(SECTION, null, "forwardWrites", true),
             "cluster".equalsIgnoreCase(config.getString(SECTION, null, "placement")),
+            duration(config, "storeProbeInterval", DEFAULT_STORE_PROBE_INTERVAL),
+            duration(config, "storeProbeTimeout", DEFAULT_STORE_PROBE_TIMEOUT),
             Project.nameKey(
                 Optional.ofNullable(config.getString("gerrit", null, "allProjects"))
                     .orElse("All-Projects")),
@@ -354,6 +366,8 @@ record WalGitConfiguration(
     require(cacheSizeLimit >= 0, "cacheSizeLimit must be zero or positive");
     require(gossipPort >= 1 && gossipPort <= 65535, "gossipPort must be between 1 and 65535");
     require(isPositive(gossipPeerRefreshInterval), "gossipPeerRefreshInterval must be positive");
+    require(isPositive(storeProbeInterval), "storeProbeInterval must be positive");
+    require(!storeProbeTimeout.isNegative(), "storeProbeTimeout must be zero or positive");
     for (String peer : gossipPeers) {
       try {
         GossipPeers.parse(peer, gossipPort);

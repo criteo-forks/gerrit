@@ -174,6 +174,8 @@ receive-pack, smart HTTP pushes and eligible REST writes use the same private HT
 | `placement` | `project` | `project` ranks the pods per project; `cluster` places every write on one pod. |
 | `forwardingJoinProbes` | `1` | Consecutive hellos a peer must answer before it is handed writes. |
 | `drainOnStop` | `0` | How long a stopping pod hands its writes to peers before it stops serving. |
+| `storeProbeInterval` | `2 sec` | Delay between store health reads. |
+| `storeProbeTimeout` | `10 sec` | Time without a successful read before a pod loses candidacy, and time write failures keep it out. Zero disables both checks. |
 
 Use a separate SSH host key per pod and set `sshd.enablePeerDaemon = false` for this deployment.
 See the routing rules, compatibility limits and failure outcomes in [Write forwarding](docs/forwarding.md).

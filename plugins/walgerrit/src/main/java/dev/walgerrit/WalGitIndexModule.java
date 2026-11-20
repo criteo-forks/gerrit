@@ -61,6 +61,10 @@ public final class WalGitIndexModule extends LifecycleModule {
       Key.get(
           new TypeLiteral<Supplier<Collection<String>>>() {}, Names.named("writeForwardingPeers"));
 
+  static final Key<Supplier<Optional<String>>> WRITE_FORWARDING_HEALTH =
+      Key.get(
+          new TypeLiteral<Supplier<Optional<String>>>() {}, Names.named("writeForwardingHealth"));
+
   static final Key<LongSupplier> SEARCH_FRESHNESS =
       Key.get(LongSupplier.class, Names.named("changeIndexSearchGeneration"));
   static final Key<LongSupplier> CANDIDATE_GENERATION =
@@ -91,6 +95,10 @@ public final class WalGitIndexModule extends LifecycleModule {
     OptionalBinder.newOptionalBinder(binder(), WRITE_FORWARDING_PEERS)
         .setBinding()
         .to(WritePeers.class);
+    OptionalBinder.newOptionalBinder(binder(), WRITE_FORWARDING_HEALTH)
+        .setBinding()
+        .to(StoreHealth.class);
+    listener().to(StoreHealth.class);
     bind(WriteRole.class).asEagerSingleton();
     // What this node does travels in the WAL to the other nodes' tailers: the events it fires and
     // the documents it reindexes with no ref update behind them.

@@ -23,6 +23,7 @@ import java.time.Clock;
 import java.util.List;
 import java.util.NavigableMap;
 import java.util.NavigableSet;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -46,6 +47,12 @@ final class StorageLayout {
   private static final String LEASES_DIRECTORY = "leases";
   private static final String CLUSTER_DIRECTORY = "cluster";
 
+  /** Prefix used by {@link ManifestStore#logKey}. */
+  private static final String LOG_ENTRIES = "log/";
+
+  /** Prefix of a repository's packs, indexes and reftables. */
+  private static final String PUBLISHED_FILES = "wal/";
+
   private final ObjectStore objectStore;
   private final Path cacheRepositoriesPath;
   private final Path indexCursorRepositoriesPath;
@@ -64,11 +71,17 @@ final class StorageLayout {
       new CopyOnWriteArrayList<>();
   private final List<PublicationObserver> publicationObservers = new CopyOnWriteArrayList<>();
 
-  /** Sees what this node publishes by kind and the ref transactions it has to run again. */
+  /** Observes publications, ref transaction conflicts and failed publication writes. */
   interface PublicationObserver {
     void published(RepositoryId id, LogEntry.Kind kind);
 
     void conflicted(RepositoryId id);
+
+    /**
+     * A publication write failed for a reason other than a lost race. {@link #published} may
+     * still follow if the publication has landed.
+     */
+    default void writeFailed(RepositoryId id, Exception failure) {}
   }
 
   StorageLayout(Path root) {
@@ -194,8 +207,9 @@ final class StorageLayout {
   ManifestStore manifestStore(RepositoryId id) {
     String manifestPrefix = manifestsPrefix + "/" + id.value();
     return new ManifestStore(
-        new PrefixedObjectStore(objectStore, repositoriesPrefix + "/" + id.value()),
-        new PrefixedObjectStore(objectStore, manifestPrefix),
+        new PublicationWrites(
+            new PrefixedObjectStore(objectStore, repositoriesPrefix + "/" + id.value()), id),
+        new PublicationWrites(new PrefixedObjectStore(objectStore, manifestPrefix), id),
         cacheRepositoriesPath.resolve(id.value()),
         indexCursorRepositoriesPath.resolve(id.value() + ".cursor"),
         id.value(),
@@ -254,5 +268,104 @@ final class StorageLayout {
 
   private static String under(String prefix, String directory) {
     return prefix.isEmpty() ? directory : prefix + "/" + directory;
+  }
+
+  private void writeFailed(RepositoryId id, Exception failure) {
+    for (PublicationObserver observer : publicationObservers) {
+      try {
+        observer.writeFailed(id, failure);
+      } catch (RuntimeException observerFailure) {
+        logger.warn("Publication observer failed for {}", id, observerFailure);
+      }
+    }
+  }
+
+  /**
+   * Reports failures for publication file uploads, log-entry puts and manifest writes. Existing
+   * log entries or manifests and failed CAS preconditions are races, not store failures.
+   */
+  private final class PublicationWrites implements ObjectStore {
+    private final ObjectStore delegate;
+    private final RepositoryId id;
+
+    PublicationWrites(ObjectStore delegate, RepositoryId id) {
+      this.delegate = delegate;
+      this.id = id;
+    }
+
+    @Override
+    public StoredObject putIfAbsent(String key, byte[] bytes) throws IOException {
+      if (!key.startsWith(LOG_ENTRIES) && !key.equals(ManifestStore.MANIFEST_FILE)) {
+        return delegate.putIfAbsent(key, bytes);
+      }
+      try {
+        return delegate.putIfAbsent(key, bytes);
+      } catch (ObjectAlreadyExistsException lostRace) {
+        throw lostRace;
+      } catch (IOException | RuntimeException failure) {
+        writeFailed(id, failure);
+        throw failure;
+      }
+    }
+
+    @Override
+    public StoredObject compareAndSwap(String key, String expectedVersion, byte[] bytes)
+        throws IOException {
+      if (!key.equals(ManifestStore.MANIFEST_FILE)) {
+        return delegate.compareAndSwap(key, expectedVersion, bytes);
+      }
+      try {
+        return delegate.compareAndSwap(key, expectedVersion, bytes);
+      } catch (ObjectStoreConflictException lostRace) {
+        throw lostRace;
+      } catch (IOException | RuntimeException failure) {
+        writeFailed(id, failure);
+        throw failure;
+      }
+    }
+
+    @Override
+    public Optional<StoredObject> get(String key) throws IOException {
+      return delegate.get(key);
+    }
+
+    @Override
+    public ConditionalRead getIfChanged(String key, String knownVersion) throws IOException {
+      return delegate.getIfChanged(key, knownVersion);
+    }
+
+    @Override
+    public void uploadIfAbsent(String key, Path source) throws IOException {
+      if (!key.startsWith(PUBLISHED_FILES)) {
+        delegate.uploadIfAbsent(key, source);
+        return;
+      }
+      try {
+        delegate.uploadIfAbsent(key, source);
+      } catch (IOException | RuntimeException failure) {
+        writeFailed(id, failure);
+        throw failure;
+      }
+    }
+
+    @Override
+    public void download(String key, Path target) throws IOException {
+      delegate.download(key, target);
+    }
+
+    @Override
+    public byte[] getRange(String key, long offset, int length) throws IOException {
+      return delegate.getRange(key, offset, length);
+    }
+
+    @Override
+    public void delete(String key) throws IOException {
+      delegate.delete(key);
+    }
+
+    @Override
+    public List<ObjectSummary> listWithVersions(String prefix) throws IOException {
+      return delegate.listWithVersions(prefix);
+    }
   }
 }

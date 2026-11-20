@@ -33,19 +33,29 @@ state its own version. The configured address and peer port determine the destin
 subsequent connections. Hellos carry no dialing instructions. The serving gate also covers the
 private listener.
 
-A member answers a hello only while it can execute writes. With `drainOnStop` set, a stopping
-daemon stops answering hellos, hands new eligible writes to its peers and keeps serving for that
-long before the HTTP listener closes. Peers drop it at their next probe. Give the pod a
-termination grace period that covers it.
+A member answers a hello only while it can execute writes:
 
-A stopping node also refuses the writes a peer still hands it, with the reason `unavailable`.
-The peer executes such a write itself and leaves the node alone until it answers a hello again.
+- **Store health.** A daemon reads the catalog manifest every `storeProbeInterval` and watches
+  pack, index and reftable uploads, log-entry puts, and manifest creation and compare-and-swap.
+  Lost races do not count as failures. When no read succeeds for `storeProbeTimeout`, or three
+  publication writes fail in a row, the node answers `503` to hellos and forwards eligible writes
+  to the best reachable peer even if the node ranks first. With no peer it executes them locally.
+  The write-failure condition clears when a publication lands or `storeProbeTimeout` passes
+  without another failure.
+  `walgerrit/store/reachable` reports the state. The node writes nothing to the store to test it.
+- **Stopping.** With `drainOnStop` set, a stopping daemon stops answering hellos, hands new
+  eligible writes to its peers and keeps serving for that long before the HTTP listener closes.
+  Peers drop it at their next probe. Give the pod a termination grace period that covers it.
+
+A node in either state refuses forwarded writes as `unavailable`. The peer executes them locally
+and excludes the node until it answers a hello. When no node reaches the store, a write crosses
+at most once and is tried where it arrived.
 
 A peer normally joins after `forwardingJoinProbes` consecutive hellos and stays while it answers.
-With a value above one, a starting node immediately admits answering peers and leaves eligible
-writes to them while they count its hellos, so both sides change executor at about the same time.
-Nodes starting together hand writes to each other during this interval. A flapping peer cannot
-join a settled node without the required streak.
+With a value above one, a node that starts or recovers its store immediately admits answering
+peers and leaves eligible writes to them while they count its hellos, so both sides change
+executor at about the same time. Nodes starting together hand writes to each other during this
+interval. A flapping peer cannot join a settled node without the required streak.
 
 All members use the same dedicated `forwardingSecret`. Gerrit uses its 32 bytes as an Ed25519
 key and wraps the public key in a self-signed certificate in memory. Both sides authenticate to
@@ -137,6 +147,8 @@ Otherwise, run it on one node or expect writes from every node.
 | `walgerrit.placement` | `project` | `project` or `cluster`; see [Placement](#placement). Any other value stops the daemon at start. |
 | `walgerrit.forwardingJoinProbes` | `1` | Consecutive hellos, one second apart, a peer must answer before this node hands it writes; see [Peer membership](#peer-membership). 1 to 3600. |
 | `walgerrit.drainOnStop` | `0` | How long a stopping daemon hands its writes to peers before its HTTP listener closes. Zero stops at once. |
+| `walgerrit.storeProbeInterval` | `2 sec` | Delay between store health reads. |
+| `walgerrit.storeProbeTimeout` | `10 sec` | Time without a successful store read after which the node stops being a candidate, and how long failed publication writes keep it out. Zero disables both checks. |
 | `sshd.enablePeerDaemon` | `false` with a forwarding key, otherwise `true` | Set to `false` in this deployment to disable SSH daemon-account login with host keys and `etc/peer_keys`. Normal user SSH keys still work. |
 
 Use the existing secure-config delivery mechanism. Permit peer TCP only between this deployment's
@@ -192,6 +204,7 @@ pod can lose its final reply.
 | `write_forwarding/cluster_executor` | | Whether this node is the executor under `cluster` placement. |
 | `walgerrit/publications` | `repository`: `all_users`, `all_projects`, `catalog`, `other`; `kind`; `executor`: `preferred`, `other` | Manifest publications by this node, and whether it was the preferred executor of the repository when it published. |
 | `walgerrit/ref_transaction_conflicts` | `repository`, `executor` | Ref transaction attempts that lost a conditional write to another publisher. |
+| `walgerrit/store/reachable` | | Whether the store health read is succeeding and publication writes are not failing. |
 
 | Outcome | Meaning |
 | --- | --- |
@@ -209,5 +222,5 @@ pod can lose its final reply.
 `executor="other"` publications are the writes that placement did not reach: ineligible
 requests, background writers, and writes made while the nodes disagreed about the executor.
 
-Peer-set changes, refused hand-overs and ambiguous HTTP failures appear in the daemon log.
-Supply a request ID or Gerrit trace ID for correlation across the hop.
+Peer-set changes, health changes, refused hand-overs and ambiguous HTTP failures appear in the
+daemon log. Supply a request ID or Gerrit trace ID for correlation across the hop.
