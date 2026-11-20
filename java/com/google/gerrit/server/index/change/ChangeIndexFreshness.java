@@ -65,6 +65,15 @@ public class ChangeIndexFreshness {
   public static final Key<LongSupplier> SEARCH_KEY =
       Key.get(LongSupplier.class, Names.named(SEARCH));
 
+  private static final String CANDIDATES = "changeIndexCandidateGeneration";
+
+  /**
+   * Index generation for storage-confirmed candidates, or a negative value during a rebuild or
+   * without complete coverage. When unbound, candidates require a fresh search index.
+   */
+  public static final Key<LongSupplier> CANDIDATES_KEY =
+      Key.get(LongSupplier.class, Names.named(CANDIDATES));
+
   /** Binds the storage-backed lookup and the index freshness checks used by write decisions. */
   public static class ChangeIndexFreshnessModule extends AbstractModule {
     @Override
@@ -72,6 +81,7 @@ public class ChangeIndexFreshness {
       // The server injector can see the storage hook installed in the database injector.
       bind(ChangeKeyLookup.StorageBackend.class).asEagerSingleton();
       OptionalBinder.newOptionalBinder(binder(), SEARCH_KEY).setDefault().toInstance(() -> 0L);
+      OptionalBinder.newOptionalBinder(binder(), CANDIDATES_KEY);
       OptionalBinder.newOptionalBinder(binder(), BARRIER_KEY)
           .setDefault()
           .toInstance(scope -> Optional.empty());
@@ -81,13 +91,16 @@ public class ChangeIndexFreshness {
   private final Function<Optional<String>, Optional<String>> barrier;
 
   private final LongSupplier searchGeneration;
+  private final LongSupplier candidateGeneration;
 
   @Inject
   ChangeIndexFreshness(
       @Named(BARRIER) Function<Optional<String>, Optional<String>> barrier,
-      @Named(SEARCH) LongSupplier searchGeneration) {
+      @Named(SEARCH) LongSupplier searchGeneration,
+      @Named(CANDIDATES) Optional<LongSupplier> candidateGeneration) {
     this.barrier = barrier;
     this.searchGeneration = searchGeneration;
+    this.candidateGeneration = candidateGeneration.orElse(searchGeneration);
   }
 
   /**
@@ -116,6 +129,26 @@ public class ChangeIndexFreshness {
       throw searchUnavailable();
     }
     return generation;
+  }
+
+  /**
+   * Refuses a lookup that takes a candidate from the index while the index is rebuilt or was
+   * never completely covered. The age of its coverage does not matter: the caller confirms the
+   * candidate in storage.
+   */
+  public long requireCandidates() {
+    long generation = candidateGeneration.getAsLong();
+    if (generation < 0) {
+      throw searchUnavailable();
+    }
+    return generation;
+  }
+
+  /** A candidate from a query crossing an index rebuild is discarded. */
+  public void checkCandidates(long generation) {
+    if (generation != candidateGeneration.getAsLong()) {
+      throw searchUnavailable();
+    }
   }
 
   /** A query crossing an index rebuild must discard results from its old generation. */

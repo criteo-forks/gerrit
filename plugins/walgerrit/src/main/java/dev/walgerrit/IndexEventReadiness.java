@@ -87,6 +87,11 @@ final class IndexEventReadiness {
     coveredFrom = null;
   }
 
+  /** Whether an inventory completed since coverage was last forgotten, at whatever age. */
+  boolean covered() {
+    return coveredFrom != null;
+  }
+
   boolean coveredWithin(Duration maxAge) {
     Long start = coveredFrom;
     return start != null && now() - start < TimeUnit.NANOSECONDS.convert(maxAge);

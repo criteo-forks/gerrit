@@ -63,6 +63,8 @@ public final class WalGitIndexModule extends LifecycleModule {
 
   static final Key<LongSupplier> SEARCH_FRESHNESS =
       Key.get(LongSupplier.class, Names.named("changeIndexSearchGeneration"));
+  static final Key<LongSupplier> CANDIDATE_GENERATION =
+      Key.get(LongSupplier.class, Names.named("changeIndexCandidateGeneration"));
 
   @Override
   protected void configure() {
@@ -79,6 +81,9 @@ public final class WalGitIndexModule extends LifecycleModule {
     OptionalBinder.newOptionalBinder(binder(), SEARCH_FRESHNESS)
         .setBinding()
         .to(IndexBarrier.class);
+    OptionalBinder.newOptionalBinder(binder(), CANDIDATE_GENERATION)
+        .setBinding()
+        .to(IndexCandidates.class);
     OptionalBinder.newOptionalBinder(binder(), SERVING_GATE).setBinding().to(StartupGate.class);
     OptionalBinder.newOptionalBinder(binder(), WRITE_FORWARDING_NODE)
         .setBinding()

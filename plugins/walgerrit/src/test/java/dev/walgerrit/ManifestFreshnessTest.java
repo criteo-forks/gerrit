@@ -17,14 +17,20 @@ package dev.walgerrit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gerrit.entities.Project;
 import dev.walgerrit.ManifestCache.VersionedManifest;
+import dev.walgerrit.proto.StorageProto.Manifest;
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
@@ -231,13 +237,167 @@ class ManifestFreshnessTest {
     }
   }
 
-  private WalGitRepositoryManager node(String name, String revalidateInterval) {
+  /**
+   * Stored refs reflect updates and deletions even when opens reuse cached catalog and repository
+   * views.
+   */
+  @Test
+  void aStoredRefIsReadFromTheStoreWhileOpensReuseTheNodesView() throws Exception {
+    WalGitRepositoryManager nodeA = node("node-a", "0");
+    WalGitRepositoryManager nodeB = node("node-b", "1 h", false);
+    Project.NameKey project = Project.nameKey("platform/stored-ref");
+    nodeA.createRepository(project).close();
+    ObjectId first;
+    ObjectId second;
+    try (Repository writer = nodeA.openRepository(project)) {
+      first = publishMain(writer, "first");
+      try (Repository reader = nodeB.openRepository(project)) {
+        assertEquals(first, reader.exactRef(MAIN).getObjectId());
+      }
+      second = WalGitRepositoryManagerTest.insertCommit(writer, "second");
+      RefUpdate update = writer.updateRef(MAIN);
+      update.setNewObjectId(second);
+      update.setForceUpdate(true);
+      assertEquals(RefUpdate.Result.FORCED, update.update());
+    }
+
+    try (Repository reader = nodeB.openRepository(project)) {
+      assertEquals(first, reader.exactRef(MAIN).getObjectId(), "an open reuses the node's view");
+    }
+    assertEquals(Optional.of(second), nodeB.storedRef(project, MAIN));
+    assertEquals(Optional.empty(), nodeB.storedRef(project, Constants.R_HEADS + "absent"));
+    assertEquals(
+        Optional.empty(), nodeB.storedRef(Project.nameKey("platform/unknown"), MAIN));
+
+    nodeA.namespace().delete(project, false);
+
+    assertEquals(Optional.empty(), nodeB.storedRef(project, MAIN), "the project was deleted");
+  }
+
+  /** Stored refs refresh during replay of this or another repository, even when opens do not. */
+  @Test
+  void aStoredRefIsReadFromTheStoreWhileTheThreadReplaysALogEntry() throws Exception {
+    WalGitRepositoryManager nodeA = node("node-a", "0");
+    Project.NameKey project = Project.nameKey("platform/stored-ref");
+    Project.NameKey replayed = Project.nameKey("platform/replayed");
+    nodeA.createRepository(project).close();
+    nodeA.createRepository(replayed).close();
+    try (Repository writer = nodeA.openRepository(project)) {
+      ObjectId tip = publishMain(writer, "first");
+      int nodes = 0;
+      for (Project.NameKey applying : new Project.NameKey[] {replayed, project}) {
+        WalGitRepositoryManager nodeB = node("node-b" + nodes++, "1 h", false);
+        try (Repository reader = nodeB.openRepository(project)) {
+          assertEquals(tip, reader.exactRef(MAIN).getObjectId());
+        }
+        ObjectId next = forceMain(writer, "while " + applying.get() + " replays");
+        try (EventReplay.Scope scope = nodeB.applyingReplay(nodeB.idOf(applying))) {
+          try (Repository reader = nodeB.openRepository(project)) {
+            assertEquals(tip, reader.exactRef(MAIN).getObjectId(), "an open reuses the view");
+          }
+          assertEquals(Optional.of(next), nodeB.storedRef(project, MAIN), applying.get());
+        }
+        tip = next;
+      }
+    }
+  }
+
+  /** A missing manifest fails both open and stored-ref lookup for an active project. */
+  @Test
+  void aStoredRefOfAnActiveProjectWithoutAManifestFailsAsAnOpenDoes() throws Exception {
+    WalGitRepositoryManager nodeA = node("node-a", "0");
+    WalGitRepositoryManager nodeB = node("node-b", "1 h", false);
+    Project.NameKey project = Project.nameKey("platform/no-manifest");
+    nodeA.createRepository(project).close();
+    try (Repository writer = nodeA.openRepository(project)) {
+      publishMain(writer, "first");
+    }
+    RepositoryId id = nodeA.idOf(project);
+    Files.delete(
+        root.resolve("shared-store/manifests")
+            .resolve(id.value())
+            .resolve(ManifestStore.MANIFEST_FILE));
+
+    IOException open = assertThrows(IOException.class, () -> nodeA.openRepository(project));
+    assertFalse(open instanceof RepositoryNotFoundException, open.toString());
+    IOException lookup = assertThrows(IOException.class, () -> nodeB.storedRef(project, MAIN));
+    assertFalse(lookup instanceof RepositoryNotFoundException, lookup.toString());
+  }
+
+  /**
+   * If the node reads a fenced manifest during the ref read, the lookup must not confirm the ref.
+   */
+  @Test
+  void aStoredRefReadAfterAFenceConfirmsNothing() throws Exception {
+    WalGitRepositoryManager nodeA = node("node-a", "0");
+    Project.NameKey project = Project.nameKey("platform/fenced-during-read");
+    nodeA.createRepository(project).close();
+    try (Repository writer = nodeA.openRepository(project)) {
+      publishMain(writer, "first");
+    }
+    RepositoryId id = nodeA.idOf(project);
+    ObjectStore shared = new FileObjectStore(root.resolve("shared-store"));
+    AtomicReference<Executable> beforeReftable = new AtomicReference<>();
+    ObjectStore hooked =
+        (ObjectStore)
+            Proxy.newProxyInstance(
+                ObjectStore.class.getClassLoader(),
+                new Class<?>[] {ObjectStore.class},
+                (proxy, method, args) -> {
+                  if (method.getName().equals("download")
+                      && ((String) args[0]).contains("/" + id.value() + "/")
+                      && ((String) args[0]).endsWith(".ref")) {
+                    Executable action = beforeReftable.getAndSet(null);
+                    if (action != null) {
+                      action.execute();
+                    }
+                  }
+                  try {
+                    return method.invoke(shared, args);
+                  } catch (InvocationTargetException failure) {
+                    throw failure.getCause();
+                  }
+                });
     Config config = new Config();
+    config.setString("walgerrit", null, "manifestRevalidateInterval", "0");
+    WalGitRepositoryManager reader =
+        new WalGitRepositoryManager(
+            WalGitConfiguration.from(config, root.resolve("reader")),
+            new StorageLayout(
+                hooked, root.resolve("reader-cache"), root.resolve("reader-cursors"), ""));
+    AtomicReference<Manifest> fenced = new AtomicReference<>();
+    beforeReftable.set(
+        () -> {
+          nodeA.namespace().delete(project, false);
+          fenced.set(reader.storage().manifestStore(id).refresh());
+        });
+
+    assertEquals(Optional.empty(), reader.storedRef(project, MAIN));
+    assertTrue(fenced.get().getDeleted(), "the fence landed while the ref was being read");
+  }
+
+  private WalGitRepositoryManager node(String name, String revalidateInterval) {
+    return node(name, revalidateInterval, true);
+  }
+
+  private WalGitRepositoryManager node(
+      String name, String revalidateInterval, boolean revalidateOnOpen) {
+    Config config = new Config();
+    config.setBoolean("walgerrit", null, "manifestRevalidateOnOpen", revalidateOnOpen);
     config.setString("walgerrit", null, "storagePath", root.resolve("shared-store").toString());
     config.setString(
         "walgerrit", null, "indexCursorPath", root.resolve(name + "-cursors").toString());
     config.setString("walgerrit", null, "manifestRevalidateInterval", revalidateInterval);
     return new WalGitRepositoryManager(WalGitConfiguration.from(config, root.resolve(name)));
+  }
+
+  private static ObjectId forceMain(Repository repository, String message) throws Exception {
+    ObjectId commit = WalGitRepositoryManagerTest.insertCommit(repository, message);
+    RefUpdate update = repository.updateRef(MAIN);
+    update.setNewObjectId(commit);
+    update.setForceUpdate(true);
+    assertEquals(RefUpdate.Result.FORCED, update.update());
+    return commit;
   }
 
   private static ObjectId publishMain(Repository repository, String message) throws Exception {

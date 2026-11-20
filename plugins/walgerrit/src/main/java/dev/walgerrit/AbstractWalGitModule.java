@@ -42,5 +42,8 @@ abstract class AbstractWalGitModule extends LifecycleModule {
                 Optional<BiFunction<String, String, List<Integer>>>>>() {})
         .annotatedWith(Names.named("reviewChangeKeyLookup"))
         .to(ReviewChangeKeys.class);
+    bind(new TypeLiteral<BiFunction<String, String, Optional<String>>>() {})
+        .annotatedWith(Names.named("authoritativeRef"))
+        .to(AuthoritativeRefs.class);
   }
 }

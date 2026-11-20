@@ -24,6 +24,7 @@ import com.google.gerrit.server.git.RepositoryExistsException;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import dev.walgerrit.Catalog.Binding;
+import dev.walgerrit.proto.StorageProto.Manifest;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -36,6 +37,8 @@ import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.internal.storage.dfs.DfsBlockCache;
 import org.eclipse.jgit.internal.storage.dfs.DfsBlockCacheConfig;
 import org.eclipse.jgit.lib.Config;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 
 /**
@@ -217,6 +220,34 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
       return reuse.repository;
     }
     return openInitialized(name, binding.id(), binding.epoch());
+  }
+
+  /**
+   * Reads the ref's object ID using the catalog and manifest from the store, even during replay or
+   * when {@code walgerrit.manifestRevalidateOnOpen} is false. Returns empty for a missing, deleted
+   * or fenced project or absent ref; an active project with no manifest fails.
+   */
+  Optional<ObjectId> storedRef(Project.NameKey name, String ref) throws IOException {
+    Binding binding = catalog.resolve(name, true).orElse(null);
+    if (binding == null || !binding.active()) {
+      return Optional.empty();
+    }
+    ManifestStore manifestStore = storage.manifestStore(binding.id());
+    if (!admits(manifestStore.refresh(), binding)) {
+      return Optional.empty();
+    }
+    Optional<ObjectId> stored;
+    try (Repository repository = openInitialized(name, binding.id(), binding.epoch())) {
+      stored = Optional.ofNullable(repository.exactRef(ref)).map(Ref::getObjectId);
+    }
+    // The handle reads the newest manifest this node holds, which can be newer than the one
+    // checked. Epochs only advance and a deletion is final, so the newest one decides.
+    return admits(manifestStore.current(), binding) ? stored : Optional.empty();
+  }
+
+  /** Whether no namespace operation fenced or deleted the repository since {@code binding}. */
+  private static boolean admits(Manifest manifest, Binding binding) {
+    return !manifest.getDeleted() && manifest.getWriteEpoch() == binding.epoch();
   }
 
   @Override

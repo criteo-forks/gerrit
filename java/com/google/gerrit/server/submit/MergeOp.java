@@ -77,6 +77,7 @@ import com.google.gerrit.server.IdentifiedUser;
 import com.google.gerrit.server.IdentifiedUser.ImpersonationPermissionMode;
 import com.google.gerrit.server.InternalUser;
 import com.google.gerrit.server.account.AccountCache;
+import com.google.gerrit.server.change.ChangeFinder;
 import com.google.gerrit.server.change.NotifyResolver;
 import com.google.gerrit.server.config.ConfigUtil;
 import com.google.gerrit.server.config.GerritServerConfig;
@@ -1491,7 +1492,8 @@ public class MergeOp implements AutoCloseable {
       commitStatus.put(commit);
 
       MergeValidators mergeValidators = mergeValidatorsFactory.create();
-      try {
+      // Let validators resolve the number without a fresh index when numbers are unique.
+      try (ChangeFinder.Hint known = ChangeFinder.knownProject(notes.getProjectName(), changeId)) {
         mergeValidators.validatePreMerge(
             or.repo, or.rw, commit, or.project, destBranch, ps.id(), caller);
       } catch (MergeValidationException mve) {

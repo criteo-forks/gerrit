@@ -20,8 +20,10 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
 import com.google.common.flogger.FluentLogger;
 import com.google.common.primitives.Ints;
+import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Change;
 import com.google.gerrit.entities.Project;
+import com.google.gerrit.entities.RefNames;
 import com.google.gerrit.exceptions.StorageException;
 import com.google.gerrit.extensions.restapi.Url;
 import com.google.gerrit.git.ObjectIds;
@@ -33,6 +35,7 @@ import com.google.gerrit.metrics.MetricMaker;
 import com.google.gerrit.server.cache.CacheModule;
 import com.google.gerrit.server.config.GerritImportedServerIdsProvider;
 import com.google.gerrit.server.index.change.ChangeIndexFreshness;
+import com.google.gerrit.server.index.change.ChangeIndexNotFreshException;
 import com.google.gerrit.server.logging.Metadata;
 import com.google.gerrit.server.notedb.ChangeNotes;
 import com.google.gerrit.server.project.NoSuchChangeException;
@@ -43,12 +46,16 @@ import com.google.inject.Module;
 import com.google.inject.Provider;
 import com.google.inject.Singleton;
 import com.google.inject.name.Named;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BiFunction;
 import org.eclipse.jgit.errors.RepositoryNotFoundException;
+import org.eclipse.jgit.lib.ObjectId;
 
 @Singleton
 public class ChangeFinder {
@@ -61,6 +68,8 @@ public class ChangeFinder {
       @Override
       protected void configure() {
         cache(CACHE_NAME, Change.Id.class, String.class).maximumWeight(1024);
+        // The server injector can see the storage hook installed in the database injector.
+        bind(StoredRefs.class);
       }
     };
   }
@@ -74,7 +83,48 @@ public class ChangeFinder {
     COMMIT_HASH
   }
 
+  /** A change whose project a caller on this thread knows; see {@link #knownProject}. */
+  private record Known(Project.NameKey project, Change.Id id) {}
+
+  private static final ThreadLocal<Known> KNOWN = new ThreadLocal<>();
+
+  /** Ends a {@link #knownProject} scope. */
+  public interface Hint extends AutoCloseable {
+    @Override
+    void close();
+  }
+
+  /**
+   * Until closed, this thread's lookups of {@code id} by number try {@code project} first. A
+   * confirmed hint needs no index or number cache. The hint grants no access; closing restores the
+   * previous one.
+   */
+  public static Hint knownProject(Project.NameKey project, Change.Id id) {
+    Known before = KNOWN.get();
+    KNOWN.set(new Known(project, id));
+    return () -> {
+      if (before == null) {
+        KNOWN.remove();
+      } else {
+        KNOWN.set(before);
+      }
+    };
+  }
+
+  /**
+   * A storage backend's read of a ref as storage holds it now, by project and ref name; empty when
+   * the project is inactive or lacks the ref. Bound where nodes share storage; absent where a local
+   * read is the answer.
+   */
+  static class StoredRefs {
+    @Inject(optional = true)
+    @Named("authoritativeRef")
+    @Nullable
+    private BiFunction<String, String, Optional<String>> reader;
+  }
+
   private final ChangeIndexFreshness freshness;
+  private final StoredRefs storedRefs;
   private final IndexConfig indexConfig;
   private final boolean hasImportedChanges;
   private final Cache<Change.Id, String> changeIdProjectCache;
@@ -85,6 +135,7 @@ public class ChangeFinder {
   @Inject
   ChangeFinder(
       ChangeIndexFreshness freshness,
+      StoredRefs storedRefs,
       IndexConfig indexConfig,
       GerritImportedServerIdsProvider gerritImportedServerIdsProvider,
       @Named(CACHE_NAME) Cache<Change.Id, String> changeIdProjectCache,
@@ -92,6 +143,7 @@ public class ChangeFinder {
       ChangeNotes.Factory changeNotesFactory,
       MetricMaker metricMaker) {
     this.freshness = freshness;
+    this.storedRefs = storedRefs;
     this.indexConfig = indexConfig;
     this.hasImportedChanges = gerritImportedServerIdsProvider.hasImportedServerIds();
     this.changeIdProjectCache = changeIdProjectCache;
@@ -193,10 +245,36 @@ public class ChangeFinder {
   }
 
   private List<ChangeNotes> fromProjectNumber(String project, int changeNumber) {
-    Change.Id cId = Change.id(changeNumber);
+    return read(Project.NameKey.parse(project), Change.id(changeNumber), null);
+  }
+
+  /** Reads a change from a candidate project as storage holds it now; empty if absent there. */
+  private List<ChangeNotes> confirmed(Project.NameKey project, Change.Id id) {
+    if (storedRefs.reader == null) {
+      return read(project, id, null);
+    }
+    Optional<String> meta;
     try {
-      return ImmutableList.of(
-          changeNotesFactory.createChecked(Project.NameKey.parse(project), cId));
+      meta = storedRefs.reader.apply(project.get(), RefNames.changeMetaRef(id));
+    } catch (UncheckedIOException failure) {
+      throw new StorageException(
+          String.format("Cannot read change %s of %s from storage", id, project),
+          failure.getCause());
+    }
+    if (meta.isEmpty()) {
+      return ImmutableList.of();
+    }
+    return read(project, id, ObjectId.fromString(meta.get()));
+  }
+
+  private List<ChangeNotes> read(Project.NameKey project, Change.Id cId, @Nullable ObjectId meta) {
+    try {
+      ChangeNotes notes = changeNotesFactory.createChecked(project, cId, meta);
+      if (!hasImportedChanges && changeIdProjectCache.getIfPresent(cId) == null) {
+        // Without imported changes a number names one change, just read from this project.
+        changeIdProjectCache.put(cId, Url.encode(notes.getProjectName().get()));
+      }
+      return ImmutableList.of(notes);
     } catch (NoSuchChangeException e) {
       return Collections.emptyList();
     } catch (StorageException e) {
@@ -224,22 +302,66 @@ public class ChangeFinder {
    */
   @Deprecated(since = "3.10", forRemoval = true)
   public List<ChangeNotes> find(Change.Id id) {
-    String project = changeIdProjectCache.getIfPresent(id);
-    if (project != null) {
-      return fromProjectNumber(project, id.get());
+    if (!hasImportedChanges) {
+      return findUnique(id);
     }
-
+    // Imported changes may share a number, so the cache cannot resolve it.
     // Use the index to search for changes, but don't return any stored fields,
     // to force rereading in case the index is stale.
     long generation = freshness.requireSearchFresh();
-    InternalChangeQuery query = queryProvider.get().noFields();
-    List<ChangeData> r = hasImportedChanges ? query.byChangeNumber(id) : query.byLegacyChangeId(id);
+    return asChangeNotes(queryProvider.get().noFields().byChangeNumber(id), generation);
+  }
 
-    List<ChangeNotes> notes = asChangeNotes(r, generation);
-    if (r.size() == 1) {
-      changeIdProjectCache.put(id, Url.encode(r.get(0).project().get()));
+  /**
+   * Without imported changes, a number names at most one change. A hinted, cached or indexed
+   * project must be confirmed in storage. Stale indexes may supply candidates outside a rebuild;
+   * without a confirmed candidate, a fresh index is required.
+   */
+  private List<ChangeNotes> findUnique(Change.Id id) {
+    Known known = KNOWN.get();
+    if (known != null && known.id().equals(id)) {
+      List<ChangeNotes> hinted = confirmed(known.project(), id);
+      if (!hinted.isEmpty()) {
+        return hinted;
+      }
     }
-    return notes;
+    String cached = changeIdProjectCache.getIfPresent(id);
+    if (cached != null) {
+      List<ChangeNotes> notes = confirmed(Project.NameKey.parse(cached), id);
+      if (!notes.isEmpty()) {
+        return notes;
+      }
+      changeIdProjectCache.invalidate(id);
+    }
+
+    long candidates = freshness.requireCandidates();
+    long generation = 0;
+    ChangeIndexNotFreshException stale = null;
+    try {
+      generation = freshness.requireSearchFresh();
+    } catch (ChangeIndexNotFreshException notFresh) {
+      stale = notFresh;
+    }
+    // No stored fields, to force rereading in case the index is stale.
+    List<ChangeData> r = queryProvider.get().noFields().byLegacyChangeId(id);
+    freshness.checkCandidates(candidates);
+    Set<Project.NameKey> projects = new LinkedHashSet<>();
+    for (ChangeData cd : r) {
+      projects.add(cd.project());
+    }
+    ImmutableList.Builder<ChangeNotes> notes = ImmutableList.builder();
+    for (Project.NameKey project : projects) {
+      notes.addAll(confirmed(project, id));
+    }
+    ImmutableList<ChangeNotes> found = notes.build();
+    if (!found.isEmpty()) {
+      return found;
+    }
+    if (stale != null) {
+      throw stale;
+    }
+    freshness.checkSearchResult(generation);
+    return ImmutableList.of();
   }
 
   private List<ChangeNotes> asChangeNotes(List<ChangeData> cds, long generation) {

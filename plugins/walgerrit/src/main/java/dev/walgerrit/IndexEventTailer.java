@@ -546,6 +546,21 @@ final class IndexEventTailer implements LifecycleListener {
     return generation;
   }
 
+  /**
+   * The generation under which the index may name candidates that storage confirms, whatever the
+   * inventory's age; -1 during a rebuild and before the first completed inventory after one.
+   */
+  long candidateGeneration() {
+    if (!tailing()) {
+      return 0;
+    }
+    long generation = rebuildsBegun.get();
+    if (indexesInDoubt() || !readiness.covered() || rebuildsBegun.get() != generation) {
+      return -1;
+    }
+    return generation;
+  }
+
   Duration indexBarrierTimeout() {
     return repositories.configuration().indexBarrierTimeout();
   }

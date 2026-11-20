@@ -40,6 +40,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.eclipse.jgit.lib.Config;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
@@ -324,6 +325,7 @@ class IndexEventTailerTest {
             },
             readiness);
     assertEquals(-1, tailer.searchGeneration());
+    assertEquals(-1, tailer.candidateGeneration(), "no inventory completed yet");
     TestStores.startCaughtUp(tailer);
     try {
       String counts = store.toString();
@@ -331,6 +333,8 @@ class IndexEventTailerTest {
       now.addAndGet(budget);
       assertEquals(
           -1, tailer.searchGeneration(), "the sweep thread need not run to expire its coverage");
+      assertTrue(
+          tailer.candidateGeneration() >= 0, "an aged inventory still names lookup candidates");
       assertEquals(counts, store.toString(), "search admission never calls the store");
 
       tailer.runBackgroundSweep();
@@ -355,6 +359,7 @@ class IndexEventTailerTest {
       tailer.stop();
     }
     assertEquals(-1, tailer.searchGeneration());
+    assertEquals(-1, tailer.candidateGeneration());
   }
 
   @Test
@@ -780,9 +785,12 @@ class IndexEventTailerTest {
     WalGitRepositoryManager nodeB = limitedManager(shared, "node-b");
     RecordingApplier applierB = new RecordingApplier();
     ObjectId[] concurrent = new ObjectId[1];
+    AtomicReference<IndexEventTailer> rebuilding = new AtomicReference<>();
+    long[] candidatesDuringRebuild = new long[1];
     FakeRebuilder rebuilder = new FakeRebuilder();
     rebuilder.duringRebuild =
         () -> {
+          candidatesDuringRebuild[0] = rebuilding.get().candidateGeneration();
           try {
             concurrent[0] = publishRef(nodeA, project, Constants.R_HEADS + "concurrent");
           } catch (Exception e) {
@@ -798,9 +806,14 @@ class IndexEventTailerTest {
             durableLuceneConfig(),
             readiness("during-node-b"),
             rebuilder);
+    rebuilding.set(tailerB);
     TestStores.startCaughtUp(tailerB);
     try {
       assertEquals(1, rebuilder.rebuilds.get());
+      assertEquals(-1, candidatesDuringRebuild[0], "a rebuilding index names no candidates");
+      assertEquals(-1, tailerB.candidateGeneration(), "nor before an inventory follows it");
+      tailerB.runBackgroundSweep();
+      assertEquals(1, tailerB.candidateGeneration());
       assertTrue(
           applierB.sawUpdate(Constants.R_HEADS + "concurrent", concurrent[0]),
           "the write that landed during the rebuild was replayed from the pre-rebuild seed");

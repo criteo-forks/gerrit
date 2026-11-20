@@ -172,6 +172,22 @@ pod. A project and numeric change number, such as `GET /changes/my-project~123/d
 still read NoteDb directly. Git ref reads and background index replay also remain available when
 their own dependencies are healthy.
 
+A change number alone, such as `GET /changes/123/detail`, is a point lookup: a number names one
+change. The pod takes a candidate project from its number cache or from its index document for that
+number, however old its coverage, and answers only after storage confirms it: the pod reads the
+catalog and the project's manifest from the store, whatever `manifestRevalidateOnOpen` says and
+also while it replays the log, and loads the change at the meta revision that manifest holds. A
+project that was deleted, or whose manifest a namespace operation fenced, confirms nothing. A store
+that cannot be read, or an active project whose manifest is missing, fails the request. The index
+names no candidate while it is being rebuilt or before the first inventory after a rebuild
+completes. A read that names the project fills the number cache. A number for which the pod has no
+confirmed candidate gets the 503 while the coverage age is over the limit, as for a change only
+another pod has seen, and is not found otherwise, even when the index holds a document for it.
+During a submit, a merge validator that looks the validated change up by its number finds it in the
+project the submit read it from, confirmed the same way. Visibility checks apply as for every
+lookup. On a server with `gerrit.importedServerId`, where numbers can repeat, a number alone
+depends on index coverage and the number cache is not used.
+
 The default age is 75 seconds. Compare
 `walgerrit/index_events/search_coverage_age_seconds` against that limit on each pod during normal
 peak traffic. It reads `-1` before coverage is established. The strict barrier for write
