@@ -42,7 +42,7 @@ work itself, but publication can queue or retry; bounded retries can still be ex
 ## Who compacts, and when
 
 After publication, a daemon evaluates the policy and queues due repositories on one maintenance
-thread. With `placement = cluster`, only the preferred executor queues compaction after
+thread. With the default `cluster` placement, only the preferred executor queues compaction after
 publication and during sweeps; see [Write forwarding](forwarding.md#background-writers).
 For each repository it:
 

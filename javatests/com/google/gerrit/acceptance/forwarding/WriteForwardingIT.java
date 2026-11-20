@@ -90,7 +90,7 @@ public class WriteForwardingIT extends AbstractDaemonTest {
 
   @ConfigSuite.Default
   public static Config peerConfig() throws IOException {
-    Config cfg = FakePeer.config();
+    Config cfg = FakePeer.projectConfig();
     cfg.setInt("httpd", null, "maxThreads", 12);
     try (ServerSocket free = new ServerSocket(0)) {
       cfg.setInt("walgerrit", null, "forwardingPort", free.getLocalPort());

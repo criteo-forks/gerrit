@@ -8,12 +8,12 @@ connectivity. Placement has no lease or election.
 
 ## Placement
 
-`walgerrit.placement` selects what the nodes are ranked by.
+`walgerrit.placement` sets what nodes are ranked by; unset or blank selects `cluster`.
 
 | Value | Executor | Eligible writes |
 | --- | --- | --- |
-| `project` (default) | One per project. | Pushes, and REST writes whose address names the project: `/projects/NAME` and `/changes/PROJECT~…`. |
-| `cluster` | One for every write. | Pushes, and REST writes to core views under `/changes/`, `/projects/`, `/accounts/` and `/groups/`, however they identify their target. |
+| `cluster` (default) | One for every write. | Pushes, and REST writes to core views under `/changes/`, `/projects/`, `/accounts/` and `/groups/`, however they identify their target. |
+| `project` | One per project. | Pushes, and REST writes whose address names the project: `/projects/NAME` and `/changes/PROJECT~…`. |
 
 Set the same value on every node. A destination applies its own placement to what it is handed
 and refuses what that placement keeps local; the entry node then executes the request itself.
@@ -144,7 +144,7 @@ Otherwise, run it on one node or expect writes from every node.
 | `walgerrit.forwardWrites` | `true` in the daemon | `false` disables handoff, probing and the private connector. |
 | `walgerrit.forwardingSecret` | unset | Base64 encoding of 32 cryptographically random bytes in `secure.config`. An absent or malformed key leaves writes local. |
 | `walgerrit.forwardingPort` | `9443` | Private TCP port. Configure the same port and HTTP context path on all nodes. |
-| `walgerrit.placement` | `project` | `project` or `cluster`; see [Placement](#placement). Any other value stops the daemon at start. |
+| `walgerrit.placement` | `cluster` | `cluster` or `project`, case-insensitive. Blank uses the default; invalid values stop startup. See [Placement](#placement). |
 | `walgerrit.forwardingJoinProbes` | `1` | Consecutive hellos, one second apart, a peer must answer before this node hands it writes; see [Peer membership](#peer-membership). 1 to 3600. |
 | `walgerrit.drainOnStop` | `0` | How long a stopping daemon hands its writes to peers before its HTTP listener closes. Zero stops at once. |
 | `walgerrit.storeProbeInterval` | `2 sec` | Delay between store health reads. |
@@ -158,7 +158,7 @@ change takes effect when a pod restarts. During a staggered change the two key g
 independently. A cluster with no reachable members continues to serve local writes.
 Peer discovery uses the configured gossip address sources even when UDP gossip is disabled.
 
-For one executor, set on every pod:
+For example, on every pod:
 
 ```
 [walgerrit]

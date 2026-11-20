@@ -171,7 +171,7 @@ receive-pack, smart HTTP pushes and eligible REST writes use the same private HT
 | `forwardWrites` | `true` | Enable forwarding when a membership key and a peer source are configured. |
 | `forwardingSecret` | unset | Dedicated cluster key in `secure.config`, Base64 encoding of 32 random bytes. |
 | `forwardingPort` | `9443` | Pod-to-pod HTTPS listener. |
-| `placement` | `project` | `project` ranks the pods per project; `cluster` places every write on one pod. |
+| `placement` | `cluster` | One preferred pod for all eligible writes; `project` selects one per project. |
 | `forwardingJoinProbes` | `1` | Consecutive hellos a peer must answer before it is handed writes. |
 | `drainOnStop` | `0` | How long a stopping pod hands its writes to peers before it stops serving. |
 | `storeProbeInterval` | `2 sec` | Delay between store health reads. |
@@ -248,8 +248,8 @@ BAZEL_TEST_FLAGS='--test_env=GERRIT_WALGERRIT_COMPACTION=aggressive' \
   plugins/walgerrit/scripts/acceptance-tests.sh
 ```
 
-`--test_env=GERRIT_WALGERRIT_PLACEMENT=cluster` runs every server with that
-`walgerrit.placement`.
+`--test_env=GERRIT_WALGERRIT_PLACEMENT=project` selects per-project placement for every
+WalGerrit test server.
 
 `@UseLocalDisk` tests retain their requested filesystem backend. Tests that assert on
 `InMemoryRepositoryManager` instrumentation need separate interpretation: these include
@@ -270,5 +270,5 @@ results for the revision being deployed.
 | Cross-node notifications | [Events in the WAL](docs/events.md) |
 | Forwarding events from a plugin | [Event log](docs/event-log.md) |
 | Peer wake-ups over UDP | [Gossip](docs/gossip.md) |
-| Preferred writer per project | [Write forwarding](docs/forwarding.md) |
+| Write placement | [Write forwarding](docs/forwarding.md) |
 | Shared login cookies | [Web sessions](docs/web-sessions.md) |

@@ -63,10 +63,10 @@ is weaker than the durable ref payload used for indexing. See [Events](events.md
 
 ## Maintenance uses the same publication rules
 
-Writing nodes queue geometric pack compaction and reftable merging. Per-repository leases reduce
-duplicate work; manifest CAS and live-input checks preserve concurrent writes. The sweep-lease
-holder reclaims unreferenced shared files after the retention checks. Each node manages its own
-S3 cache. Ordinary Gerrit GC is disabled. See [Compaction](compaction.md).
+By default, the preferred executor queues geometric pack compaction and reftable merging.
+Per-repository leases reduce duplicate work. Manifest CAS and live-input checks preserve concurrent
+writes. The sweep-lease holder reclaims unreferenced shared files after the retention checks.
+Each node manages its own S3 cache. Ordinary Gerrit GC is disabled. See [Compaction](compaction.md).
 
 ## The fork connects Gerrit to the backend
 

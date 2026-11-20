@@ -53,6 +53,23 @@ class WalGitConfigurationTest {
   }
 
   @Test
+  void placementDefaultsToCluster() {
+    Config config = new Config();
+    assertTrue(WalGitConfiguration.from(config, sitePath).clusterPlacement());
+    assertTrue(new WalGitConfiguration(BackendType.LOCAL, sitePath).clusterPlacement());
+    for (String value : List.of(" ", "cluster", " Cluster ")) {
+      config.setString("walgerrit", null, "placement", value);
+      assertTrue(WalGitConfiguration.from(config, sitePath).clusterPlacement(), value);
+    }
+    for (String value : List.of("project", " ProJect ")) {
+      config.setString("walgerrit", null, "placement", value);
+      assertFalse(WalGitConfiguration.from(config, sitePath).clusterPlacement(), value);
+    }
+    config.setString("walgerrit", null, "placement", "pod");
+    assertThrows(IllegalArgumentException.class, () -> WalGitConfiguration.from(config, sitePath));
+  }
+
+  @Test
   void configuresReplayLimitAndRebuildBehaviour() {
     Config config = new Config();
     config.setString("walgerrit", null, "indexReplayLimit", "500");

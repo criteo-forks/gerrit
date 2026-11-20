@@ -44,6 +44,8 @@ import org.junit.jupiter.api.io.TempDir;
 class WriteRoleTest {
   private static final Project.NameKey ALL_USERS = Project.nameKey("All-Users");
   private static final Project.NameKey PROJECT = Project.nameKey("platform/placed");
+  private static final Consumer<Config> PROJECT_PLACEMENT =
+      config -> config.setString("walgerrit", null, "placement", "project");
 
   @TempDir Path root;
 
@@ -90,9 +92,9 @@ class WriteRoleTest {
     FileObjectStore store = new FileObjectStore(root.resolve("store"));
     Counters writerCounts = new Counters();
     Counters readerCounts = new Counters();
-    WalGitRepositoryManager writer = node("writer", store, ignored -> {});
+    WalGitRepositoryManager writer = node("writer", store, PROJECT_PLACEMENT);
     new WriteRole(writer, project -> true, writerCounts);
-    WalGitRepositoryManager reader = node("reader", store, ignored -> {});
+    WalGitRepositoryManager reader = node("reader", store, PROJECT_PLACEMENT);
     // Gerrit prefers the other node for every project but one.
     new WriteRole(reader, project -> project.equals("reader/own"), readerCounts);
 
@@ -158,8 +160,7 @@ class WriteRoleTest {
   @Test
   void withOneExecutorForEveryWriteOnlyThatNodeCompacts() throws Exception {
     FileObjectStore store = new FileObjectStore(root.resolve("store"));
-    Consumer<Config> cluster = config -> config.setString("walgerrit", null, "placement", "cluster");
-    WalGitRepositoryManager reader = node("reader", store, cluster);
+    WalGitRepositoryManager reader = node("reader", store, ignored -> {});
     new WriteRole(reader, project -> false, new DisabledMetricMaker());
     reader.compactor().start();
     try {
@@ -174,7 +175,7 @@ class WriteRoleTest {
       assertFalse(reader.compactor().isQueued(PROJECT), "and so does its sweep");
       assertFalse(reader.compactor().policy().plan(manifest(reader)).isEmpty());
 
-      WalGitRepositoryManager writer = node("writer", store, cluster);
+      WalGitRepositoryManager writer = node("writer", store, ignored -> {});
       new WriteRole(writer, project -> true, new DisabledMetricMaker());
       writer.compactor().start();
       try {
@@ -190,7 +191,7 @@ class WriteRoleTest {
   @Test
   void withAnExecutorPerProjectEveryNodeCompactsWhatItWrites() throws Exception {
     FileObjectStore store = new FileObjectStore(root.resolve("store"));
-    WalGitRepositoryManager node = node("node", store, ignored -> {});
+    WalGitRepositoryManager node = node("node", store, PROJECT_PLACEMENT);
     new WriteRole(node, project -> false, new DisabledMetricMaker());
     node.compactor().start();
     try {

@@ -49,6 +49,12 @@ public final class FakePeer implements AutoCloseable {
     return config;
   }
 
+  public static Config projectConfig() {
+    Config config = config();
+    config.setString("walgerrit", null, "placement", "project");
+    return config;
+  }
+
   private static final String HELLO = "/peerz";
 
   /** One request other than a hello; {@code body} is null when the connection was passed on. */

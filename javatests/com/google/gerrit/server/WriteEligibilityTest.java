@@ -240,11 +240,12 @@ public class WriteEligibilityTest {
   }
 
   @Test
-  public void placementIsProjectUnlessConfiguredOtherwise() {
-    assertThat(Placement.parse(null)).isEqualTo(Placement.PROJECT);
-    assertThat(Placement.parse(" ")).isEqualTo(Placement.PROJECT);
+  public void placementIsClusterUnlessConfiguredOtherwise() {
+    assertThat(Placement.parse(null)).isEqualTo(Placement.CLUSTER);
+    assertThat(Placement.parse(" ")).isEqualTo(Placement.CLUSTER);
     assertThat(Placement.parse("project")).isEqualTo(Placement.PROJECT);
-    assertThat(Placement.parse("Cluster")).isEqualTo(Placement.CLUSTER);
+    assertThat(Placement.parse(" ProJect ")).isEqualTo(Placement.PROJECT);
+    assertThat(Placement.parse(" Cluster ")).isEqualTo(Placement.CLUSTER);
     assertThat(assertThrows(IllegalArgumentException.class, () -> Placement.parse("pod")))
         .hasMessageThat()
         .contains("walgerrit.placement must be project or cluster");

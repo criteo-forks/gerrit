@@ -180,9 +180,8 @@ public class WriteForwardingTest {
   }
 
   @Test
-  public void withAClusterPlacementEveryNodeChoosesTheSameExecutorForEveryWrite() {
+  public void byDefaultEveryNodeChoosesTheSameExecutorForEveryWrite() {
     Config cluster = FakePeer.config();
-    cluster.setString("walgerrit", null, "placement", "cluster");
     Set<String> executors = new HashSet<>();
     List<WriteForwarding> nodes = new ArrayList<>();
     for (String name : NAMES) {
@@ -217,7 +216,7 @@ public class WriteForwardingTest {
   public void aNodeCutOffFromItsStoreHandsItsWritesToThePeersItReaches() {
     AtomicReference<Optional<String>> health = new AtomicReference<>(Optional.empty());
     for (String name : NAMES) {
-      WriteForwarding node = node(name, addresses, health::get, FakePeer.config());
+      WriteForwarding node = node(name, addresses, health::get, FakePeer.projectConfig());
       node.probe();
       for (String project : PROJECTS) {
         health.set(Optional.empty());
@@ -237,7 +236,7 @@ public class WriteForwardingTest {
 
   @Test
   public void aStoppingNodeHandsItsWritesToItsPeersForItsDrainTime() {
-    Config config = FakePeer.config();
+    Config config = FakePeer.projectConfig();
     config.setString("walgerrit", null, "drainOnStop", "200 ms");
     WriteForwarding node = node("gerrit-0", addresses, Optional::empty, config);
     node.probe();
@@ -255,7 +254,7 @@ public class WriteForwardingTest {
 
   @Test
   public void withoutADrainTimeAStoppingNodeKeepsItsWrites() {
-    WriteForwarding node = node("gerrit-0", addresses, Optional::empty, FakePeer.config());
+    WriteForwarding node = node("gerrit-0", addresses);
     node.probe();
     String own = ownProject(node);
 
@@ -267,7 +266,7 @@ public class WriteForwardingTest {
 
   @Test
   public void aReturningNodeLeavesItsWritesToItsPeersUntilTheyHaveCountedItsHellos() {
-    Config config = FakePeer.config();
+    Config config = FakePeer.projectConfig();
     config.setInt("walgerrit", null, "forwardingJoinProbes", 3);
     AtomicLong clock = new AtomicLong(1);
     WriteForwarding node =
@@ -393,7 +392,7 @@ public class WriteForwardingTest {
   }
 
   private static WriteForwarding node(String name, List<String> addresses) {
-    return node(name, addresses, Optional::empty, FakePeer.config());
+    return node(name, addresses, Optional::empty, FakePeer.projectConfig());
   }
 
   private static WriteForwarding node(

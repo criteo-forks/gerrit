@@ -43,7 +43,7 @@ final class WalGerritTestSupport {
   private static final String STORAGE_ENV = "GERRIT_WALGERRIT_STORAGE";
   /** Set to {@code aggressive} to compact after every couple of writes, racing the tests. */
   private static final String COMPACTION_ENV = "GERRIT_WALGERRIT_COMPACTION";
-  /** The value of {@code walgerrit.placement} for every server; unset leaves the default. */
+  /** Optional override for {@code walgerrit.placement}, which defaults to {@code cluster}. */
   private static final String PLACEMENT_ENV = "GERRIT_WALGERRIT_PLACEMENT";
   private static final String DB_MODULE = "dev.walgerrit.WalGitModule";
 

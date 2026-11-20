@@ -32,12 +32,12 @@ public final class WriteEligibility {
   public enum Placement {
     /** One executor per project; a write needs an address that names its project. */
     PROJECT,
-    /** One executor for every write. */
+    /** One executor for all eligible writes. Used when placement is unset or blank. */
     CLUSTER;
 
     static Placement parse(@Nullable String value) {
       if (value == null || value.isBlank()) {
-        return PROJECT;
+        return CLUSTER;
       }
       try {
         return valueOf(value.trim().toUpperCase(Locale.ROOT));

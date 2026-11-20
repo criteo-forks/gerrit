@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -166,6 +167,7 @@ record WalGitConfiguration(
   static final Duration DEFAULT_STORE_PROBE_TIMEOUT = Duration.ofSeconds(10);
 
   private static final String SECTION = "walgerrit";
+  private static final boolean DEFAULT_CLUSTER_PLACEMENT = true;
 
   /** The local backend below the site's data directory, with every other setting at its default. */
   WalGitConfiguration(BackendType backend, Path storagePath) {
@@ -214,7 +216,7 @@ record WalGitConfiguration(
         DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL,
         null,
         true,
-        false,
+        DEFAULT_CLUSTER_PLACEMENT,
         DEFAULT_STORE_PROBE_INTERVAL,
         DEFAULT_STORE_PROBE_TIMEOUT,
         Project.nameKey("All-Projects"),
@@ -290,7 +292,7 @@ record WalGitConfiguration(
             duration(config, "gossipPeerRefreshInterval", DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL),
             blankToNull(config.getString(SECTION, null, "gossipSecret")),
             config.getBoolean(SECTION, null, "forwardWrites", true),
-            "cluster".equalsIgnoreCase(config.getString(SECTION, null, "placement")),
+            parseClusterPlacement(config.getString(SECTION, null, "placement")),
             duration(config, "storeProbeInterval", DEFAULT_STORE_PROBE_INTERVAL),
             duration(config, "storeProbeTimeout", DEFAULT_STORE_PROBE_TIMEOUT),
             Project.nameKey(
@@ -313,6 +315,20 @@ record WalGitConfiguration(
 
   private static String blankToNull(String value) {
     return value == null || value.isBlank() ? null : value;
+  }
+
+  // Matches WriteEligibility.Placement.parse in Gerrit core.
+  private static boolean parseClusterPlacement(String value) {
+    if (value == null || value.isBlank()) {
+      return DEFAULT_CLUSTER_PLACEMENT;
+    }
+    return switch (value.trim().toUpperCase(Locale.ROOT)) {
+      case "CLUSTER" -> true;
+      case "PROJECT" -> false;
+      default ->
+          throw new IllegalArgumentException(
+              "walgerrit.placement must be project or cluster, not " + value);
+    };
   }
 
   private static Path path(Config config, Path sitePath, String key, String defaultValue) {

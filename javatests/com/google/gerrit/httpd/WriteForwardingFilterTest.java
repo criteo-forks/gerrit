@@ -136,7 +136,7 @@ public class WriteForwardingFilterTest {
     when(user.isIdentifiedUser()).thenReturn(true);
     when(user.getAccountId()).thenReturn(Account.id(42));
     peer = new FakePeer(PEER);
-    forwarding = node(SELF, FakePeer.config());
+    forwarding = node(SELF, FakePeer.projectConfig());
     filter = new WriteForwardingFilter(forwarding, 2, () -> session);
     for (int i = 0; peerProject == null || ownProject == null; i++) {
       String project = "team/repo-" + i;
@@ -819,7 +819,7 @@ public class WriteForwardingFilterTest {
   public void aNodeTakesItsWritesBackOnceItsPeersHaveCountedItsHellos() throws Exception {
     ThreadSettingsConfig threads = mock(ThreadSettingsConfig.class);
     when(threads.getHttpdMaxThreads()).thenReturn(3);
-    Config config = FakePeer.config();
+    Config config = FakePeer.projectConfig();
     config.setInt("walgerrit", null, "forwardingJoinProbes", 2);
     java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong(1);
     WriteForwarding node =

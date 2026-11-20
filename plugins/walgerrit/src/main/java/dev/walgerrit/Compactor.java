@@ -43,8 +43,9 @@ import org.slf4j.LoggerFactory;
  * This node's compactor: rewrites a repository's small packs into larger ones and its reftable
  * stack in contiguous runs, publishing each result as one add-and-supersede manifest transaction.
  *
- * <p>The node that writes compacts. After every publication the policy is evaluated on the new
- * manifest, and a repository whose packs are due is queued for one compaction at a time on a
+ * <p>With default cluster placement, only the preferred executor queues compaction; with project
+ * placement, any node can. After each publication, the node checks the manifest against the policy
+ * and queues due work, running one compaction at a time on a
  * single background thread. The compactor takes the repository's lease so other nodes skip the
  * same work, re-reads the manifest, and repeats passes until the policy is satisfied. JGit's
  * {@code DfsPackCompactor} is the repacking engine; WalGerrit supplies the inputs it selected and
