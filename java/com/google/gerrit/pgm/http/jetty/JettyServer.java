@@ -152,6 +152,7 @@ public class JettyServer {
 
     @Override
     public void stop() {
+      server.forwarding.drain();
       try {
         server.httpd.stop();
         server.httpd.join();
@@ -241,6 +242,7 @@ public class JettyServer {
 
   private final SitePaths site;
   private final Server httpd;
+  private final WriteForwarding forwarding;
   private final Metrics metrics;
   private boolean reverseProxy;
   private ConnectionStatistics connStats;
@@ -259,7 +261,7 @@ public class JettyServer {
     QueuedThreadPool pool = threadPool(cfg, threadSettingsConfig);
     httpd = new Server(pool);
     httpd.setConnectors(listen(httpd, cfg));
-    WriteForwarding forwarding = env.webInjector.getInstance(WriteForwarding.class);
+    forwarding = env.webInjector.getInstance(WriteForwarding.class);
     if (forwarding.tls() != null && !forwarding.name().isEmpty()) {
       SslContextFactory.Server ssl = new SslContextFactory.Server();
       ssl.setSslContext(forwarding.tls());

@@ -70,6 +70,7 @@ record WalGitConfiguration(
     Duration gossipPeerRefreshInterval,
     String gossipSecret,
     boolean forwardWrites,
+    boolean clusterPlacement,
     Project.NameKey allProjects,
     Project.NameKey allUsers) {
   /**
@@ -208,6 +209,7 @@ record WalGitConfiguration(
         DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL,
         null,
         true,
+        false,
         Project.nameKey("All-Projects"),
         Project.nameKey("All-Users"));
   }
@@ -281,6 +283,7 @@ record WalGitConfiguration(
             duration(config, "gossipPeerRefreshInterval", DEFAULT_GOSSIP_PEER_REFRESH_INTERVAL),
             blankToNull(config.getString(SECTION, null, "gossipSecret")),
             config.getBoolean(SECTION, null, "forwardWrites", true),
+            "cluster".equalsIgnoreCase(config.getString(SECTION, null, "placement")),
             Project.nameKey(
                 Optional.ofNullable(config.getString("gerrit", null, "allProjects"))
                     .orElse("All-Projects")),

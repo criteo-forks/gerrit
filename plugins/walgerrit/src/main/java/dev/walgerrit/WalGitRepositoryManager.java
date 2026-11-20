@@ -27,8 +27,11 @@ import dev.walgerrit.Catalog.Binding;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.Map;
 import java.util.NavigableSet;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.internal.storage.dfs.DfsBlockCache;
 import org.eclipse.jgit.internal.storage.dfs.DfsBlockCacheConfig;
@@ -48,6 +51,12 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   private final Namespace namespace;
   private final Compactor compactor;
   private final GerritRuntime runtime;
+
+  /** Whether Gerrit prefers this node to execute writes to the named project. */
+  private volatile Predicate<String> writeExecutor = project -> true;
+
+  /** The name each repository id was last seen under; an id never changes its name. */
+  private final Map<RepositoryId, String> names = new ConcurrentHashMap<>();
 
   /** The repository whose log entry the thread is applying; see {@link #applyingReplay}. */
   private final ThreadLocal<RepositoryId> applyingReplay = new ThreadLocal<>();
@@ -235,6 +244,45 @@ public final class WalGitRepositoryManager implements GitRepositoryManager, Life
   public void repositoryDeleted(Project.NameKey name) {
     // Deletion is a namespace operation with its own protocol; see Namespace#delete. This hook
     // arrives after a plugin already acted on its own and proves nothing.
+  }
+
+  /** Takes Gerrit's choice of the node that executes a project's writes; see {@link WriteRole}. */
+  void writeExecutor(Predicate<String> executor) {
+    writeExecutor = executor;
+  }
+
+  /**
+   * Whether Gerrit prefers this node to execute writes to {@code id}'s repository; true when
+   * nothing chooses or the choice fails.
+   */
+  boolean executes(RepositoryId id) {
+    try {
+      return writeExecutor.test(knownName(id));
+    } catch (RuntimeException failure) {
+      return true;
+    }
+  }
+
+  /** The project name of {@code id}, or the id itself for the catalog and for unbound ids. */
+  String knownName(RepositoryId id) {
+    if (id.isCatalog()) {
+      return id.value();
+    }
+    String known = names.get(id);
+    if (known != null) {
+      return known;
+    }
+    try {
+      Optional<Binding> binding = catalog.bindingOf(id, false);
+      if (binding.isPresent()) {
+        String name = binding.get().name().get();
+        names.put(id, name);
+        return name;
+      }
+    } catch (IOException | RuntimeException unknown) {
+      // The next caller asks again.
+    }
+    return id.value();
   }
 
   /** Deletes and resumes; the front end for plugins and the batch program. */

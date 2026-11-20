@@ -16,6 +16,7 @@ package com.google.gerrit.sshd;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.extensions.restapi.Url;
 import com.google.gerrit.server.PeerGitStream;
+import com.google.gerrit.server.WriteEligibility;
 import com.google.gerrit.server.WriteForwarding;
 import com.google.gerrit.server.WriteForwarding.Peer;
 import com.google.gerrit.sshd.BaseCommand.Failure;
@@ -36,6 +37,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLSocket;
+import org.apache.http.Header;
 import org.apache.http.HttpException;
 import org.apache.http.HttpResponse;
 import org.apache.http.entity.InputStreamEntity;
@@ -59,6 +61,16 @@ public final class PeerRelay {
     this.forwarding = forwarding;
   }
 
+  /** Whether this node hands writes over at all. */
+  public boolean active() {
+    return forwarding.active();
+  }
+
+  /** Counts a write command that is executed here, and why it may not be handed over. */
+  public void ineligible(String reason) {
+    forwarding.ineligible("ssh", reason);
+  }
+
   public boolean receivePack(
       String project,
       Account.Id account,
@@ -68,8 +80,15 @@ public final class PeerRelay {
       OutputStream out,
       OutputStream err)
       throws IOException, Failure {
-    Optional<Peer> target = forwarding.preferredPeer(project, any -> true);
-    if (target.isEmpty() || !(from instanceof InetSocketAddress client) || client.isUnresolved()) {
+    Optional<Peer> target =
+        forwarding.preferredPeer(
+            WriteEligibility.sshReceivePack(forwarding.placement(), project).key());
+    if (target.isEmpty()) {
+      forwarding.count("ssh", "local");
+      return false;
+    }
+    if (!(from instanceof InetSocketAddress client) || client.isUnresolved()) {
+      forwarding.ineligible("ssh", "unforwardable");
       return false;
     }
     AtomicInteger count = outgoing.computeIfAbsent(pool, unused -> new AtomicInteger());
@@ -134,6 +153,26 @@ public final class PeerRelay {
       HttpResponse answer = connection.receiveResponseHeader();
       if (answer.getStatusLine().getStatusCode() == 503) {
         forwarding.count("ssh", "fallback");
+        return false;
+      }
+      Header refused = answer.getFirstHeader(WriteForwarding.REFUSED_HEADER);
+      if (refused != null) {
+        String reason = refused.getValue();
+        if (!WriteForwarding.executedAtEntry(reason)) {
+          // Do not execute at entry after a denial or an unknown refusal.
+          boolean denial = WriteForwarding.denial(reason);
+          forwarding.count("ssh", denial ? "denied" : "failed");
+          throw new UnloggedFailure(
+              1,
+              denial
+                  ? "fatal: server " + peer.name() + " does not accept this push for your account"
+                  : "fatal: server " + peer.name() + " refused this push");
+        }
+        if ("unavailable".equals(reason)) {
+          forwarding.failed(peer);
+        }
+        // The peer executed nothing, and no client input was read.
+        forwarding.count("ssh", "refused");
         return false;
       }
       if (answer.getStatusLine().getStatusCode() != 200

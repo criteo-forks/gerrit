@@ -32,6 +32,7 @@ import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Permission;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.extensions.api.changes.ReviewInput;
+import com.google.gerrit.extensions.client.ChangeStatus;
 import com.google.gerrit.extensions.common.ChangeInfo;
 import com.google.gerrit.extensions.restapi.Url;
 import com.google.gerrit.server.WriteForwarding;
@@ -365,6 +366,46 @@ public class WriteForwardingIT extends AbstractDaemonTest {
     assertThat(peer.requests().get(0).header(WriteForwarding.FORWARDED_HEADER)).isEqualTo(PEER);
     ChangeInfo change = gApi.changes().id(pushed.getChangeId()).get();
     assertThat(change.labels.get("Code-Review").recommended._accountId).isEqualTo(user.id().get());
+  }
+
+  @Test
+  public void writesWithoutABodyAreHandedToThePeer() throws Exception {
+    PushOneCommit.Result pushed =
+        pushFactory.create(user.newIdent(), cloneProject(peerProject)).to("refs/for/master%topic=t");
+    pushed.assertOkStatus();
+    String id =
+        Url.encode(peerProject.get()) + "~" + gApi.changes().id(pushed.getChangeId()).get()._number;
+    join();
+
+    adminRestSession.delete("/changes/" + id + "/topic").assertNoContent();
+    adminRestSession.post("/changes/" + id + "/abandon").assertOK();
+
+    assertThat(gApi.changes().id(pushed.getChangeId()).get().topic).isNull();
+    assertThat(gApi.changes().id(pushed.getChangeId()).get().status)
+        .isEqualTo(ChangeStatus.ABANDONED);
+    assertThat(peer.requests()).hasSize(2);
+    for (FakePeer.Request request : peer.requests()) {
+      assertThat(request.header("Content-Length")).isEqualTo("0");
+    }
+    assertThat(metrics.getCount(COUNTER, "http", "forwarded")).isEqualTo(2);
+  }
+
+  @Test
+  public void writesThatNameNoProjectRunHereAndAreCountedByReason() throws Exception {
+    PushOneCommit.Result pushed =
+        pushFactory.create(user.newIdent(), cloneProject(peerProject)).to("refs/for/master");
+    pushed.assertOkStatus();
+    int number = gApi.changes().id(pushed.getChangeId()).get()._number;
+    join();
+
+    userRestSession
+        .post("/changes/" + number + "/revisions/current/review", ReviewInput.noScore())
+        .assertOK();
+    userRestSession.put("/accounts/self/starred.changes/" + number).assertNoContent();
+
+    assertThat(peer.requests()).isEmpty();
+    assertThat(metrics.getCount(COUNTER, "http", "ineligible")).isEqualTo(2);
+    assertThat(metrics.getCount("write_forwarding/ineligible", "http", "no_project")).isEqualTo(2);
   }
 
   @Test

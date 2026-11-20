@@ -16,6 +16,7 @@ package dev.walgerrit;
 
 import com.google.common.cache.Cache;
 import dev.walgerrit.ManifestCache.VersionedManifest;
+import dev.walgerrit.proto.StorageProto.LogEntry;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -61,6 +62,14 @@ final class StorageLayout {
   private final RepositoryLocks repositoryLocks = new RepositoryLocks();
   private final List<BiConsumer<RepositoryId, VersionedManifest>> publicationListeners =
       new CopyOnWriteArrayList<>();
+  private final List<PublicationObserver> publicationObservers = new CopyOnWriteArrayList<>();
+
+  /** Sees what this node publishes by kind and the ref transactions it has to run again. */
+  interface PublicationObserver {
+    void published(RepositoryId id, LogEntry.Kind kind);
+
+    void conflicted(RepositoryId id);
+  }
 
   StorageLayout(Path root) {
     this(new FileObjectStore(root), root, root.resolve("index-events"), "");
@@ -127,12 +136,24 @@ final class StorageLayout {
     return manifestCache.expect(manifestsPrefix + "/" + id.value(), version, revision);
   }
 
-  private void published(RepositoryId id, VersionedManifest manifest) {
+  /** Observers run after the listeners, under the same rules. */
+  void observePublications(PublicationObserver observer) {
+    publicationObservers.add(observer);
+  }
+
+  private void published(RepositoryId id, VersionedManifest manifest, LogEntry.Kind kind) {
     for (BiConsumer<RepositoryId, VersionedManifest> listener : publicationListeners) {
       try {
         listener.accept(id, manifest);
       } catch (RuntimeException failure) {
         logger.warn("Post-publication listener failed for {}", id, failure);
+      }
+    }
+    for (PublicationObserver observer : publicationObservers) {
+      try {
+        observer.published(id, kind);
+      } catch (RuntimeException failure) {
+        logger.warn("Publication observer failed for {}", id, failure);
       }
     }
   }
@@ -179,7 +200,19 @@ final class StorageLayout {
         indexCursorRepositoriesPath.resolve(id.value() + ".cursor"),
         id.value(),
         Clock.systemUTC(),
-        manifest -> published(id, manifest),
+        new ManifestStore.Listener() {
+          @Override
+          public void published(VersionedManifest manifest, LogEntry.Kind kind) {
+            StorageLayout.this.published(id, manifest, kind);
+          }
+
+          @Override
+          public void conflicted() {
+            for (PublicationObserver observer : publicationObservers) {
+              observer.conflicted(id);
+            }
+          }
+        },
         manifestCache,
         repositoryLocks,
         chunkedFiles,

@@ -15,16 +15,16 @@ package com.google.gerrit.httpd;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static javax.servlet.http.HttpServletResponse.SC_BAD_GATEWAY;
+import static javax.servlet.http.HttpServletResponse.SC_FORBIDDEN;
 import static javax.servlet.http.HttpServletResponse.SC_SERVICE_UNAVAILABLE;
 
-import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.flogger.FluentLogger;
 import com.google.common.net.InetAddresses;
-import com.google.gerrit.common.Nullable;
-import com.google.gerrit.extensions.restapi.Url;
 import com.google.gerrit.server.AccessPath;
 import com.google.gerrit.server.CurrentUser;
+import com.google.gerrit.server.WriteEligibility;
+import com.google.gerrit.server.WriteEligibility.Decision;
 import com.google.gerrit.server.WriteForwarding;
 import com.google.gerrit.server.WriteForwarding.Peer;
 import com.google.gerrit.server.config.ThreadSettingsConfig;
@@ -62,6 +62,7 @@ import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.methods.RequestBuilder;
 import org.apache.http.config.SocketConfig;
 import org.apache.http.conn.ConnectTimeoutException;
+import org.apache.http.entity.ByteArrayEntity;
 import org.apache.http.entity.InputStreamEntity;
 import org.apache.http.impl.NoConnectionReuseStrategy;
 import org.apache.http.impl.client.CloseableHttpClient;
@@ -72,7 +73,6 @@ import org.apache.http.impl.client.HttpClients;
 public class WriteForwardingFilter implements Filter {
   private static final FluentLogger logger = FluentLogger.forEnclosingClass();
 
-  private static final String RECEIVE_PACK = "git-receive-pack";
   private static final int CONNECT_TIMEOUT_MILLIS = 2_000;
   private static final int READ_TIMEOUT_MILLIS = 15 * 60 * 1000;
   private static final int MAX_CONNECTIONS = 4096;
@@ -93,6 +93,7 @@ public class WriteForwardingFilter implements Filter {
           "upgrade",
           WriteForwarding.FORWARDED_HEADER.toLowerCase(Locale.US));
 
+  /** Only these client headers pass; credentials, cookies and CSRF tokens stay at entry. */
   private static final ImmutableSet<String> REQUEST_HEADERS =
       ImmutableSet.of(
           "accept",
@@ -104,27 +105,14 @@ public class WriteForwardingFilter implements Filter {
           "if-none-match",
           "if-modified-since",
           "if-unmodified-since",
+          "origin",
           "user-agent",
           "accept-language",
           "x-request-id",
           "x-gerrit-deadline",
-          "x-gerrit-trace");
-  private static final ImmutableSet<String> ENTRY_HEADERS =
-      ImmutableSet.of(
-          "accept-charset",
-          "authorization",
-          "cookie",
-          "x-gerrit-auth",
-          "cache-control",
-          "pragma",
-          "referer",
-          "forwarded",
-          "via",
-          "x-forwarded-for",
-          "x-forwarded-host",
-          "x-forwarded-port",
-          "x-forwarded-proto",
-          "x-real-ip");
+          "x-gerrit-trace",
+          "x-gerrit-updatedref-enabled");
+
   private final Provider<WebSession> sessions;
 
   public static Module module() {
@@ -174,6 +162,8 @@ public class WriteForwardingFilter implements Filter {
                     .setConnectTimeout(CONNECT_TIMEOUT_MILLIS)
                     .setSocketTimeout(READ_TIMEOUT_MILLIS)
                     .setNormalizeUri(false)
+                    // Expect-continue lets the peer refuse before the body is read at entry.
+                    .setExpectContinueEnabled(true)
                     .build())
             .build();
   }
@@ -195,191 +185,72 @@ public class WriteForwardingFilter implements Filter {
       throws IOException, ServletException {
     HttpServletRequest req = (HttpServletRequest) request;
     HttpServletResponse rsp = (HttpServletResponse) response;
-    String method = req.getMethod();
-    String path = req.getRequestURI().substring(req.getContextPath().length());
-
-    String project = eligibleProject(req, path);
-    if (project != null
-        && !PeerWriteFilter.isPeer(req)
-        && forwarding.tls() != null
-        && req.getHeader("X-Gerrit-RunAs") == null
-        && req.getHeader("Origin") == null) {
-      Optional<Peer> peer = forwarding.preferredPeer(project, any -> true);
-      if (peer.isPresent()
-          && Collections.list(req.getHeaderNames()).stream()
-              .map(h -> h.toLowerCase(Locale.ROOT))
-              .allMatch(
-                  h ->
-                      REQUEST_HEADERS.contains(h)
-                          || ENTRY_HEADERS.contains(h)
-                          || NOT_COPIED.contains(h))) {
-        WebSession session = sessions.get();
-        CurrentUser user = session.getUser();
-        if (user.isIdentifiedUser()
-            && !user.isImpersonated()
-            && (gitWrite(method, path) || session.isAccessPathOk(AccessPath.REST_API))
-            && handOver(req, rsp, peer.get(), isAdvertisement(method, path), user)) {
-          return;
-        }
-      }
+    if (!PeerWriteFilter.isPeer(req) && forwarding.active() && handedOver(req, rsp)) {
+      return;
     }
     chain.doFilter(request, response);
   }
 
-  static boolean gitWrite(String method, String path) {
-    return isAdvertisement(method, path)
-        || ("POST".equals(method) && path.endsWith("/git-receive-pack"));
-  }
-
-  @Nullable
-  static String eligibleProject(HttpServletRequest req, String path) {
+  /**
+   * Hands an eligible write to its preferred executor.
+   *
+   * @return true when the peer's answer, or this node's account of its failure, went to the client
+   */
+  private boolean handedOver(HttpServletRequest req, HttpServletResponse rsp) throws IOException {
     String method = req.getMethod();
-    String query = req.getQueryString();
-    String decoded = decode(path);
-    if (decoded == null
-        || !decoded.startsWith("/")
-        || decoded.contains("//")
-        || decoded.indexOf('%') >= 0
-        || decoded.indexOf(';') >= 0
-        || decoded.indexOf('\\') >= 0
-        || decoded.chars().anyMatch(Character::isISOControl)
-        || Splitter.on('/').splitToList(decoded).stream()
-            .anyMatch(p -> p.equals(".") || p.equals(".."))) {
-      return null;
+    String path = req.getRequestURI().substring(req.getContextPath().length());
+    Decision decision = eligibility(forwarding, req, path);
+    if (!decision.write()) {
+      return false;
     }
-    // Form data and query parameters can carry site or Gerrit authentication tokens.
-    if (query != null
-        && !(isAdvertisement(method, path) && query.equals("service=" + RECEIVE_PACK))) {
-      return null;
+    if (!decision.eligible()) {
+      forwarding.ineligible("http", decision.reason());
+      return false;
     }
-    String type = req.getContentType();
-    if (gitWrite(method, path)) {
-      if ("POST".equals(method)
-          && !"application/x-git-receive-pack-request".equalsIgnoreCase(type)) {
-        return null;
-      }
-      if ("GET".equals(method)
-          && (req.getContentLengthLong() > 0 || req.getHeader("Transfer-Encoding") != null)) {
-        return null;
-      }
-    } else {
-      if (!ImmutableSet.of("POST", "PUT", "DELETE").contains(method)) {
-        return null;
-      }
-      if (type == null
-          ? req.getContentLengthLong() != 0
-          : !type.split(";", 2)[0].trim().equalsIgnoreCase("application/json")) {
-        return null;
-      }
+    if (req.getHeader("X-Gerrit-RunAs") != null) {
+      forwarding.ineligible("http", "run_as");
+      return false;
     }
-    return project(method, path, query);
-  }
-
-  private boolean handOver(
-      HttpServletRequest req,
-      HttpServletResponse rsp,
-      Peer peer,
-      boolean advertisement,
-      CurrentUser user)
-      throws IOException {
+    Optional<Peer> peer = forwarding.preferredPeer(decision.key());
+    if (peer.isEmpty()) {
+      forwarding.count("http", "local");
+      return false;
+    }
+    WebSession session = sessions.get();
+    CurrentUser user = session.getUser();
+    boolean git = WriteEligibility.gitWrite(method, path);
+    String kept =
+        !user.isIdentifiedUser()
+            ? "anonymous"
+            : user.isImpersonated()
+                ? "impersonated"
+                // A cookie session has this path only with the session's CSRF token.
+                : !git && !session.isAccessPathOk(AccessPath.REST_API) ? "csrf" : null;
+    if (kept != null) {
+      forwarding.ineligible("http", kept);
+      return false;
+    }
     if (!handingOver.tryAcquire()) {
       forwarding.count("http", "busy");
       return false;
     }
     try {
-      return forward(req, rsp, peer, advertisement, user);
+      return forward(req, rsp, peer.get(), user);
     } finally {
       handingOver.release();
     }
   }
 
-  /**
-   * The project that the request writes to, when its address names one.
-   *
-   * @param path the undecoded request path after the context path
-   */
-  @Nullable
-  static String project(String method, String path, @Nullable String query) {
-    String rest = path.startsWith("/a/") ? path.substring(2) : path;
-    if (isAdvertisement(method, path) && hasParameter(query, "service=" + RECEIVE_PACK)) {
-      return gitProject(rest, "/info/refs");
-    }
-    if ("POST".equals(method) && rest.endsWith("/" + RECEIVE_PACK)) {
-      return gitProject(rest, "/" + RECEIVE_PACK);
-    }
-    if ("GET".equals(method) || "HEAD".equals(method)) {
-      return null;
-    }
-    boolean change = rest.startsWith("/changes/");
-    if (!change && !rest.startsWith("/projects/")) {
-      return null;
-    }
-    int start = rest.indexOf('/', 1) + 1;
-    int end = rest.indexOf('/', start);
-    String id = decode(rest.substring(start, end < 0 ? rest.length() : end));
-    if (id == null || id.isEmpty()) {
-      return null;
-    }
-    if (!change) {
-      return id;
-    }
-    // PROJECT~NUMBER or PROJECT~BRANCH~CHANGE-ID; other change identifiers name no project.
-    int last = id.lastIndexOf('~');
-    if (last <= 0) {
-      return null;
-    }
-    if (last + 1 < id.length() && id.substring(last + 1).chars().allMatch(Character::isDigit)) {
-      return id.substring(0, last);
-    }
-    int first = id.lastIndexOf('~', last - 1);
-    return first <= 0 ? null : id.substring(0, first);
-  }
-
-  private static boolean isAdvertisement(String method, String path) {
-    return "GET".equals(method) && path.endsWith("/info/refs");
-  }
-
-  private static boolean hasParameter(@Nullable String query, String parameter) {
-    if (query != null) {
-      for (String part : Splitter.on('&').split(query)) {
-        if (part.equals(parameter)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  @Nullable
-  private static String gitProject(String path, String suffix) {
-    String encoded = path.substring(0, path.length() - suffix.length());
-    if (encoded.isEmpty()) {
-      return null;
-    }
-    encoded = encoded.startsWith("/p/") ? encoded.substring(3) : encoded.substring(1);
-    String name = decode(encoded);
-    if (name == null) {
-      return null;
-    }
-    while (name.endsWith("/")) {
-      name = name.substring(0, name.length() - 1);
-    }
-    if (name.endsWith(".git")) {
-      name = name.substring(0, name.length() - ".git".length());
-    }
-    while (name.endsWith("/")) {
-      name = name.substring(0, name.length() - 1);
-    }
-    return name.isEmpty() ? null : name;
-  }
-
-  @Nullable
-  private static String decode(String encoded) {
-    try {
-      return Url.decode(encoded);
-    } catch (RuntimeException malformed) {
-      return null;
-    }
+  /** What both ends of a hand-over ask about a request. */
+  static Decision eligibility(WriteForwarding forwarding, HttpServletRequest req, String path) {
+    return WriteEligibility.http(
+        forwarding.placement(),
+        req.getMethod(),
+        path,
+        req.getQueryString(),
+        req.getContentType(),
+        req.getContentLengthLong(),
+        req.getHeader("Transfer-Encoding") != null);
   }
 
   /**
@@ -389,18 +260,17 @@ public class WriteForwardingFilter implements Filter {
    *     nothing was written to the response
    */
   private boolean forward(
-      HttpServletRequest req,
-      HttpServletResponse rsp,
-      Peer peer,
-      boolean advertisement,
-      CurrentUser user)
+      HttpServletRequest req, HttpServletResponse rsp, Peer peer, CurrentUser user)
       throws IOException {
+    // The only read that is handed over is a receive-pack advertisement.
+    boolean advertisement = "GET".equals(req.getMethod());
     HttpUriRequest out;
     ClientBody body = new ClientBody(req);
     try {
       out = copy(req, body, user, peer);
     } catch (IllegalArgumentException unforwardable) {
       logger.atFine().withCause(unforwardable).log("Not forwarding %s", req.getRequestURI());
+      forwarding.ineligible("http", "unforwardable");
       return false;
     }
     CloseableHttpResponse answer;
@@ -432,6 +302,31 @@ public class WriteForwardingFilter implements Filter {
         forwarding.failed(peer);
         forwarding.count("http", "fallback");
         return false;
+      }
+      Header refused = answer.getFirstHeader(WriteForwarding.REFUSED_HEADER);
+      if (refused != null) {
+        String reason = refused.getValue();
+        logger.atInfo().log(
+            "Write forwarding: %s refused %s %s (%s)",
+            peer.name(), req.getMethod(), req.getRequestURI(), reason);
+        if (!WriteForwarding.executedAtEntry(reason)) {
+          // Do not execute at entry after a denial or an unknown refusal.
+          boolean denial = WriteForwarding.denial(reason);
+          forwarding.count("http", denial ? "denied" : "failed");
+          refused(rsp, peer, denial);
+          return true;
+        }
+        if ("unavailable".equals(reason)) {
+          forwarding.failed(peer);
+        }
+        // The peer executed nothing. With the body still unread, this node executes the request.
+        if (body.in == null) {
+          forwarding.count("http", "refused");
+          return false;
+        }
+        forwarding.count("http", "rejected");
+        unavailable(rsp, peer);
+        return true;
       }
       rsp.setStatus(status);
       for (Header header : answer.getAllHeaders()) {
@@ -483,13 +378,26 @@ public class WriteForwardingFilter implements Filter {
     out.setHeader(WriteForwarding.ACCOUNT_HEADER, Integer.toString(user.getAccountId().get()));
     out.setHeader(WriteForwarding.ADDRESS_HEADER, address);
     out.setHeader(WriteForwarding.FORWARDED_HEADER, peer.name());
-    // A length that is not known is sent in chunks, so a body is never dropped.
-    long length = req.getContentLengthLong();
     boolean read = "GET".equals(req.getMethod()) || "HEAD".equals(req.getMethod());
-    if (length > 0 || (length < 0 && !read)) {
-      out.setEntity(new InputStreamEntity(body, length));
+    if (!read) {
+      long length = req.getContentLengthLong();
+      if (length == 0 || (length < 0 && !hasBody(req))) {
+        // An explicit empty body, so the peer sees the length this node saw or inferred.
+        out.setEntity(new ByteArrayEntity(new byte[0]));
+      } else {
+        // A length that is not known is sent in chunks, so a body is never dropped.
+        out.setEntity(new InputStreamEntity(body, length));
+      }
     }
     return out.build();
+  }
+
+  /** Whether a request that declares no length can still carry a body. */
+  private static boolean hasBody(HttpServletRequest req) {
+    String protocol = req.getProtocol();
+    return req.getHeader("Transfer-Encoding") != null
+        || protocol == null
+        || !protocol.startsWith("HTTP/1.");
   }
 
   private static boolean neverConnected(IOException failure) {
@@ -508,6 +416,39 @@ public class WriteForwardingFilter implements Filter {
                 + " have applied. Check before you retry.\n")
             .getBytes(UTF_8);
     rsp.setStatus(SC_BAD_GATEWAY);
+    CacheHeaders.setNotCacheable(rsp);
+    rsp.setContentType("text/plain");
+    rsp.setCharacterEncoding(UTF_8.name());
+    rsp.setContentLength(body.length);
+    rsp.getOutputStream().write(body);
+  }
+
+  /** Answers for a peer that refused to execute a request for its caller. */
+  private static void refused(HttpServletResponse rsp, Peer peer, boolean denial)
+      throws IOException {
+    byte[] body =
+        ("Server "
+                + peer.name()
+                + (denial
+                    ? " does not execute this request for your account."
+                    : " refused this request.")
+                + " Nothing was written.\n")
+            .getBytes(UTF_8);
+    rsp.setStatus(denial ? SC_FORBIDDEN : SC_BAD_GATEWAY);
+    CacheHeaders.setNotCacheable(rsp);
+    rsp.setContentType("text/plain");
+    rsp.setCharacterEncoding(UTF_8.name());
+    rsp.setContentLength(body.length);
+    rsp.getOutputStream().write(body);
+  }
+
+  /** Answers for a peer that refused a request whose body this node can no longer replay. */
+  private static void unavailable(HttpServletResponse rsp, Peer peer) throws IOException {
+    byte[] body =
+        ("Server " + peer.name() + " did not take this request. Nothing was written. Please retry.\n")
+            .getBytes(UTF_8);
+    rsp.setStatus(SC_SERVICE_UNAVAILABLE);
+    rsp.setHeader("Retry-After", "1");
     CacheHeaders.setNotCacheable(rsp);
     rsp.setContentType("text/plain");
     rsp.setCharacterEncoding(UTF_8.name());

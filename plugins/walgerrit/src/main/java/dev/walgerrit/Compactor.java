@@ -161,6 +161,8 @@ final class Compactor {
     if (running == null
         || manifest.getDeleted()
         || policy.plan(manifest).isEmpty()
+        // With one executor for every write, a compaction elsewhere is a second ref writer.
+        || (configuration.clusterPlacement() && !repositories.executes(id))
         || !queued.add(id)) {
       return;
     }

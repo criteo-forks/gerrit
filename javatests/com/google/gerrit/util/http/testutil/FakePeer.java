@@ -63,6 +63,8 @@ public final class FakePeer implements AutoCloseable {
 
   private enum Mode {
     ANSWER,
+    REFUSE,
+    REFUSE_LATE,
     RELAY,
     DROP_REPLY,
     HANG_UP,
@@ -77,6 +79,7 @@ public final class FakePeer implements AutoCloseable {
 
   private volatile String helloBody;
   private volatile int helloStatus = 200;
+  private volatile boolean helloProtocol = true;
   private volatile String targetName;
   private volatile int discardedStatus;
   private volatile Mode mode = Mode.ANSWER;
@@ -120,6 +123,28 @@ public final class FakePeer implements AutoCloseable {
   public void hello(int status, String body) {
     helloStatus = status;
     helloBody = body;
+  }
+
+  /** Answers hellos as a node that predates the hand-over protocol header. */
+  public void helloWithoutProtocol() {
+    helloProtocol = false;
+  }
+
+  /** Refuses every request before reading its body, as a destination that executes nothing. */
+  public FakePeer refuse(String reason) {
+    status = 403;
+    answerHeaders =
+        ImmutableMap.of(com.google.gerrit.server.WriteForwarding.REFUSED_HEADER, reason);
+    answerBody = new byte[0];
+    mode = Mode.REFUSE;
+    return this;
+  }
+
+  /** Refuses after input starts, simulating a late {@code Expect: 100-continue} response. */
+  public FakePeer refuseAfterInput(String reason) {
+    refuse(reason);
+    mode = Mode.REFUSE_LATE;
+    return this;
   }
 
   /** Answers every request with this status, these headers and this body. */
@@ -200,7 +225,15 @@ public final class FakePeer implements AutoCloseable {
             line.substring(0, colon).toLowerCase(Locale.US), line.substring(colon + 1).trim());
       }
       if (target.equals(HELLO)) {
-        respond(out, helloStatus, ImmutableMap.of(), helloBody.getBytes(UTF_8));
+        respond(
+            out,
+            helloStatus,
+            helloProtocol
+                ? ImmutableMap.of(
+                    com.google.gerrit.server.WriteForwarding.PROTOCOL_HEADER,
+                    com.google.gerrit.server.WriteForwarding.PROTOCOL)
+                : ImmutableMap.of(),
+            helloBody.getBytes(UTF_8));
         return;
       }
       Mode now = mode;
@@ -236,6 +269,22 @@ public final class FakePeer implements AutoCloseable {
           }
         }
         return;
+      }
+      if (now == Mode.REFUSE) {
+        record(method, target, headers, null);
+        respond(out, status, answerHeaders, answerBody);
+        return;
+      }
+      if (now == Mode.REFUSE_LATE) {
+        record(method, target, headers, null);
+        if (in.read() >= 0) {
+          respond(out, status, answerHeaders, answerBody);
+        }
+        return;
+      }
+      if ("100-continue".equalsIgnoreCase(headers.get("expect"))) {
+        out.write("HTTP/1.1 100 Continue\r\n\r\n".getBytes(ISO_8859_1));
+        out.flush();
       }
       record(method, target, headers, readBody(in, headers));
       respond(out, status, answerHeaders, answerBody);
@@ -303,6 +352,10 @@ public final class FakePeer implements AutoCloseable {
     out.flush();
   }
 
+  private static int statusOf(byte[] responseHead) {
+    return Integer.parseInt(new String(responseHead, ISO_8859_1).split(" ", 3)[1]);
+  }
+
   private void relay(Socket client, byte[] head, boolean dropReply) throws IOException {
     try (Socket server =
         TLS.getSocketFactory().createSocket(relayTo.getAddress(), relayTo.getPort())) {
@@ -337,9 +390,14 @@ public final class FakePeer implements AutoCloseable {
         if (dropReply) {
           InputStream answer = server.getInputStream();
           byte[] responseHead = readHead(answer);
+          while (responseHead != null && statusOf(responseHead) < 200) {
+            // The client waits for an interim answer before it sends its body.
+            client.getOutputStream().write(responseHead);
+            client.getOutputStream().flush();
+            responseHead = readHead(answer);
+          }
           if (responseHead != null) {
-            discardedStatus =
-                Integer.parseInt(new String(responseHead, ISO_8859_1).split(" ", 3)[1]);
+            discardedStatus = statusOf(responseHead);
             answer.transferTo(OutputStream.nullOutputStream());
           }
         } else {

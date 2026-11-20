@@ -43,7 +43,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.Consumer;
 import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -91,7 +90,7 @@ final class ManifestStore {
   private final long packFetchChunkSize;
   private final String repositoryName;
   private final Clock clock;
-  private final Consumer<VersionedManifest> afterPublish;
+  private final Listener afterPublish;
   private final ManifestCache cache;
   private final String cacheKey;
   private final ReentrantLock writeLock;
@@ -111,7 +110,7 @@ final class ManifestStore {
         repositoryPath.resolve("index-events.cursor"),
         repositoryName,
         Clock.systemUTC(),
-        ignored -> {},
+        Listener.NONE,
         new ManifestCache(),
         new RepositoryLocks(),
         new java.util.concurrent.ConcurrentHashMap<>(),
@@ -141,7 +140,7 @@ final class ManifestStore {
       Path indexCursorPath,
       String repositoryName,
       Clock clock,
-      Consumer<VersionedManifest> afterPublish,
+      Listener afterPublish,
       ManifestCache cache,
       RepositoryLocks locks,
       java.util.concurrent.ConcurrentMap<Path, ChunkedFile> chunkedFiles,
@@ -164,6 +163,33 @@ final class ManifestStore {
     this.cacheIsStore = cacheIsStore;
     stagingPath = this.repositoryPath.resolve(STAGING_DIRECTORY);
     walPath = this.repositoryPath.resolve(WAL_DIRECTORY);
+  }
+
+  /** Hears what this node does to the repository's manifest. */
+  interface Listener {
+    Listener NONE =
+        new Listener() {
+          @Override
+          public void published(VersionedManifest manifest, LogEntry.Kind kind) {}
+
+          @Override
+          public void conflicted() {}
+        };
+
+    /** The entry of {@code kind} this node wrote is the head of {@code manifest}. */
+    void published(VersionedManifest manifest, LogEntry.Kind kind);
+
+    /** A ref transaction of this node lost to another publication and runs again. */
+    void conflicted();
+  }
+
+  /** Tells the listener that a ref transaction of this node has to run again. */
+  void conflicted() {
+    try {
+      afterPublish.conflicted();
+    } catch (RuntimeException failure) {
+      logger.warn("Conflict notification failed for {}", repositoryName, failure);
+    }
   }
 
   /** This node's write lock for the repository; ref transactions hold it end to end. */
@@ -685,7 +711,7 @@ final class ManifestStore {
         }
         if (landed) {
           attempts.settled(true);
-          notifyPublished(fresh);
+          notifyPublished(fresh, entry.getKind());
           return fresh.manifest();
         }
         if (fresh.manifest().getHeadSeq() < sequence) {
@@ -702,7 +728,7 @@ final class ManifestStore {
       attempts.settled(true);
       VersionedManifest published = new VersionedManifest(updated, stored.version());
       cache.offer(cacheKey, published);
-      notifyPublished(published);
+      notifyPublished(published, entry.getKind());
       return updated;
     }
     throw new IOException("Manifest CAS did not converge after " + MAX_CAS_ATTEMPTS + " attempts");
@@ -754,9 +780,9 @@ final class ManifestStore {
     return new Resolution(fresh, history.contains(fresh));
   }
 
-  private void notifyPublished(VersionedManifest manifest) {
+  private void notifyPublished(VersionedManifest manifest, LogEntry.Kind kind) {
     try {
-      afterPublish.accept(manifest);
+      afterPublish.published(manifest, kind);
     } catch (RuntimeException failure) {
       // Scheduling maintenance is downstream of the commit point. A stopped executor or a
       // listener failure must not turn an acknowledged durable write into an apparent failure.

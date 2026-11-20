@@ -15,7 +15,9 @@ package com.google.gerrit.server;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.flogger.FluentLogger;
 import com.google.common.net.HostAndPort;
 import com.google.gerrit.common.Nullable;
@@ -25,6 +27,7 @@ import com.google.gerrit.metrics.Counter2;
 import com.google.gerrit.metrics.Description;
 import com.google.gerrit.metrics.Field;
 import com.google.gerrit.metrics.MetricMaker;
+import com.google.gerrit.server.WriteEligibility.Placement;
 import com.google.gerrit.server.config.GerritRuntime;
 import com.google.gerrit.server.config.GerritServerConfig;
 import com.google.gerrit.server.logging.PluginMetadata;
@@ -41,6 +44,7 @@ import java.net.HttpURLConnection;
 import java.net.Proxy;
 import java.net.URI;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -48,6 +52,7 @@ import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -56,16 +61,27 @@ import javax.net.ssl.SSLContext;
 import org.eclipse.jgit.lib.Config;
 
 /**
- * Chooses the node of a cluster that should execute a write to a project.
+ * Chooses the node of a cluster that should execute a write.
  *
- * <p>Nodes that share their repositories all accept writes, and one node executing a project's
+ * <p>Nodes that share their repositories all accept writes, and one node executing a repository's
  * writes avoids the waits that interleaved writers cause each other. A node that receives a write
- * therefore hands it to the node {@link WriteRouter} prefers for the project, when it has a working
- * link to that node, and executes it itself otherwise. A node always executes what a peer handed
- * it, so a write crosses at most one link however the nodes' views of each other differ.
+ * therefore hands it to the node {@link WriteRouter} prefers, when it has a working link to that
+ * node, and executes it itself otherwise. {@link Placement} says whether the nodes are ranked for
+ * each project or once for every write. A node always executes what a peer handed it, so a write
+ * crosses at most one link however the nodes' views of each other differ.
  *
- * <p>The plugin supplies a stable node name and peer addresses. A peer joins the candidate set when
- * its private TLS listener answers a hello while the serving gate is open.
+ * <p>The plugin supplies a stable node name, peer addresses and store health. A peer can join
+ * when its hello has a matching protocol version, its serving gate is open, it can reach its
+ * store and it is not stopping.
+ *
+ * <p>Background work that writes asks {@link #executes}. Code built against the plugin API reads
+ * the same answer from {@link #EXECUTOR_KEY}:
+ *
+ * <pre>{@code
+ * @Inject @Named("writeExecutor") Predicate<String> executor;
+ * ...
+ * if (executor.test(project.get())) { // act }
+ * }</pre>
  */
 @Singleton
 public class WriteForwarding implements LifecycleListener {
@@ -73,12 +89,22 @@ public class WriteForwarding implements LifecycleListener {
 
   public static final String NODE = "writeForwardingNode";
   public static final String PEERS = "writeForwardingPeers";
+  public static final String HEALTH = "writeForwardingHealth";
+  public static final String EXECUTOR = "writeExecutor";
 
   public static final Key<Supplier<String>> NODE_KEY =
       Key.get(new TypeLiteral<Supplier<String>>() {}, Names.named(NODE));
 
   public static final Key<Supplier<Collection<String>>> PEERS_KEY =
       Key.get(new TypeLiteral<Supplier<Collection<String>>>() {}, Names.named(PEERS));
+
+  /** Empty while this node can reach its store; otherwise the reason it cannot. */
+  public static final Key<Supplier<Optional<String>>> HEALTH_KEY =
+      Key.get(new TypeLiteral<Supplier<Optional<String>>>() {}, Names.named(HEALTH));
+
+  /** Whether this node is the preferred executor of writes to the named project. */
+  public static final Key<Predicate<String>> EXECUTOR_KEY =
+      Key.get(new TypeLiteral<Predicate<String>>() {}, Names.named(EXECUTOR));
 
   /** Private readiness and node identity endpoint. */
   public static final String HELLO_PATH = "/peerz";
@@ -92,6 +118,35 @@ public class WriteForwarding implements LifecycleListener {
   public static final String NATIVE_TYPE = "application/x-walgerrit-duplex-receive-pack";
 
   public static final String FORWARDED_HEADER = "X-Gerrit-Forwarded-By";
+
+  /** On a destination's answer: it refused the hand-over and executed nothing. */
+  public static final String REFUSED_HEADER = "X-Gerrit-Peer-Refused";
+
+  /**
+   * The refusals after which the entry node executes the request itself: the destination judged
+   * the request or itself. Any other refusal is about the caller, or unknown, and stands.
+   */
+  private static final ImmutableSet<String> EXECUTED_AT_ENTRY =
+      ImmutableSet.of("destination", "ineligible", "unavailable");
+
+  /** The refusals that deny the caller. */
+  private static final ImmutableSet<String> DENIALS =
+      ImmutableSet.of("account", "credentials", "identity");
+
+  /** Whether the entry node may execute a request that its destination refused for this reason. */
+  public static boolean executedAtEntry(@Nullable String refusal) {
+    return refusal != null && EXECUTED_AT_ENTRY.contains(refusal);
+  }
+
+  /** Whether a refusal for this reason denies the caller; any other is not one this node knows. */
+  public static boolean denial(@Nullable String refusal) {
+    return refusal != null && DENIALS.contains(refusal);
+  }
+
+  /** On a hello: the hand-over rules the node applies. A node only joins nodes with its own. */
+  public static final String PROTOCOL_HEADER = "X-Gerrit-Peer-Protocol";
+
+  public static final String PROTOCOL = "2";
 
   private static final int PROBE_INTERVAL_MILLIS = 1000;
   private static final int PROBE_TIMEOUT_MILLIS = 1000;
@@ -110,31 +165,83 @@ public class WriteForwarding implements LifecycleListener {
     protected void configure() {
       OptionalBinder.newOptionalBinder(binder(), NODE_KEY).setDefault().toInstance(() -> "");
       OptionalBinder.newOptionalBinder(binder(), PEERS_KEY).setDefault().toInstance(List::of);
+      OptionalBinder.newOptionalBinder(binder(), HEALTH_KEY)
+          .setDefault()
+          .toInstance(Optional::empty);
+      bind(EXECUTOR_KEY).toProvider(ExecutorProvider.class);
       listener().to(WriteForwarding.class);
+    }
+  }
+
+  private static class ExecutorProvider implements com.google.inject.Provider<Predicate<String>> {
+    private final WriteForwarding forwarding;
+
+    @Inject
+    ExecutorProvider(WriteForwarding forwarding) {
+      this.forwarding = forwarding;
+    }
+
+    @Override
+    public Predicate<String> get() {
+      return forwarding::executes;
     }
   }
 
   private final Supplier<String> node;
   private final Supplier<Collection<String>> addresses;
+  private final Supplier<Optional<String>> health;
+  private final Placement placement;
+  private final int joinProbes;
+  private final long drainMillis;
   private final String contextPath;
   private final int port;
   @Nullable private final SSLContext tls;
   private final GerritRuntime runtime;
   private final Counter2<String, String> requests;
+  private final Counter2<String, String> ineligible;
 
   private volatile ImmutableMap<String, Peer> peers = ImmutableMap.of();
+  private final LongSupplier nanoTime;
+  private volatile boolean draining;
+  private volatile String unhealthy;
+
+  /** When a peer first found this node able to execute writes; zero while none has. */
+  private volatile long candidateSince;
+
+  /** Consecutive hellos each peer answered. */
+  private final Map<String, Integer> answers = new HashMap<>();
+
   private ScheduledExecutorService prober;
 
   @Inject
   public WriteForwarding(
       @Named(NODE) Supplier<String> node,
       @Named(PEERS) Supplier<Collection<String>> addresses,
+      @Named(HEALTH) Supplier<Optional<String>> health,
       @GerritServerConfig Config config,
       GerritRuntime runtime,
       MetricMaker metrics) {
+    this(node, addresses, health, config, runtime, metrics, System::nanoTime);
+  }
+
+  @VisibleForTesting
+  public WriteForwarding(
+      Supplier<String> node,
+      Supplier<Collection<String>> addresses,
+      Supplier<Optional<String>> health,
+      Config config,
+      GerritRuntime runtime,
+      MetricMaker metrics,
+      LongSupplier nanoTime) {
     this.node = node;
+    this.nanoTime = nanoTime;
     this.addresses = addresses;
+    this.health = health;
     this.tls = configuredTls(config);
+    placement = Placement.parse(config.getString("walgerrit", null, "placement"));
+    joinProbes = config.getIntInRange("walgerrit", null, "forwardingJoinProbes", 1, 3600, 1);
+    drainMillis =
+        config.getTimeUnit("walgerrit", null, "drainOnStop", 0, TimeUnit.MILLISECONDS);
     port = config.getIntInRange("walgerrit", null, "forwardingPort", 1, 65535, 9443);
     String[] urls = config.getStringList("httpd", null, "listenUrl");
     String path = urls.length == 0 ? "" : URI.create(urls[0]).getRawPath();
@@ -147,10 +254,34 @@ public class WriteForwarding implements LifecycleListener {
             field("transport", "ssh or http"),
             field(
                 "outcome",
-                "forwarded: the peer answered; fallback: executed here because the peer could not"
-                    + " be reached; busy: executed here because too many threads were handing"
-                    + " writes over; inbound_busy: destination admission limit reached; failed: the"
-                    + " link broke after the peer may have acted"));
+                "forwarded: the peer answered; local: this node is the preferred executor;"
+                    + " ineligible: executed here because the request may not be handed over;"
+                    + " fallback: executed here because the peer could not be reached; refused:"
+                    + " executed here because the peer refused the hand-over; rejected: the peer"
+                    + " refused after the request body was sent, and the client was told to"
+                    + " retry; busy: executed here because too many threads were handing writes"
+                    + " over; inbound_busy: destination admission limit reached; failed: the link"
+                    + " broke after the peer may have acted"));
+    this.ineligible =
+        metrics.newCounter(
+            "write_forwarding/ineligible",
+            new Description("Writes executed where they arrived because they may not be handed over")
+                .setRate(),
+            field("transport", "ssh or http"),
+            field("reason", "why the write may not be handed over"));
+    metrics.newCallbackMetric(
+        "write_forwarding/peers",
+        Integer.class,
+        new Description("Peers this node may hand writes to").setGauge(),
+        () -> peers.size());
+    metrics.newCallbackMetric(
+        "write_forwarding/cluster_executor",
+        Boolean.class,
+        new Description(
+                "Whether this node is the preferred executor of every write; false unless"
+                    + " walgerrit.placement is cluster")
+            .setGauge(),
+        () -> placement == Placement.CLUSTER && active() && executes(""));
   }
 
   @Nullable
@@ -208,6 +339,81 @@ public class WriteForwarding implements LifecycleListener {
     }
   }
 
+  /** Whether this node hands writes over at all: it has a cluster key and a name. */
+  public boolean active() {
+    return tls != null && !name().isEmpty();
+  }
+
+  public Placement placement() {
+    return placement;
+  }
+
+  /**
+   * Stops answering hellos and hands new writes to peers; returns after {@code
+   * walgerrit.drainOnStop}.
+   */
+  public void drain() {
+    if (!active() || drainMillis <= 0 || draining) {
+      return;
+    }
+    draining = true;
+    logger.atInfo().log(
+        "Write forwarding: node %s is stopping; handing new writes to its peers for %d ms",
+        name(), drainMillis);
+    try {
+      Thread.sleep(drainMillis);
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  /**
+   * Why this node must not be chosen to execute writes, or empty when it may be: it is stopping,
+   * or it cannot reach its store.
+   */
+  public Optional<String> unavailable() {
+    if (draining) {
+      candidateSince = 0;
+      return Optional.of("stopping");
+    }
+    Optional<String> reason;
+    try {
+      reason = health.get();
+    } catch (RuntimeException failure) {
+      logger.atWarning().withCause(failure).log("Cannot tell whether this node reaches its store");
+      reason = Optional.empty();
+    }
+    String now = reason.orElse(null);
+    if (now != null) {
+      candidateSince = 0;
+    }
+    if ((now == null) != (unhealthy == null)) {
+      unhealthy = now;
+      if (now == null) {
+        logger.atInfo().log("Write forwarding: node %s is a candidate again", name());
+      } else {
+        logger.atWarning().log(
+            "Write forwarding: node %s is no candidate and hands its writes to peers: %s",
+            name(), now);
+      }
+    }
+    return reason;
+  }
+
+  /**
+   * Whether this node is the preferred executor of writes to {@code project}: no peer it can reach
+   * ranks above it. Background work that writes runs where this is true.
+   */
+  public boolean executes(String project) {
+    return preferredPeer(placement == Placement.CLUSTER ? WriteEligibility.CLUSTER_KEY : project)
+        .isEmpty();
+  }
+
+  /** The peer that should execute a write ranked by {@code key}, or empty when this node should. */
+  public Optional<Peer> preferredPeer(String key) {
+    return preferredPeer(key, any -> true);
+  }
+
   /** This node's name; empty when it has none, and then it neither forwards nor is a candidate. */
   public String name() {
     try {
@@ -238,14 +444,16 @@ public class WriteForwarding implements LifecycleListener {
   }
 
   /**
-   * The peer that should execute a write to {@code project}, or empty when this node should.
+   * The peer that should execute a write ranked by {@code key}, or empty when this node should.
+   * The key is a {@link WriteEligibility.Decision}'s. A node that is {@linkplain #unavailable() no
+   * candidate} itself chooses the best peer it can reach.
    *
    * <p>The caller must not ask for a write that a peer handed to this node: that one is executed
    * here.
    *
    * @param usable whether the caller's transport has a working link to the peer
    */
-  public Optional<Peer> preferredPeer(String project, Predicate<Peer> usable) {
+  public Optional<Peer> preferredPeer(String key, Predicate<Peer> usable) {
     ImmutableMap<String, Peer> view = peers;
     if (view.isEmpty()) {
       return Optional.empty();
@@ -257,14 +465,38 @@ public class WriteForwarding implements LifecycleListener {
     Peer best = null;
     for (Peer peer : view.values()) {
       if (usable.test(peer)
-          && (best == null || WriteRouter.outranks(project, peer.name(), best.name()))) {
+          && (best == null || WriteRouter.outranks(key, peer.name(), best.name()))) {
         best = peer;
       }
     }
-    if (best == null || !WriteRouter.outranks(project, best.name(), self)) {
+    if (best == null
+        || (!WriteRouter.outranks(key, best.name(), self)
+            && unavailable().isEmpty()
+            && !settling())) {
       return Optional.empty();
     }
     return Optional.of(best);
+  }
+
+  /** Notes that this node answered a peer's hello: that peer now counts its hellos. */
+  public void helloAnswered() {
+    if (candidateSince == 0) {
+      candidateSince = nanoTime.getAsLong() | 1;
+    }
+  }
+
+  /**
+   * Whether to leave writes with peers while they count {@code walgerrit.forwardingJoinProbes}
+   * hellos, so both sides change executor at about the same time.
+   */
+  private boolean settling() {
+    if (joinProbes <= 1) {
+      return false;
+    }
+    long since = candidateSince;
+    return since == 0
+        || nanoTime.getAsLong() - since
+            < (joinProbes - 1) * TimeUnit.MILLISECONDS.toNanos(PROBE_INTERVAL_MILLIS);
   }
 
   /** Stops preferring {@code peer} until it answers a probe again. */
@@ -273,8 +505,9 @@ public class WriteForwarding implements LifecycleListener {
       Map<String, Peer> rest = new LinkedHashMap<>(peers);
       rest.remove(peer.name());
       peers = ImmutableMap.copyOf(rest);
+      answers.remove(peer.name());
       logger.atWarning().log(
-          "Write forwarding: peer %s at %s failed; its projects are written here until it answers",
+          "Write forwarding: peer %s at %s failed; its writes are executed here until it answers",
           peer.name(), peer.httpAuthority());
     }
   }
@@ -282,6 +515,12 @@ public class WriteForwarding implements LifecycleListener {
   /** Counts one write by its transport, {@code ssh} or {@code http}, and how handing it went. */
   public void count(String transport, String outcome) {
     requests.increment(transport, outcome);
+  }
+
+  /** Counts one write that is executed where it arrived, and why it may not be handed over. */
+  public void ineligible(String transport, String reason) {
+    requests.increment(transport, "ineligible");
+    ineligible.increment(transport, reason);
   }
 
   private void probeQuietly() {
@@ -305,11 +544,31 @@ public class WriteForwarding implements LifecycleListener {
         }
       }
     }
+    answers.keySet().retainAll(answered.keySet());
     ImmutableMap<String, Peer> before = peers;
-    ImmutableMap<String, Peer> now = ImmutableMap.copyOf(answered);
+    // A node that is settling leaves its writes to its peers, so it joins them at once.
+    int needed = settling() ? 1 : joinProbes;
+    Map<String, Peer> joined = new LinkedHashMap<>();
+    for (Peer peer : answered.values()) {
+      // A peer that keeps answering stays; one that returns waits for its hellos in a row.
+      int streak = Math.min(joinProbes, answers.getOrDefault(peer.name(), 0) + 1);
+      answers.put(peer.name(), streak);
+      if (streak >= needed || peer.equals(before.get(peer.name()))) {
+        joined.put(peer.name(), peer);
+      }
+    }
+    ImmutableMap<String, Peer> now = ImmutableMap.copyOf(joined);
     peers = now;
     if (!before.equals(now)) {
-      logger.atInfo().log("Write forwarding: node %s has peers %s", self, now.values());
+      logger.atInfo().log(
+          "Write forwarding: node %s has peers %s%s",
+          self,
+          now.values(),
+          placement == Placement.CLUSTER
+              ? "; "
+                  + preferredPeer(WriteEligibility.CLUSTER_KEY).map(Peer::name).orElse(self)
+                  + " executes every write"
+              : "");
     }
   }
 
@@ -333,7 +592,8 @@ public class WriteForwarding implements LifecycleListener {
       connection.setReadTimeout(PROBE_TIMEOUT_MILLIS);
       connection.setUseCaches(false);
       connection.setInstanceFollowRedirects(false);
-      if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
+      if (connection.getResponseCode() != HttpURLConnection.HTTP_OK
+          || !PROTOCOL.equals(connection.getHeaderField(PROTOCOL_HEADER))) {
         return null;
       }
       String body;

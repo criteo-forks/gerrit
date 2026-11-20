@@ -43,6 +43,8 @@ final class WalGerritTestSupport {
   private static final String STORAGE_ENV = "GERRIT_WALGERRIT_STORAGE";
   /** Set to {@code aggressive} to compact after every couple of writes, racing the tests. */
   private static final String COMPACTION_ENV = "GERRIT_WALGERRIT_COMPACTION";
+  /** The value of {@code walgerrit.placement} for every server; unset leaves the default. */
+  private static final String PLACEMENT_ENV = "GERRIT_WALGERRIT_PLACEMENT";
   private static final String DB_MODULE = "dev.walgerrit.WalGitModule";
 
   /**
@@ -110,6 +112,9 @@ final class WalGerritTestSupport {
       // compaction thread, so reads and writes throughout the suite race real compactions.
       cfg.setInt("walgerrit", null, "compactMinPacks", 2);
       cfg.setInt("walgerrit", null, "compactMinReftables", 2);
+    }
+    if (!Strings.isNullOrEmpty(System.getenv(PLACEMENT_ENV))) {
+      cfg.setString("walgerrit", null, "placement", System.getenv(PLACEMENT_ENV));
     }
   }
 

@@ -16,8 +16,10 @@ package com.google.gerrit.httpd;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.google.common.net.InetAddresses;
+import com.google.gerrit.common.Nullable;
 import com.google.gerrit.entities.Account;
 import com.google.gerrit.server.AccessPath;
+import com.google.gerrit.server.WriteEligibility;
 import com.google.gerrit.server.WriteForwarding;
 import com.google.gerrit.server.account.AccountCache;
 import com.google.gerrit.server.config.ThreadSettingsConfig;
@@ -61,8 +63,7 @@ public final class PeerWriteFilter implements Filter {
           "X-Gerrit-Auth",
           "X-Gerrit-RunAs",
           "Forwarded",
-          "X-Forwarded-For",
-          "Origin");
+          "X-Forwarded-For");
   private final WriteForwarding forwarding;
   private final AccountCache accounts;
   private final Provider<WebSession> sessions;
@@ -115,6 +116,13 @@ public final class PeerWriteFilter implements Filter {
     }
     if (hello && req.getMethod().equals("GET")) {
       rsp.setHeader("Cache-Control", "no-store");
+      if (forwarding.unavailable().isPresent()) {
+        // A node that cannot execute writes is nobody's preferred executor.
+        rsp.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+        return;
+      }
+      forwarding.helloAnswered();
+      rsp.setHeader(WriteForwarding.PROTOCOL_HEADER, WriteForwarding.PROTOCOL);
       rsp.setContentType("text/plain");
       rsp.getOutputStream().write(self.getBytes(UTF_8));
       return;
@@ -122,25 +130,12 @@ public final class PeerWriteFilter implements Filter {
     String address = req.getHeader(WriteForwarding.ADDRESS_HEADER);
     String id = req.getHeader(WriteForwarding.ACCOUNT_HEADER);
     boolean nativeReceive = req.getHeader(WriteForwarding.NATIVE_HEADER) != null;
-    if (!self.equals(req.getHeader(WriteForwarding.FORWARDED_HEADER))
-        || CLIENT_AUTH_HEADERS.stream().anyMatch(header -> req.getHeader(header) != null)
-        || WriteForwardingFilter.eligibleProject(req, path) == null
-        || (nativeReceive
-            && !(req.getMethod().equals("POST") && path.endsWith("/git-receive-pack")))
-        || address == null
-        || !InetAddresses.isInetAddress(address)
-        || id == null
-        || !id.matches("[1-9][0-9]{0,9}")) {
-      rsp.sendError(HttpServletResponse.SC_FORBIDDEN);
+    String refusal = refusal(req, path, self, address, id, nativeReceive);
+    if (refusal != null) {
+      refuse(rsp, refusal);
       return;
     }
-    Account.Id account;
-    try {
-      account = Account.id(Integer.parseInt(id));
-    } catch (NumberFormatException invalid) {
-      rsp.sendError(HttpServletResponse.SC_FORBIDDEN);
-      return;
-    }
+    Account.Id account = Account.id(Integer.parseInt(id));
 
     boolean first = req.getAttribute(PERMIT) == null;
     if (first && !inbound.tryAcquire()) {
@@ -153,16 +148,14 @@ public final class PeerWriteFilter implements Filter {
     req.setAttribute(PERMIT, permit);
     try {
       if (accounts.get(account).filter(state -> state.account().isActive()).isEmpty()) {
-        rsp.sendError(HttpServletResponse.SC_FORBIDDEN);
+        refuse(rsp, "account");
         return;
       }
       req.setAttribute(CLIENT_ADDRESS, address);
       WebSession session = sessions.get();
       session.setUserAccountId(account);
       session.setAccessPathOk(
-          WriteForwardingFilter.gitWrite(req.getMethod(), path)
-              ? AccessPath.GIT
-              : AccessPath.REST_API,
+          WriteEligibility.gitWrite(req.getMethod(), path) ? AccessPath.GIT : AccessPath.REST_API,
           true);
       chain.doFilter(
           new HttpServletRequestWrapper(req) {
@@ -197,6 +190,53 @@ public final class PeerWriteFilter implements Filter {
         permit.release();
       }
     }
+  }
+
+  /** Why this node does not execute the request for its peer, or null when it does. */
+  @Nullable
+  private String refusal(
+      HttpServletRequest req,
+      String path,
+      String self,
+      @Nullable String address,
+      @Nullable String id,
+      boolean nativeReceive) {
+    if (!self.equals(req.getHeader(WriteForwarding.FORWARDED_HEADER))) {
+      return "destination";
+    }
+    if (CLIENT_AUTH_HEADERS.stream().anyMatch(header -> req.getHeader(header) != null)) {
+      return "credentials";
+    }
+    if (forwarding.unavailable().isPresent()) {
+      // The entry node saw this node before it stopped being a candidate.
+      return "unavailable";
+    }
+    if (!WriteForwardingFilter.eligibility(forwarding, req, path).eligible()
+        || (nativeReceive
+            && !(req.getMethod().equals("POST") && path.endsWith("/git-receive-pack")))) {
+      return "ineligible";
+    }
+    if (address == null
+        || !InetAddresses.isInetAddress(address)
+        || id == null
+        || !id.matches("[1-9][0-9]{0,9}")) {
+      return "identity";
+    }
+    try {
+      Integer.parseInt(id);
+    } catch (NumberFormatException tooLarge) {
+      return "identity";
+    }
+    return null;
+  }
+
+  /**
+   * Refuses before execution or body consumption so entry can decide whether to execute. See
+   * {@link WriteForwarding#executedAtEntry}.
+   */
+  private static void refuse(HttpServletResponse rsp, String reason) throws IOException {
+    rsp.setHeader(WriteForwarding.REFUSED_HEADER, reason);
+    rsp.sendError(HttpServletResponse.SC_FORBIDDEN);
   }
 
   private final class Permit implements AsyncListener {

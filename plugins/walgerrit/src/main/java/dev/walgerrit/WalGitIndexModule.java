@@ -86,6 +86,7 @@ public final class WalGitIndexModule extends LifecycleModule {
     OptionalBinder.newOptionalBinder(binder(), WRITE_FORWARDING_PEERS)
         .setBinding()
         .to(WritePeers.class);
+    bind(WriteRole.class).asEagerSingleton();
     // What this node does travels in the WAL to the other nodes' tailers: the events it fires and
     // the documents it reindexes with no ref update behind them.
     DynamicSet.bind(binder(), EventListener.class).to(WalJournal.class);

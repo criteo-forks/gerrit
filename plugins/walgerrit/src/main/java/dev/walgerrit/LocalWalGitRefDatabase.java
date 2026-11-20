@@ -255,7 +255,11 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
               nodeLock.unlock();
             }
           }
-          if (!objectDatabase.refTransactionConflicted() || attempt >= MAX_ATTEMPTS) {
+          if (!objectDatabase.refTransactionConflicted()) {
+            return;
+          }
+          objectDatabase.manifestStore().conflicted();
+          if (attempt >= MAX_ATTEMPTS) {
             return;
           }
         } catch (IOException exception) {

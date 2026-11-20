@@ -27,7 +27,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.stream.IntStream;
 import org.eclipse.jgit.lib.Config;
 import org.junit.After;
 import org.junit.Before;
@@ -166,11 +171,188 @@ public class WriteForwardingTest {
         new WriteForwarding(
             () -> "gerrit-0",
             () -> List.of("127.0.0.1"),
+            Optional::empty,
             config,
             GerritRuntime.DAEMON,
             new DisabledMetricMaker());
     node.probe();
     assertThat(names(node.peers())).containsExactly("gerrit-1");
+  }
+
+  @Test
+  public void withAClusterPlacementEveryNodeChoosesTheSameExecutorForEveryWrite() {
+    Config cluster = FakePeer.config();
+    cluster.setString("walgerrit", null, "placement", "cluster");
+    Set<String> executors = new HashSet<>();
+    List<WriteForwarding> nodes = new ArrayList<>();
+    for (String name : NAMES) {
+      WriteForwarding node = node(name, addresses, Optional::empty, cluster);
+      node.probe();
+      nodes.add(node);
+      for (String project : PROJECTS) {
+        String key = WriteEligibility.sshReceivePack(node.placement(), project).key();
+        executors.add(node.preferredPeer(key).map(Peer::name).orElse(name));
+      }
+    }
+    assertThat(executors).hasSize(1);
+    String executor = executors.iterator().next();
+    for (int i = 0; i < NAMES.size(); i++) {
+      for (String project : PROJECTS) {
+        assertThat(nodes.get(i).executes(project)).isEqualTo(NAMES.get(i).equals(executor));
+      }
+    }
+  }
+
+  @Test
+  public void withAProjectPlacementANodeExecutesTheProjectsItRanksFirst() {
+    WriteForwarding node = probed("gerrit-0");
+    for (String project : PROJECTS) {
+      assertThat(node.executes(project))
+          .isEqualTo(node.preferredPeer(project, any -> true).isEmpty());
+    }
+    assertThat(node(NAMES.get(0), List.of()).executes("a")).isTrue();
+  }
+
+  @Test
+  public void aNodeCutOffFromItsStoreHandsItsWritesToThePeersItReaches() {
+    AtomicReference<Optional<String>> health = new AtomicReference<>(Optional.empty());
+    for (String name : NAMES) {
+      WriteForwarding node = node(name, addresses, health::get, FakePeer.config());
+      node.probe();
+      for (String project : PROJECTS) {
+        health.set(Optional.empty());
+        Optional<Peer> healthy = node.preferredPeer(project, any -> true);
+        health.set(Optional.of("the store has not answered for 12 s"));
+        Optional<Peer> cutOff = node.preferredPeer(project, any -> true);
+        assertThat(cutOff).isPresent();
+        assertThat(node.executes(project)).isFalse();
+        if (healthy.isPresent()) {
+          assertThat(cutOff).isEqualTo(healthy);
+        }
+        // With nobody to hand it to, the write is still executed here.
+        assertThat(node.preferredPeer(project, any -> false)).isEmpty();
+      }
+    }
+  }
+
+  @Test
+  public void aStoppingNodeHandsItsWritesToItsPeersForItsDrainTime() {
+    Config config = FakePeer.config();
+    config.setString("walgerrit", null, "drainOnStop", "200 ms");
+    WriteForwarding node = node("gerrit-0", addresses, Optional::empty, config);
+    node.probe();
+    String own = ownProject(node);
+    assertThat(node.unavailable()).isEmpty();
+
+    long started = System.nanoTime();
+    node.drain();
+
+    assertThat(System.nanoTime() - started).isAtLeast(200_000_000L);
+    assertThat(node.unavailable()).hasValue("stopping");
+    assertThat(node.executes(own)).isFalse();
+    assertThat(node.preferredPeer(own)).isPresent();
+  }
+
+  @Test
+  public void withoutADrainTimeAStoppingNodeKeepsItsWrites() {
+    WriteForwarding node = node("gerrit-0", addresses, Optional::empty, FakePeer.config());
+    node.probe();
+    String own = ownProject(node);
+
+    node.drain();
+
+    assertThat(node.unavailable()).isEmpty();
+    assertThat(node.executes(own)).isTrue();
+  }
+
+  @Test
+  public void aReturningNodeLeavesItsWritesToItsPeersUntilTheyHaveCountedItsHellos() {
+    Config config = FakePeer.config();
+    config.setInt("walgerrit", null, "forwardingJoinProbes", 3);
+    AtomicLong clock = new AtomicLong(1);
+    WriteForwarding node =
+        new WriteForwarding(
+            () -> "gerrit-0",
+            () -> addresses,
+            Optional::empty,
+            config,
+            GerritRuntime.DAEMON,
+            new DisabledMetricMaker(),
+            clock::get);
+
+    node.probe();
+
+    assertThat(names(node.peers())).containsExactly("gerrit-1", "gerrit-2", "gerrit-3");
+    for (int i = 0; i < 100; i++) {
+      assertThat(node.executes("project-" + i)).isFalse();
+    }
+
+    // Its peers hand it writes after three hellos, two probe intervals after the first.
+    node.helloAnswered();
+    clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(1500));
+    node.probe();
+    for (int i = 0; i < 100; i++) {
+      assertThat(node.executes("project-" + i)).isFalse();
+    }
+    clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(500));
+    node.probe();
+
+    assertThat(names(node.peers())).containsExactly("gerrit-1", "gerrit-2", "gerrit-3");
+    assertThat(ownProject(node)).isNotEmpty();
+  }
+
+  /** A node whose peers have counted its hellos. */
+  private WriteForwarding settled(String name, Config config, AtomicLong clock) {
+    WriteForwarding node =
+        new WriteForwarding(
+            () -> name,
+            () -> addresses,
+            Optional::empty,
+            config,
+            GerritRuntime.DAEMON,
+            new DisabledMetricMaker(),
+            clock::get);
+    node.helloAnswered();
+    clock.addAndGet(TimeUnit.HOURS.toNanos(1));
+    return node;
+  }
+
+  private static String ownProject(WriteForwarding node) {
+    return IntStream.range(0, 1000)
+        .mapToObj(i -> "project-" + i)
+        .filter(node::executes)
+        .findFirst()
+        .orElseThrow();
+  }
+
+  @Test
+  public void aNodeOnlyJoinsNodesThatApplyItsHandOverRules() {
+    hellos.get(1).helloWithoutProtocol();
+    assertThat(names(probed("gerrit-0").peers())).containsExactly("gerrit-2", "gerrit-3");
+  }
+
+  @Test
+  public void aReturningPeerJoinsAfterItsHellosInARow() throws Exception {
+    Config config = FakePeer.config();
+    config.setInt("walgerrit", null, "forwardingJoinProbes", 3);
+    AtomicLong clock = new AtomicLong(1);
+    WriteForwarding node = settled("gerrit-0", config, clock);
+    node.probe();
+    node.probe();
+    assertThat(node.peers()).isEmpty();
+    hellos.get(1).hello(503, "");
+    node.probe();
+    assertThat(names(node.peers())).containsExactly("gerrit-2", "gerrit-3");
+    hellos.get(1).hello(200, NAMES.get(1));
+    node.probe();
+    node.probe();
+    assertThat(names(node.peers())).containsExactly("gerrit-2", "gerrit-3");
+    node.probe();
+    assertThat(names(node.peers())).containsExactly("gerrit-1", "gerrit-2", "gerrit-3");
+    Peer failed = node.peers().iterator().next();
+    node.failed(failed);
+    node.probe();
+    assertThat(names(node.peers())).doesNotContain(failed.name());
   }
 
   @Test
@@ -195,6 +377,7 @@ public class WriteForwardingTest {
           new WriteForwarding(
               () -> NAMES.get(0),
               () -> addresses,
+              Optional::empty,
               config,
               GerritRuntime.DAEMON,
               new DisabledMetricMaker());
@@ -210,12 +393,13 @@ public class WriteForwardingTest {
   }
 
   private static WriteForwarding node(String name, List<String> addresses) {
+    return node(name, addresses, Optional::empty, FakePeer.config());
+  }
+
+  private static WriteForwarding node(
+      String name, List<String> addresses, Supplier<Optional<String>> health, Config config) {
     return new WriteForwarding(
-        () -> name,
-        () -> addresses,
-        FakePeer.config(),
-        GerritRuntime.DAEMON,
-        new DisabledMetricMaker());
+        () -> name, () -> addresses, health, config, GerritRuntime.DAEMON, new DisabledMetricMaker());
   }
 
   private static String executor(

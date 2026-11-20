@@ -160,17 +160,20 @@ Conditional reads and index sweeps still discover writes after missed hints. Dup
 unsigned forged hints can trigger extra reads and queued work. See
 [Peer wake-ups](docs/gossip.md) for authentication, metrics and failure behavior.
 
-## Project write placement
+## Write placement
 
-Every pod remains writable. The entry pod authenticates the client and can hand a project's
-write to the preferred pod over mutual TLS. SSH receive-pack, smart HTTP pushes and eligible
-project-qualified REST writes use the same private HTTPS listener.
+Every pod remains writable. The entry pod authenticates the client and can hand a write to the
+preferred pod over mutual TLS: one pod per project, or one pod for every write. SSH
+receive-pack, smart HTTP pushes and eligible REST writes use the same private HTTPS listener.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `forwardWrites` | `true` | Enable forwarding when a membership key and a peer source are configured. |
 | `forwardingSecret` | unset | Dedicated cluster key in `secure.config`, Base64 encoding of 32 random bytes. |
 | `forwardingPort` | `9443` | Pod-to-pod HTTPS listener. |
+| `placement` | `project` | `project` ranks the pods per project; `cluster` places every write on one pod. |
+| `forwardingJoinProbes` | `1` | Consecutive hellos a peer must answer before it is handed writes. |
+| `drainOnStop` | `0` | How long a stopping pod hands its writes to peers before it stops serving. |
 
 Use a separate SSH host key per pod and set `sshd.enablePeerDaemon = false` for this deployment.
 See the routing rules, compatibility limits and failure outcomes in [Write forwarding](docs/forwarding.md).
@@ -242,6 +245,9 @@ and with the storage and index modules together.
 BAZEL_TEST_FLAGS='--test_env=GERRIT_WALGERRIT_COMPACTION=aggressive' \
   plugins/walgerrit/scripts/acceptance-tests.sh
 ```
+
+`--test_env=GERRIT_WALGERRIT_PLACEMENT=cluster` runs every server with that
+`walgerrit.placement`.
 
 `@UseLocalDisk` tests retain their requested filesystem backend. Tests that assert on
 `InMemoryRepositoryManager` instrumentation need separate interpretation: these include
