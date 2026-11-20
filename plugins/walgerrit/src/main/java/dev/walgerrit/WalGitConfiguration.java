@@ -125,16 +125,13 @@ record WalGitConfiguration(
   /** Packs above this size are never rewritten by compaction. */
   static final long DEFAULT_COMPACT_MAX_PACK_SIZE = 8L << 30;
 
-  /** Reftable stack depth at which the whole stack is compacted into one table. */
+  /** Minimum stack depth for merging reftables. */
   static final int DEFAULT_COMPACT_MIN_REFTABLES = 8;
 
-  /**
-   * Reftables up to this size are merged with every new table above them; larger ones are left as
-   * bases.
-   */
-  static final long DEFAULT_COMPACT_SMALL_REFTABLE_SIZE = 8L << 20;
+  /** Compacted tables up to this size can join a merge regardless of the bytes above them. */
+  static final long DEFAULT_COMPACT_SMALL_REFTABLE_SIZE = 64L << 10;
 
-  /** Stack depth at which even the large base tables are merged into one. */
+  /** Depth that forces a merge to at most half as many tables. */
   static final int DEFAULT_COMPACT_MAX_REFTABLES = 32;
 
   /** How long one node's compaction lease on a repository lasts without renewal. */

@@ -34,8 +34,16 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 import org.eclipse.jgit.internal.storage.dfs.DfsPackCompactor;
@@ -48,11 +56,14 @@ import org.eclipse.jgit.lib.NullProgressMonitor;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.RefUpdate;
+import org.eclipse.jgit.lib.ReflogEntry;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.ReceiveCommand;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Compaction is representation only: after any pass, every object and every ref a repository had
@@ -206,6 +217,237 @@ class CompactorTest {
       ObjectId later = publish(repository, head("later"), "after compaction");
       assertEquals(later, repository.exactRef(head("later")).getObjectId());
       assertNotNull(repository.exactRef(head("batch0-0")));
+    }
+  }
+
+  @Test
+  void sustainedSmallUpdatesAboveALargeBase() throws Exception {
+    FileObjectStore shared = new FileObjectStore(root.resolve("store"));
+    AtomicLong uploaded = new AtomicLong();
+    ObjectStore store =
+        new ManifestReadCountTest.CountingObjectStore(shared) {
+          @Override
+          public void uploadIfAbsent(String key, Path file) throws IOException {
+            super.uploadIfAbsent(key, file);
+            if (key.endsWith(".ref")) {
+              uploaded.addAndGet(Files.size(file));
+            }
+          }
+        };
+    WalGitRepositoryManager node =
+        node("writer", store, config -> config.unset("walgerrit", null, "compactMinReftables"));
+    ObjectId tip;
+    Random random = new Random(42);
+    byte[] key = new byte[Constants.OBJECT_ID_LENGTH];
+    try (Repository repo = node.createRepository(PROJECT)) {
+      tip = WalGitRepositoryManagerTest.insertCommit(repo, "seed");
+      // HEAD and seven standalone transactions seed one compacted table.
+      for (int batch = 0; batch < 7; batch++) {
+        BatchRefUpdate update = repo.getRefDatabase().newBatchUpdate();
+        update.disableRefLog();
+        for (int i = 0; i < 9_000; i++) {
+          random.nextBytes(key);
+          String ref = "refs/cache-automerge/" + ObjectId.fromRaw(key).name();
+          update.addCommand(new ReceiveCommand(ObjectId.zeroId(), tip, ref));
+        }
+        try (RevWalk walk = new RevWalk(repo)) {
+          update.execute(walk, NullProgressMonitor.INSTANCE);
+        }
+        for (ReceiveCommand command : update.getCommands()) {
+          assertEquals(ReceiveCommand.Result.OK, command.getResult());
+        }
+      }
+    }
+    assertEquals(Outcome.COMPACTED, node.compactor().compact(PROJECT));
+    List<PackRef> stack = CompactionPolicy.reftableStack(manifest(node));
+    assertEquals(1, stack.size());
+    long baseBytes = CompactionPolicy.reftableSize(stack.getFirst());
+    assertTrue(baseBytes >= 3_000_000 && baseBytes < 5_000_000, "base bytes " + baseBytes);
+
+    AtomicLong downloaded = new AtomicLong();
+    ObjectStore peerStore =
+        new ManifestReadCountTest.CountingObjectStore(shared) {
+          @Override
+          public void download(String key, Path file) throws IOException {
+            super.download(key, file);
+            if (key.endsWith(".ref")) {
+              downloaded.addAndGet(Files.size(file));
+            }
+          }
+        };
+    WalGitRepositoryManager peer = node("peer", peerStore, ignored -> {});
+    String baseRef = "refs/cache-automerge/" + ObjectId.fromRaw(key).name();
+    long compactedBytes = 0;
+    int baseRewrites = 0;
+    int compactions = 0;
+    int peakDepth = 0;
+    // Disjoint in-flight work keeps each single-ref publication in its own table.
+    GroupPublisher.Admission other =
+        node.manifestStore(PROJECT).publisher().admit(Set.of(head("busy")));
+    // JGit's JVM-wide block cache is keyed by repository name.
+    try (Repository repo = node.openRepository(PROJECT);
+        Repository reader = peer.openById(peer.idOf(PROJECT), Project.nameKey("peer-view"), 0)) {
+      assertEquals(tip, reader.exactRef(baseRef).getObjectId());
+      assertEquals(baseBytes, downloaded.getAndSet(0), "the peer warmed the base once");
+      for (int i = 0; i < 112; i++) {
+        RefUpdate update = repo.updateRef(head("user-" + i));
+        update.setNewObjectId(tip);
+        update.disableRefLog();
+        assertEquals(RefUpdate.Result.NEW, update.update());
+        Manifest before = manifest(node);
+        peakDepth = Math.max(peakDepth, reftables(before).size());
+        if (node.compactor().policy().reftablesToMerge(before).isEmpty()) {
+          continue;
+        }
+        String base = CompactionPolicy.reftableStack(before).getFirst().getName();
+        long start = uploaded.get();
+        assertEquals(Outcome.COMPACTED, node.compactor().compact(PROJECT));
+        compactedBytes += uploaded.get() - start;
+        compactions++;
+        reader.scanForRepoChanges();
+        assertEquals(tip, reader.exactRef(head("user-" + i)).getObjectId());
+        assertEquals(tip, reader.exactRef(baseRef).getObjectId());
+        stack = CompactionPolicy.reftableStack(manifest(node));
+        if (!base.equals(stack.getFirst().getName())) {
+          baseRewrites++;
+        }
+      }
+    } finally {
+      other.release();
+    }
+    System.out.printf(
+        "Base %d bytes, %d compactions, %d base rewrites, %d bytes uploaded, "
+            + "%d bytes downloaded by the warm peer, peak depth %d%n",
+        baseBytes, compactions, baseRewrites, compactedBytes, downloaded.get(), peakDepth);
+    assertTrue(compactions > 1);
+    assertEquals(0, baseRewrites);
+    assertTrue(compactedBytes < baseBytes / 10);
+    assertEquals(compactedBytes, downloaded.get());
+    assertTrue(peakDepth <= node.configuration().compactMinReftables());
+    assertEquals(112, allRefs(peer).size());
+  }
+
+  @ParameterizedTest(name = "concurrent writer on compacting node = {0}")
+  @ValueSource(booleans = {true, false})
+  void concurrentUpdatesAndDeletesSurviveAPartialMerge(boolean local) throws Exception {
+    FileObjectStore shared = new FileObjectStore(root.resolve("store"));
+    Consumer<Config> settings =
+        config -> {
+          config.setInt("walgerrit", null, "compactMinReftables", 4);
+          config.setInt("walgerrit", null, "compactMaxReftables", 4);
+          config.setLong("walgerrit", null, "compactSmallReftableSize", 1);
+        };
+    WalGitRepositoryManager seed = node("seed", shared, settings);
+    Map<String, ObjectId> expected = new TreeMap<>();
+    String watched = head("watched");
+    ObjectId first;
+    ObjectId second;
+    try (Repository repo = seed.createRepository(PROJECT)) {
+      first = WalGitRepositoryManagerTest.insertCommit(repo, "first");
+      second = WalGitRepositoryManagerTest.insertCommit(repo, "second");
+      for (int batch = 0; batch < 3; batch++) {
+        ReceiveCommand[] commands = new ReceiveCommand[STANDALONE_TABLE_REFS];
+        for (int i = 0; i < commands.length; i++) {
+          String ref = head("batch" + batch + "-" + i);
+          commands[i] = new ReceiveCommand(ObjectId.zeroId(), first, ref);
+          expected.put(ref, first);
+        }
+        writeRefs(repo, "seed", commands);
+      }
+      writeRefs(repo, "create", new ReceiveCommand(ObjectId.zeroId(), first, watched));
+      expected.put(watched, first);
+    }
+    assertEquals(Outcome.COMPACTED, seed.compactor().compact(PROJECT));
+    List<PackRef> bases = reftables(manifest(seed));
+    assertEquals(1, bases.size());
+    PackRef base = bases.getFirst();
+
+    GroupPublisher.Admission other =
+        seed.manifestStore(PROJECT).publisher().admit(Set.of(head("busy")));
+    try (Repository repo = seed.openRepository(PROJECT)) {
+      writeRefs(repo, "retarget", new ReceiveCommand(first, second, watched));
+      expected.put(watched, second);
+      String doomed = head("batch0-1");
+      writeRefs(
+          repo, "delete", new ReceiveCommand(expected.remove(doomed), ObjectId.zeroId(), doomed));
+      String added = head("added");
+      writeRefs(repo, "add", new ReceiveCommand(ObjectId.zeroId(), first, added));
+      expected.put(added, first);
+    } finally {
+      other.release();
+    }
+    List<PackRef> plannedStack = CompactionPolicy.reftableStack(manifest(seed));
+    assertEquals(4, plannedStack.size());
+    PackRef top = plannedStack.getLast();
+    CompletableFuture<String> firstUpload = new CompletableFuture<>();
+    CountDownLatch resume = new CountDownLatch(1);
+    ObjectStore gated =
+        new ManifestReadCountTest.CountingObjectStore(shared) {
+          @Override
+          public void uploadIfAbsent(String key, Path source) throws IOException {
+            super.uploadIfAbsent(key, source);
+            if (key.endsWith(".ref") && firstUpload.complete(key)) {
+              try {
+                assertTrue(resume.await(15, TimeUnit.SECONDS));
+              } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException(interrupted);
+              }
+            }
+          }
+        };
+    WalGitRepositoryManager compactor = node("compactor", gated, settings);
+    WalGitRepositoryManager writer = local ? compactor : seed;
+    ExecutorService background = Executors.newSingleThreadExecutor();
+    String output;
+    try {
+      Future<Outcome> merge = background.submit(() -> compactor.compactor().compact(PROJECT));
+      output = Path.of(firstUpload.get(15, TimeUnit.SECONDS)).getFileName().toString();
+      try (Repository repo = writer.openRepository(PROJECT)) {
+        String doomed = head("batch2-1");
+        writeRefs(
+            repo,
+            "during",
+            new ReceiveCommand(second, first, watched),
+            new ReceiveCommand(expected.remove(doomed), ObjectId.zeroId(), doomed));
+        expected.put(watched, first);
+      }
+      assertEquals(local, reftables(manifest(writer)).contains(top), "local append or remote fold");
+      resume.countDown();
+      assertEquals(Outcome.COMPACTED, merge.get(15, TimeUnit.SECONDS));
+    } finally {
+      resume.countDown();
+      background.shutdownNow();
+    }
+    Manifest after = manifest(compactor);
+    assertTrue(reftables(after).contains(base));
+    assertEquals(local ? 3 : 2, reftables(after).size());
+    assertEquals(
+        local,
+        ManifestStore.liveFileNames(after).contains(output),
+        "a folded input invalidates the uploaded output");
+    WalGitRepositoryManager peer = node("failover", shared, settings);
+    assertEquals(expected, allRefs(peer));
+    try (Repository reader = peer.openRepository(PROJECT)) {
+      assertEquals(
+          List.of("during", "retarget", "create"),
+          reader.getRefDatabase().getReflogReader(watched).getReverseEntries().stream()
+              .map(ReflogEntry::getComment)
+              .toList());
+    }
+  }
+
+  private static void writeRefs(Repository repository, String message, ReceiveCommand... commands)
+      throws IOException {
+    BatchRefUpdate update = repository.getRefDatabase().newBatchUpdate();
+    update.setAllowNonFastForwards(true);
+    update.setRefLogMessage(message, false);
+    update.addCommand(commands);
+    try (RevWalk walk = new RevWalk(repository)) {
+      update.execute(walk, NullProgressMonitor.INSTANCE);
+    }
+    for (ReceiveCommand command : commands) {
+      assertEquals(ReceiveCommand.Result.OK, command.getResult(), command.getRefName());
     }
   }
 

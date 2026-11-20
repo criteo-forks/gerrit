@@ -116,9 +116,9 @@ class CompactionPolicyTest {
       stack.add(reftable("txn-" + i, "INSERT", 200, 12 + i));
     }
     List<String> names = tiered.plan(manifest(stack)).reftables();
-    assertEquals(8, names.size());
+    assertEquals(9, names.size());
     assertTrue(names.contains("import"), "a transaction table left beneath the merge would shadow it");
-    assertFalse(names.contains("base"));
+    assertTrue(names.contains("base"), "the import is larger than the base");
   }
 
   @Test
@@ -131,6 +131,46 @@ class CompactionPolicyTest {
     assertEquals(4, tiered.plan(manifest(stack)).reftables().size());
     stack.remove(3);
     assertTrue(tiered.plan(manifest(stack)).reftables().isEmpty(), "three large bases are left alone");
+  }
+
+  @Test
+  void includesEachLargeTierOnlyWhenTheSuffixReachesHalfItsSize() {
+    CompactionPolicy tiered = new CompactionPolicy(8, 2, 1L << 30, 3, 100, 8);
+    List<PackRef> stack = new java.util.ArrayList<>();
+    stack.add(reftable("base", "COMPACT", 9001, 1));
+    stack.add(reftable("upper", "COMPACT", 3001, 2));
+    stack.add(reftable("write", "RECEIVE", 1500, 3));
+    assertTrue(tiered.reftablesToMerge(manifest(stack)).isEmpty());
+    stack.set(2, reftable("write", "RECEIVE", 1501, 3));
+    assertEquals(List.of("base", "upper", "write"), tiered.reftablesToMerge(manifest(stack)));
+    stack.set(0, reftable("base", "COMPACT", 9005, 1));
+    assertEquals(List.of("upper", "write"), tiered.reftablesToMerge(manifest(stack)));
+  }
+
+  @Test
+  void depthPressureMergesEnoughUpperTiersToLeaveRoomForWrites() {
+    CompactionPolicy tiered = new CompactionPolicy(8, 2, 1L << 30, 3, 100, 4);
+    List<PackRef> stack =
+        List.of(
+            reftable("base", "COMPACT", 500_000, 1),
+            reftable("upper", "COMPACT", 50_000, 2),
+            reftable("top", "COMPACT", 5000, 3),
+            reftable("write", "INSERT", 500, 4));
+    assertTrue(tiered.reftablesToMerge(manifest(stack.subList(0, 3))).isEmpty());
+    assertEquals(List.of("upper", "top", "write"), tiered.reftablesToMerge(manifest(stack)));
+    CompactionPolicy two = new CompactionPolicy(8, 2, 1L << 30, 2, 100, 2);
+    assertEquals(List.of("base", "upper"), two.reftablesToMerge(manifest(stack.subList(0, 2))));
+  }
+
+  @Test
+  void aRetainedCompactedTableMustSortStrictlyBelowTheOutput() {
+    CompactionPolicy tiered = new CompactionPolicy(8, 2, 1L << 30, 3, 100, 8);
+    List<PackRef> stack =
+        List.of(
+            reftable("base", "COMPACT", 5_000_000, 7),
+            reftable("first", "INSERT", 100, 7),
+            reftable("second", "INSERT", 100, 7));
+    assertEquals(List.of("base", "first", "second"), tiered.reftablesToMerge(manifest(stack)));
   }
 
   private static Manifest manifest(List<PackRef> packs) {

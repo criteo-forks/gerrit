@@ -30,13 +30,8 @@ import java.util.Set;
  * at least {@code minPacks} of them are involved; packs above {@code maxPackSize} are never
  * rewritten.
  *
- * <p>Reftables are merged from the top of the stack down. Every table a ref transaction wrote
- * ({@code INSERT} or {@code RECEIVE}) is included, together with the {@code COMPACT} tables directly
- * beneath them that are no larger than {@code smallReftableSize}; a large compacted table stays as a
- * base. That respects the order JGit derives for the stack, in which compacted tables always sort
- * below transaction tables: a merge that left a transaction table underneath its own output would
- * let stale values shadow newer ones. The merge runs once {@code minReftables} tables qualify, and
- * once the whole stack is {@code maxReftables} deep the bases are merged too.
+ * <p>Compacted output sorts below transaction tables, so the merged suffix must include them all.
+ * Larger compacted tables stay until bytes above, stack depth or ordering require their inclusion.
  */
 record CompactionPolicy(
     int minPacks,
@@ -99,20 +94,34 @@ record CompactionPolicy(
   /** The reftables one pass merges, in stack order; empty when the stack is shallow enough. */
   List<String> reftablesToMerge(Manifest manifest) {
     List<PackRef> stack = reftableStack(manifest);
-    if (stack.size() >= maxReftables) {
-      return stack.stream().map(PackRef::getName).toList();
+    int depth = stack.size();
+    if (depth < minReftables && depth < maxReftables) {
+      return List.of();
     }
-    int from = stack.size();
+
+    // Under depth pressure, leave room for another half-stack of appends.
+    int maxRetained = depth >= maxReftables ? maxReftables / 2 - 1 : depth;
+    int from = depth - 1;
+    long upperBytes = reftableSize(stack.get(from));
+    long maxIndex = stack.get(from).getMaxUpdateIndex();
     while (from > 0) {
-      PackRef table = stack.get(from - 1);
-      if (!TRANSACTION_SOURCES.contains(table.getSource())
-          && reftableSize(table) > smallReftableSize) {
+      PackRef lower = stack.get(from - 1);
+      long bytes = reftableSize(lower);
+      // Include update-index ties so modification time cannot reorder the output.
+      if (from <= maxRetained
+          && !TRANSACTION_SOURCES.contains(lower.getSource())
+          && lower.getMaxUpdateIndex() < maxIndex
+          && bytes > smallReftableSize
+          && upperBytes < Math.ceilDiv(bytes, 2)) {
         break;
       }
+      upperBytes += bytes;
+      maxIndex = Math.max(maxIndex, lower.getMaxUpdateIndex());
       from--;
     }
-    List<PackRef> top = stack.subList(from, stack.size());
-    return top.size() >= minReftables ? top.stream().map(PackRef::getName).toList() : List.of();
+    return depth - from >= 2
+        ? stack.subList(from, depth).stream().map(PackRef::getName).toList()
+        : List.of();
   }
 
   /**
@@ -129,7 +138,6 @@ record CompactionPolicy(
     tables.sort(
         Comparator.comparingInt((PackRef pack) -> TRANSACTION_SOURCES.contains(pack.getSource()) ? 1 : 0)
             .thenComparingLong(PackRef::getMaxUpdateIndex)
-            .thenComparingLong(PackRef::getMinUpdateIndex)
             .thenComparingLong(PackRef::getLastModifiedEpochMillis));
     return tables;
   }

@@ -41,7 +41,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * This node's compactor: rewrites a repository's small packs into larger ones and its reftable
- * stack into one table, publishing each result as one add-and-supersede manifest transaction.
+ * stack in contiguous runs, publishing each result as one add-and-supersede manifest transaction.
  *
  * <p>The node that writes compacts. After every publication the policy is evaluated on the new
  * manifest, and a repository whose packs are due is queued for one compaction at a time on a
@@ -307,6 +307,8 @@ final class Compactor {
       compactor.add(table);
     }
     long started = System.nanoTime();
+    // An admission with no ref names keeps local writers appending throughout the rewrite.
+    GroupPublisher.Admission admission = repository.manifestStore().publisher().admit(Set.of());
     try {
       compactor.compact(NullProgressMonitor.INSTANCE);
     } catch (StaleCompactionInputException lost) {
@@ -315,6 +317,8 @@ final class Compactor {
           repository.getDescription().getRepositoryName(),
           lost.getMessage());
       return false;
+    } finally {
+      admission.release();
     }
     logger.info(
         "WalGerrit compacted {} of the {} reftables of {} into one table in {} ms",

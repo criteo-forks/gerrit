@@ -191,9 +191,8 @@ final class LocalWalGitRefDatabase extends DfsReftableDatabase {
 
   /**
    * JGit folds a small transaction into the small table on top of the stack instead of deepening
-   * it. Two concurrent transactions on this node would both fold the same table, so folding is only
-   * allowed while this transaction is the only one in flight; otherwise the stack deepens by one
-   * and the compactor merges it later.
+   * it. A writer appends during another local transaction or a local reftable rewrite, so neither
+   * retires the other's input.
    */
   @Override
   protected boolean compactDuringCommit() {

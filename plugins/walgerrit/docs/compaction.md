@@ -15,14 +15,17 @@ size would crowd the next pack. It merges that prefix only when at least `compac
 `compactMaxPackSize` (default `8g`) are excluded. That cap applies to inputs only; the merged
 pack may be larger, and the result need not satisfy the factor at every step.
 
-Reftables merge from the top down. Transaction tables and the small compacted tables directly
-beneath them qualify once `compactMinReftables` (default `8`) accumulate. A compacted table larger
-than `compactSmallReftableSize` (default `8m`) remains a base until the whole stack reaches
-`compactMaxReftables` (default `32`), when all tables merge. Deletions must survive the merge so
-older values cannot reappear.
+At `compactMinReftables` tables (default `8`), the compactor selects from the top: all transaction
+tables, then compacted tables up to `compactSmallReftableSize` (default `64k`). Larger tables join
+when selected bytes above them reach half their size. Update-index ties join so the output sorts
+above retained compacted tables. A merge needs at least two inputs.
 
-JGit may also fold a small ref update into the top table during commit. WalGerrit allows that
-only while the transaction is alone on its node; concurrent transactions extend the stack.
+At `compactMaxReftables` tables (default `32`), a merge leaves at most half that depth in its plan,
+including the base only if needed. Writers can append during a pass; merges preserve deletions and
+reflogs across table boundaries.
+
+JGit may fold a small ref update into the top table while the transaction is alone on its node.
+During a local reftable rewrite, new ref transactions append.
 
 ## Publication preserves concurrent work
 
@@ -123,9 +126,9 @@ All keys below belong to `[walgerrit]` except `core.dfs.blockLimit`.
 | `compactMinPacks` | `8` | Minimum selected object packs to merge. |
 | `compactGeometricFactor` | `2` | Factor used to select a geometric pack prefix. |
 | `compactMaxPackSize` | `8g` | Maximum individual input pack size. |
-| `compactMinReftables` | `8` | Minimum qualifying tables for a top-stack merge. |
-| `compactSmallReftableSize` | `8m` | Largest compacted table included in a top-stack merge. |
-| `compactMaxReftables` | `32` | Depth that triggers a whole-stack merge. |
+| `compactMinReftables` | `8` | Stack depth at which to consider a top-stack merge. |
+| `compactSmallReftableSize` | `64k` | Largest compacted input eligible regardless of the bytes above it. |
+| `compactMaxReftables` | `32` | Depth that forces a merge to at most half this depth. |
 | `compactionLeaseDuration` | `30 min` | Repository lease lifetime without renewal. |
 | `sweepLeaseDuration` | `60 sec` | Shared reclamation lease lifetime without renewal. |
 | `reclaimEnabled` | `true` | Run reclamation and periodic cache cleanup. |
